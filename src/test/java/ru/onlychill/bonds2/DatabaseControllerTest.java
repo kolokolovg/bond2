@@ -3,6 +3,7 @@ package ru.onlychill.bonds2;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -14,17 +15,22 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import ru.onlychill.bonds2.persistence.Database;
+import ru.onlychill.bonds2.persistence.PersistenceException;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
@@ -55,6 +61,17 @@ class DatabaseControllerTest {
 
   private DatabaseController controller(DatabaseController.Background background) {
     return controllerWith(settingsFile(), background);
+  }
+
+  private DatabaseController controller(
+      DatabaseController.Background background, Duration shutdownTimeout) {
+    return new DatabaseController(
+        new SettingsStore(settingsFile()),
+        defaultFile(),
+        background,
+        dialogs,
+        exits::incrementAndGet,
+        shutdownTimeout);
   }
 
   private DatabaseController controllerWith(
@@ -223,7 +240,11 @@ class DatabaseControllerTest {
   @Test
   void unexpectedBackgroundFailureIsReportedAndDatabaseStaysClosed() {
     DatabaseController.Background failing =
-        (work, onDone, onError) -> onError.accept(new IllegalStateException("сбой"));
+        (work, onDone, onError) -> {
+          var failure = new IllegalStateException("сбой");
+          onError.accept(failure);
+          return CompletableFuture.failedFuture(failure);
+        };
     var db = controller(failing);
 
     db.openDatabase();
@@ -404,6 +425,107 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void lateResultAfterShutdownClosesItsDatabaseAndStaysSilent() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background, Duration.ofMillis(50));
+    db.openDatabase();
+
+    db.shutdown();
+    background.runNext();
+
+    assertThat(background.results).hasSize(1);
+    assertDatabaseClosed(background.results.get(0));
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPENING);
+    assertThat(db.statusProperty().get()).isEqualTo("Открытие базы…");
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void shutdownClosesDatabaseOpenedByFinishedButUndeliveredWork() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    var job = background.runWorkOnly();
+
+    db.shutdown();
+    job.deliver();
+
+    assertDatabaseClosed(background.results.get(0));
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPENING);
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void shutdownDuringMigrationClosesMigratedDatabase() throws IOException {
+    emptyUserFile();
+    saveSettings(userFile(), true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    background.runNext();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.MIGRATING);
+    var job = background.runWorkOnly();
+
+    db.shutdown();
+    job.deliver();
+
+    assertThat(backupsIn(dataDir())).hasSize(1);
+    assertDatabaseClosed(background.results.get(1));
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void shutdownStopsWaitingWhenWorkDoesNotFinishInTime() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background, Duration.ofMillis(50));
+    db.openDatabase();
+
+    assertTimeoutPreemptively(Duration.ofSeconds(10), db::shutdown);
+
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void errorAfterShutdownIsNotReported() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background, Duration.ofMillis(50));
+    db.openDatabase();
+
+    db.shutdown();
+    background.runNext();
+
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void migrationAnswerAfterShutdownDoesNotStartMigration() throws IOException {
+    emptyUserFile();
+    saveSettings(userFile(), true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    dialogs.onQuestion = db::shutdown;
+    db.openDatabase();
+
+    background.runNext();
+
+    assertThat(background.pending()).isZero();
+    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPENING);
+  }
+
+  private static void assertDatabaseClosed(OpenResult result) {
+    assertThat(result).isInstanceOf(OpenResult.Opened.class);
+    var database = ((OpenResult.Opened) result).database();
+    assertThatThrownBy(() -> database.inTransaction(connection -> null))
+        .isInstanceOf(PersistenceException.class);
+  }
+
+  @Test
   void shutdownWhileClosedDoesNothing() {
     var db = immediate();
 
@@ -509,7 +631,10 @@ class DatabaseControllerTest {
   static final class FakeBackground implements DatabaseController.Background {
 
     private final boolean immediate;
-    private final Deque<Runnable> queue = new ArrayDeque<>();
+    private final Deque<Job> queue = new ArrayDeque<>();
+
+    /** Результаты выполненной работы: до доставки в обработчики. */
+    final List<OpenResult> results = new ArrayList<>();
 
     private FakeBackground(boolean immediate) {
       this.immediate = immediate;
@@ -524,47 +649,85 @@ class DatabaseControllerTest {
     }
 
     @Override
-    public void run(
+    public Future<OpenResult> run(
         Callable<OpenResult> work, Consumer<OpenResult> onDone, Consumer<Throwable> onError) {
-      Runnable job =
-          () -> {
-            OpenResult result;
-            try {
-              result = work.call();
-            } catch (Exception e) {
-              onError.accept(e);
-              return;
-            }
-            onDone.accept(result);
-          };
+      var job = new Job(work, onDone, onError);
       if (immediate) {
-        job.run();
+        job.runWork();
+        job.deliver();
       } else {
         queue.add(job);
       }
+      return job.outcome;
     }
 
-    /** Выполняет следующую отложенную работу. */
+    /** Выполняет работу и доставляет результат следующей отложенной операции. */
     void runNext() {
-      queue.remove().run();
+      Job job = queue.remove();
+      job.runWork();
+      job.deliver();
+    }
+
+    /** Выполняет работу следующей операции, но результат ещё не доставляет. */
+    Job runWorkOnly() {
+      Job job = queue.remove();
+      job.runWork();
+      return job;
     }
 
     int pending() {
       return queue.size();
     }
+
+    /** Отложенная операция: работа и доставка результата выполняются отдельно. */
+    final class Job {
+
+      final CompletableFuture<OpenResult> outcome = new CompletableFuture<>();
+      private final Callable<OpenResult> work;
+      private final Consumer<OpenResult> onDone;
+      private final Consumer<Throwable> onError;
+      private @Nullable Throwable failure;
+
+      Job(Callable<OpenResult> work, Consumer<OpenResult> onDone, Consumer<Throwable> onError) {
+        this.work = work;
+        this.onDone = onDone;
+        this.onError = onError;
+      }
+
+      void runWork() {
+        try {
+          OpenResult result = work.call();
+          results.add(result);
+          outcome.complete(result);
+        } catch (Exception e) {
+          failure = e;
+          outcome.completeExceptionally(e);
+        }
+      }
+
+      /** Передаёт обработчику результат или ошибку, как это делает поток JavaFX. */
+      void deliver() {
+        if (failure != null) {
+          onError.accept(failure);
+        } else {
+          onDone.accept(outcome.join());
+        }
+      }
+    }
   }
 
-  /** Записывает сообщения диалогов; подтверждение миграции задаётся полем. */
   static final class RecordingDialogs implements DatabaseController.Dialogs {
 
     final List<String> questions = new ArrayList<>();
     final List<String> warnings = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
     boolean migrationAnswer = true;
+    Runnable onQuestion = () -> {};
 
     @Override
     public boolean confirmMigration(String question) {
       questions.add(question);
+      onQuestion.run();
       return migrationAnswer;
     }
 

@@ -13,7 +13,7 @@
 ./gradlew run                        # запуск: открывается главное окно (JavaFX)
 ```
 
-Главное окно содержит меню «Файл»: «Настройки…», «Открыть базу», «Создать базу…», «Закрыть базу» и «Выход», завершающее приложение. Консольного режима нет. Для тестов UI нужен дисплей (JavaFX toolkit).
+Главное окно содержит меню «Файл»: «Настройки…», «Открыть базу», «Создать базу…», «Закрыть базу» и «Выход», завершающее приложение. Консольного режима нет. Тесты UI по умолчанию идут на реальном дисплее; без дисплея запускайте их с `-Pheadless=true` (см. «Тесты»).
 
 ## Хранилище данных (SQLite)
 
@@ -70,6 +70,8 @@
 | `./gradlew jacocoTestCoverageVerification` | падает, если покрытие строк ниже `coverage.minLine` (0.80) |
 | `./gradlew pitest` | мутационное тестирование (PIT), порог `mutation.threshold` (70%); отчёт `build/reports/pitest/` |
 
+Без графического дисплея (CI, SSH) добавьте `-Pheadless=true`: JavaFX работает в headless-режиме Monocle для `test` и `pitest`. Monocle входит в JDK с JavaFX (например, Liberica Full), на обычном Temurin флаг не сработает.
+
 Пороги задаются в `gradle.properties` и переопределяются, например: `-Pcoverage.minLine=0.9`.
 Отчёт покрытия: `build/reports/jacoco/test/html/index.html`. `check` включает тесты и проверку покрытия, но не `pitest` (он медленнее; запускается в CI отдельно).
 
@@ -97,4 +99,4 @@
 
 ## CI
 
-`.github/workflows/ci.yml` на каждый push и pull request выполняет `./gradlew check pitest openjmlProve`.
+`.github/workflows/ci.yml` на каждый push и pull request выполняет `./gradlew check pitest openjmlProve -Pheadless=true` на JDK Liberica Full (с JavaFX).

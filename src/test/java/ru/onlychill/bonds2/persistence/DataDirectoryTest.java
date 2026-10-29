@@ -69,4 +69,14 @@ class DataDirectoryTest {
     assertThat(settings.getFileName()).hasToString("settings.properties");
     assertThat(settings.getParent()).isEqualTo(DataDirectory.databaseFile().getParent());
   }
+
+  @Test
+  void lockFileIsNextToDatabaseFile() {
+    assertThat(DataDirectory.lockFile("Linux", k -> null, HOME))
+        .isEqualTo(Path.of("home/u/.local/share/bonds2/bonds2.lock"));
+    assertThat(DataDirectory.lockFile("Windows 11", k -> "AD", HOME))
+        .isEqualTo(Path.of("AD/bonds2/bonds2.lock"));
+    assertThat(DataDirectory.lockFile("Mac OS X", k -> null, HOME))
+        .isEqualTo(Path.of("home/u/Library/Application Support/bonds2/bonds2.lock"));
+  }
 }

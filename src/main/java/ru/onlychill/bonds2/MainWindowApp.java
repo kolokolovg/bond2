@@ -3,11 +3,13 @@ package ru.onlychill.bonds2;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.function.Consumer;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.value.ObservableValue;
 import javafx.geometry.Insets;
 import javafx.scene.Scene;
+import javafx.scene.control.Alert;
 import javafx.scene.control.Label;
 import javafx.scene.control.Menu;
 import javafx.scene.control.MenuBar;
@@ -18,6 +20,8 @@ import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.persistence.DataDirectory;
+import ru.onlychill.bonds2.persistence.InstanceLock;
+import ru.onlychill.bonds2.persistence.PersistenceException;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
 /**
@@ -32,9 +36,16 @@ public final class MainWindowApp extends Application {
       Runnable settings, Runnable open, Runnable create, Runnable close, Runnable exit) {}
 
   private @Nullable DatabaseController controller;
+  private @Nullable InstanceLock instanceLock;
 
   @Override
   public void start(Stage stage) {
+    // Блокировка берётся до чтения настроек: второй экземпляр не должен трогать общие файлы
+    instanceLock = acquireInstanceLock(DataDirectory.lockFile(), MainWindowApp::showStartupError);
+    if (instanceLock == null) {
+      Platform.exit();
+      return;
+    }
     var db =
         new DatabaseController(
             new SettingsStore(DataDirectory.settingsFile()),
@@ -68,9 +79,45 @@ public final class MainWindowApp extends Application {
   @Override
   public void stop() {
     DatabaseController db = controller;
-    if (db != null) {
-      db.shutdown();
+    InstanceLock lock = instanceLock;
+    shutDownInOrder(db == null ? () -> {} : db::shutdown, lock == null ? () -> {} : lock::close);
+  }
+
+  /**
+   * Завершение: сначала останавливается работа с БД, и только потом освобождается блокировка
+   * экземпляра, чтобы новый экземпляр не открыл файл, пока старый ещё с ним работает. Блокировка
+   * освобождается, даже если остановка завершилась ошибкой.
+   */
+  static void shutDownInOrder(Runnable stopDatabase, Runnable releaseLock) {
+    try {
+      stopDatabase.run();
+    } finally {
+      releaseLock.run();
     }
+  }
+
+  /**
+   * Берёт блокировку единственного экземпляра. Если приложение уже запущено или блокировку взять
+   * нельзя, сообщает об этом через {@code report} и возвращает {@code null}.
+   */
+  static @Nullable InstanceLock acquireInstanceLock(Path lockFile, Consumer<String> report) {
+    try {
+      Optional<InstanceLock> lock = InstanceLock.tryAcquire(lockFile);
+      if (lock.isEmpty()) {
+        report.accept("Приложение уже запущено.");
+      }
+      return lock.orElse(null);
+    } catch (PersistenceException e) {
+      report.accept("Не удалось запустить приложение: " + ErrorMessages.of(e));
+      return null;
+    }
+  }
+
+  private static void showStartupError(String message) {
+    var alert = new Alert(Alert.AlertType.ERROR, message);
+    alert.setTitle("Bonds");
+    alert.setHeaderText(null);
+    alert.showAndWait();
   }
 
   /** Строка меню с пунктами «Файл»; доступность пунктов следует за состоянием БД. */

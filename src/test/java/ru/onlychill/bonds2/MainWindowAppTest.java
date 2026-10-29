@@ -1,6 +1,7 @@
 package ru.onlychill.bonds2;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -43,6 +44,31 @@ class MainWindowAppTest {
     items.get(CREATE).fire();
     items.get(EXIT).fire();
     assertThat(calls).containsExactly("settings", "open", "create", "exit");
+  }
+
+  @Test
+  void shutdownStopsDatabaseBeforeReleasingLock() {
+    var calls = new ArrayList<String>();
+
+    MainWindowApp.shutDownInOrder(() -> calls.add("database"), () -> calls.add("lock"));
+
+    assertThat(calls).containsExactly("database", "lock");
+  }
+
+  @Test
+  void lockIsReleasedEvenWhenDatabaseStopFails() {
+    var calls = new ArrayList<String>();
+
+    assertThatThrownBy(
+            () ->
+                MainWindowApp.shutDownInOrder(
+                    () -> {
+                      throw new IllegalStateException("сбой");
+                    },
+                    () -> calls.add("lock")))
+        .isInstanceOf(IllegalStateException.class);
+
+    assertThat(calls).containsExactly("lock");
   }
 
   @Test
@@ -91,5 +117,32 @@ class MainWindowAppTest {
         () -> calls.add("create"),
         () -> calls.add("close"),
         () -> calls.add("exit"));
+  }
+
+  @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir;
+
+  @Test
+  void acquireInstanceLockReportsRunningInstance() {
+    var reports = new ArrayList<String>();
+    var file = dir.resolve("bonds2.lock");
+
+    var first = MainWindowApp.acquireInstanceLock(file, reports::add);
+    var second = MainWindowApp.acquireInstanceLock(file, reports::add);
+
+    assertThat(first).isNotNull();
+    assertThat(second).isNull();
+    assertThat(reports).containsExactly("Приложение уже запущено.");
+    first.close();
+  }
+
+  @Test
+  void acquireInstanceLockReportsFailure() throws java.io.IOException {
+    java.nio.file.Files.writeString(dir.resolve("blocker"), "файл");
+    var reports = new ArrayList<String>();
+
+    var lock = MainWindowApp.acquireInstanceLock(dir.resolve("blocker/bonds2.lock"), reports::add);
+
+    assertThat(lock).isNull();
+    assertThat(reports).singleElement().asString().startsWith("Не удалось запустить приложение");
   }
 }

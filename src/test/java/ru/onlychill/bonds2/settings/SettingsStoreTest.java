@@ -11,10 +11,23 @@ import java.nio.file.Path;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class SettingsStoreTest {
 
   @TempDir Path dir;
+
+  private static final java.time.Clock FIXED =
+      java.time.Clock.fixed(
+          java.time.LocalDateTime.of(2026, 1, 2, 3, 4, 5)
+              .atZone(java.time.ZoneId.systemDefault())
+              .toInstant(),
+          java.time.ZoneId.systemDefault());
+
+  private SettingsStore storeAt(java.time.Clock clock) {
+    return new SettingsStore(settingsFile(), clock);
+  }
 
   private Path settingsFile() {
     return dir.resolve("bonds2/settings.properties");
@@ -95,13 +108,71 @@ class SettingsStoreTest {
     assertThat(loadFromSettingsFile()).isEqualTo(Settings.defaults());
   }
 
-  @Test
-  void invalidValuesFallBackToDefaultsPerKey() throws IOException {
-    writeSettingsFile("database.path=relative/bonds.db\ndatabase.autoOpen=maybe\n");
-    assertThat(loadFromSettingsFile()).isEqualTo(Settings.defaults());
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "database.path=relative/bonds.db\ndatabase.autoOpen=false\n",
+        "database.autoOpen=maybe\n",
+        "database.autoOpen=\n",
+        "database.path=\\u0000x.db\ndatabase.autoOpen=FALSE\n",
+        "database.path=\\uZZZZ\n"
+      })
+  void corruptedContentIsBackedUpAndReset(String content) throws IOException {
+    writeSettingsFile(content);
 
-    writeSettingsFile("database.path=\\u0000x.db\ndatabase.autoOpen=FALSE\n");
-    assertThat(loadFromSettingsFile()).isEqualTo(new Settings(null, false));
+    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+
+    Path backup = dir.resolve("bonds2/settings.properties.bad-20260102-030405");
+    assertThat(Files.readString(backup, StandardCharsets.UTF_8)).isEqualTo(content);
+    assertThat(Files.readAllLines(settingsFile(), StandardCharsets.UTF_8))
+        .contains("database.path=", "database.autoOpen=true");
+    // Повторная загрузка файл уже не считает испорченным
+    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    assertThat(namesIn(dir.resolve("bonds2")))
+        .containsExactly("settings.properties", "settings.properties.bad-20260102-030405");
+  }
+
+  @Test
+  void missingFileAndMissingKeysAreNotCorruption() throws IOException {
+    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    assertThat(dir.resolve("bonds2")).doesNotExist();
+
+    writeSettingsFile("database.autoOpen=false\n");
+    assertThat(storeAt(FIXED).load()).isEqualTo(new Settings(null, false));
+    writeSettingsFile("# только комментарий\n");
+    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+  }
+
+  @Test
+  void backupNameCollisionGetsNumericSuffix() throws IOException {
+    writeSettingsFile("database.autoOpen=maybe\n");
+    storeAt(FIXED).load();
+    writeSettingsFile("database.autoOpen=nope\n");
+    storeAt(FIXED).load();
+
+    assertThat(namesIn(dir.resolve("bonds2")))
+        .containsExactly(
+            "settings.properties",
+            "settings.properties.bad-20260102-030405",
+            "settings.properties.bad-20260102-030405-1");
+  }
+
+  @Test
+  void failedBackupKeepsOriginalAndStillReturnsDefaults() throws IOException {
+    writeSettingsFile("database.autoOpen=maybe\n");
+    // Каталог только для чтения: копию создать нельзя
+    Files.setPosixFilePermissions(
+        dir.resolve("bonds2"),
+        java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"));
+    try {
+      assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+      assertThat(Files.readString(settingsFile())).isEqualTo("database.autoOpen=maybe\n");
+    } finally {
+      Files.setPosixFilePermissions(
+          dir.resolve("bonds2"),
+          java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"));
+    }
   }
 
   @Test

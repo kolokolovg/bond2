@@ -28,6 +28,16 @@ public final class DataDirectory {
     return appDirectory(osName, env, home).resolve("settings.properties");
   }
 
+  /** Файл блокировки единственного экземпляра для текущей ОС и окружения. */
+  public static Path lockFile() {
+    return lockFile(
+        System.getProperty("os.name"), System::getenv, Path.of(System.getProperty("user.home")));
+  }
+
+  static Path lockFile(String osName, UnaryOperator<String> env, Path home) {
+    return appDirectory(osName, env, home).resolve("bonds2.lock");
+  }
+
   /** Каталог приложения {@code bonds2} в пользовательском каталоге данных ОС. */
   private static Path appDirectory(String osName, UnaryOperator<String> env, Path home) {
     String os = osName.toLowerCase(java.util.Locale.ROOT);

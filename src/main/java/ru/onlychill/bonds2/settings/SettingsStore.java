@@ -8,6 +8,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Clock;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.Objects;
 import java.util.Properties;
 import org.jspecify.annotations.Nullable;
@@ -31,30 +35,78 @@ public final class SettingsStore {
       "Настройки bonds2. database.path: путь к файлу БД, пусто — по умолчанию. "
           + "database.autoOpen: открывать БД при запуске, true или false.";
 
+  private static final DateTimeFormatter BAD_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+
+  private static final System.Logger LOG = System.getLogger(SettingsStore.class.getName());
+
   private final Path file;
+  private final Clock clock;
 
   /** Хранилище настроек в указанном файле. */
   public SettingsStore(Path file) {
+    this(file, Clock.system(ZoneId.systemDefault()));
+  }
+
+  /** Хранилище настроек; время в имени копии испорченного файла берётся из {@code clock}. */
+  SettingsStore(Path file, Clock clock) {
     this.file = file;
+    this.clock = clock;
   }
 
   /**
    * Читает настройки из файла.
    *
-   * @return настройки из файла либо {@link Settings#defaults()}, если файл отсутствует, нечитаем
-   *     или повреждён
+   * <p>Испорченный файл (нечитаем, битая Unicode-последовательность, относительный или некорректный
+   * путь, флаг не {@code true}/{@code false}) копируется в {@code
+   * settings.properties.bad-<yyyyMMdd-HHmmss>} и заменяется значениями по умолчанию. Отсутствие
+   * файла и отдельных ключей повреждением не считается. Сбой копирования или записи пишется в лог.
+   *
+   * @return настройки из файла либо {@link Settings#defaults()}
    */
   public Settings load() {
+    if (Files.notExists(file)) {
+      return Settings.defaults();
+    }
     var props = new Properties();
     try (Reader in = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
       props.load(in);
     } catch (IOException | IllegalArgumentException e) {
       // IllegalArgumentException: некорректная Unicode-escape-последовательность в файле
-      return Settings.defaults();
+      return recover();
     }
-    return new Settings(
-        Settings.parseDatabasePath(props.getProperty(KEY_DATABASE_PATH)),
-        parseFlag(props.getProperty(KEY_AUTO_OPEN)));
+    String rawPath = props.getProperty(KEY_DATABASE_PATH);
+    Path path = Settings.parseDatabasePath(rawPath);
+    Boolean autoOpen = parseFlag(props.getProperty(KEY_AUTO_OPEN));
+    boolean pathBroken = path == null && rawPath != null && !rawPath.isBlank();
+    if (pathBroken || autoOpen == null) {
+      return recover();
+    }
+    return new Settings(path, autoOpen);
+  }
+
+  /** Сохраняет испорченный файл рядом и записывает значения по умолчанию. */
+  private Settings recover() {
+    Settings defaults = Settings.defaults();
+    try {
+      if (!Files.isRegularFile(file)) {
+        throw new IOException("не обычный файл: " + file);
+      }
+      Files.copy(file, badCopyPath());
+      save(defaults);
+    } catch (IOException | UncheckedIOException e) {
+      LOG.log(System.Logger.Level.WARNING, "Не удалось восстановить настройки: " + file, e);
+    }
+    return defaults;
+  }
+
+  /** Свободное имя копии; при совпадении метки времени добавляется числовой суффикс. */
+  private Path badCopyPath() {
+    String base = file.getFileName() + ".bad-" + LocalDateTime.now(clock).format(BAD_STAMP);
+    Path candidate = file.resolveSibling(base);
+    for (int i = 1; Files.exists(candidate); i++) {
+      candidate = file.resolveSibling(base + "-" + i);
+    }
+    return candidate;
   }
 
   /**
@@ -98,18 +150,20 @@ public final class SettingsStore {
   }
 
   /**
-   * Флаг из строки: {@code true} или {@code false} без учёта регистра, иначе значение по умолчанию.
+   * Флаг из строки: {@code true} или {@code false} без учёта регистра. Отсутствующее значение даёт
+   * значение по умолчанию, любое другое — {@code null} (файл испорчен).
    */
-  private static boolean parseFlag(@Nullable String value) {
-    if (value != null) {
-      String text = value.strip();
-      if (text.equalsIgnoreCase("true")) {
-        return true;
-      }
-      if (text.equalsIgnoreCase("false")) {
-        return false;
-      }
+  private static @Nullable Boolean parseFlag(@Nullable String value) {
+    if (value == null) {
+      return Settings.DEFAULT_AUTO_OPEN;
     }
-    return Settings.DEFAULT_AUTO_OPEN;
+    String text = value.strip();
+    if (text.equalsIgnoreCase("true")) {
+      return true;
+    }
+    if (text.equalsIgnoreCase("false")) {
+      return false;
+    }
+    return null;
   }
 }

@@ -3,7 +3,12 @@ package ru.onlychill.bonds2;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import javafx.beans.property.ReadOnlyObjectProperty;
 import javafx.beans.property.ReadOnlyObjectWrapper;
@@ -45,6 +50,9 @@ final class DatabaseController {
   private static final String REASON_MIGRATION = "ошибка миграции";
   private static final String REASON_UNEXPECTED = "внутренняя ошибка";
 
+  /** Сколько ждать окончания фоновой операции при завершении приложения. */
+  static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(30);
+
   private static final System.Logger LOG = System.getLogger(DatabaseController.class.getName());
 
   /**
@@ -52,8 +60,14 @@ final class DatabaseController {
    */
   interface Background {
 
-    /** Выполняет {@code work} вне потока JavaFX и затем вызывает один из обработчиков. */
-    void run(Callable<OpenResult> work, Consumer<OpenResult> onDone, Consumer<Throwable> onError);
+    /**
+     * Выполняет {@code work} вне потока JavaFX и затем вызывает один из обработчиков.
+     *
+     * @return результат самой работы: он готов, как только работа закончилась, и не зависит от
+     *     доставки в поток JavaFX, поэтому его можно ждать из потока JavaFX
+     */
+    Future<OpenResult> run(
+        Callable<OpenResult> work, Consumer<OpenResult> onDone, Consumer<Throwable> onError);
   }
 
   /** Диалоги пользователя. */
@@ -77,6 +91,7 @@ final class DatabaseController {
   private final Background background;
   private final Dialogs dialogs;
   private final Runnable exit;
+  private final Duration shutdownTimeout;
 
   private final ReadOnlyObjectWrapper<DbState> state = new ReadOnlyObjectWrapper<>(DbState.CLOSED);
   private final ReadOnlyStringWrapper status = new ReadOnlyStringWrapper(STATUS_CLOSED);
@@ -85,6 +100,12 @@ final class DatabaseController {
 
   /** Открытая БД: не {@code null} ровно тогда, когда состояние {@link DbState#OPEN}. */
   private @Nullable Database database;
+
+  /** Фоновая работа, результат которой ещё не обработан; её ждёт {@link #shutdown()}. */
+  private @Nullable Future<OpenResult> pendingWork;
+
+  /** Приложение завершается: поздние результаты фоновой работы игнорируются. */
+  private boolean stopped;
 
   /**
    * @param store хранилище настроек; настройки читаются при создании контроллера
@@ -99,6 +120,18 @@ final class DatabaseController {
       Background background,
       Dialogs dialogs,
       Runnable exit) {
+    this(store, defaultDatabaseFile, background, dialogs, exit, SHUTDOWN_TIMEOUT);
+  }
+
+  /** Конструктор с заданным сроком ожидания фоновой операции при завершении. */
+  DatabaseController(
+      SettingsStore store,
+      Path defaultDatabaseFile,
+      Background background,
+      Dialogs dialogs,
+      Runnable exit,
+      Duration shutdownTimeout) {
+    this.shutdownTimeout = shutdownTimeout;
     this.store = store;
     this.defaultDatabaseFile = defaultDatabaseFile;
     this.background = background;
@@ -137,10 +170,11 @@ final class DatabaseController {
     Path file = databaseFile();
     boolean defaultPath = settings.databasePath() == null;
     setState(DbState.OPENING, STATUS_OPENING);
-    background.run(
-        () -> attempt(file, defaultPath),
-        result -> onResult(file, result),
-        this::onUnexpectedError);
+    pendingWork =
+        background.run(
+            () -> attempt(file, defaultPath),
+            result -> onResult(file, result),
+            this::onUnexpectedError);
   }
 
   /**
@@ -160,7 +194,9 @@ final class DatabaseController {
       return;
     }
     setState(DbState.OPENING, STATUS_CREATING);
-    background.run(() -> create(file), result -> onCreated(file, result), this::onUnexpectedError);
+    pendingWork =
+        background.run(
+            () -> create(file), result -> onCreated(file, result), this::onUnexpectedError);
   }
 
   /** «Файл → Закрыть базу»: закрывает БД, переносит журнал WAL в файл. */
@@ -206,8 +242,14 @@ final class DatabaseController {
     }
   }
 
-  /** Вызывается при завершении приложения: закрывает БД, только если она открыта. */
+  /**
+   * Вызывается при завершении приложения. Ждёт окончания фоновой операции не дольше срока ожидания
+   * и закрывает полученную БД, затем закрывает открытую БД. Результаты, пришедшие позже,
+   * игнорируются.
+   */
   void shutdown() {
+    stopped = true;
+    awaitPendingWork();
     Database opened = database;
     if (opened == null) {
       return;
@@ -221,6 +263,35 @@ final class DatabaseController {
     }
   }
 
+  /** Ждёт фоновую работу и закрывает БД, которую она открыла; по сроку или ошибке идёт дальше. */
+  private void awaitPendingWork() {
+    Future<OpenResult> work = pendingWork;
+    pendingWork = null;
+    if (work == null) {
+      return;
+    }
+    try {
+      discard(work.get(shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    } catch (TimeoutException e) {
+      LOG.log(System.Logger.Level.WARNING, "Операция с БД не завершилась при выходе", e);
+    } catch (ExecutionException e) {
+      LOG.log(System.Logger.Level.WARNING, "Операция с БД завершилась ошибкой при выходе", e);
+    }
+  }
+
+  /** Результат, который больше никому не нужен: открытую БД закрывает, остальное отбрасывает. */
+  private static void discard(OpenResult result) {
+    if (result instanceof OpenResult.Opened opened) {
+      try {
+        opened.database().close();
+      } catch (PersistenceException e) {
+        LOG.log(System.Logger.Level.WARNING, "Не удалось закрыть БД при выходе", e);
+      }
+    }
+  }
+
   /** Файл БД по настройкам либо путь по умолчанию. */
   private Path databaseFile() {
     Path configured = settings.databasePath();
@@ -229,6 +300,10 @@ final class DatabaseController {
 
   /** Результат создания: при успехе запоминает путь в настройках. */
   private void onCreated(Path file, OpenResult result) {
+    if (stopped) {
+      discard(result);
+      return;
+    }
     if (result instanceof OpenResult.Opened opened) {
       becomeOpen(file, opened.database());
       rememberDatabasePath(file);
@@ -251,6 +326,10 @@ final class DatabaseController {
    * Результат открытия или миграции: открывает БД, спрашивает о миграции или сообщает об ошибке.
    */
   private void onResult(Path file, OpenResult result) {
+    if (stopped) {
+      discard(result);
+      return;
+    }
     switch (result) {
       case OpenResult.Opened opened -> becomeOpen(file, opened.database());
       case OpenResult.NeedsMigration() -> confirmMigration(file);
@@ -260,13 +339,18 @@ final class DatabaseController {
 
   /** Спрашивает согласие на миграцию; без согласия файл не меняется и БД не открывается. */
   private void confirmMigration(Path file) {
-    if (!dialogs.confirmMigration(MIGRATION_QUESTION)) {
+    boolean confirmed = dialogs.confirmMigration(MIGRATION_QUESTION);
+    if (stopped) {
+      return;
+    }
+    if (!confirmed) {
       setState(DbState.CLOSED, STATUS_CLOSED + ": " + REASON_OUTDATED);
       return;
     }
     setState(DbState.MIGRATING, STATUS_MIGRATING);
-    background.run(
-        () -> migrateAndOpen(file), result -> onResult(file, result), this::onUnexpectedError);
+    pendingWork =
+        background.run(
+            () -> migrateAndOpen(file), result -> onResult(file, result), this::onUnexpectedError);
   }
 
   private void becomeOpen(Path file, Database opened) {
@@ -281,6 +365,9 @@ final class DatabaseController {
   }
 
   private void onUnexpectedError(Throwable error) {
+    if (stopped) {
+      return;
+    }
     reject(
         new OpenResult.Failed(
             REASON_UNEXPECTED, "Непредвиденная ошибка: " + ErrorMessages.of(error)));

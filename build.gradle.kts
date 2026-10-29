@@ -66,8 +66,17 @@ tasks.withType<JavaCompile>().configureEach {
     }
 }
 
+// Без дисплея (CI): JavaFX работает в headless-режиме Monocle, который есть в JDK с JavaFX (Liberica Full)
+val headlessJavaFxArgs =
+    if (providers.gradleProperty("headless").map { it.toBoolean() }.getOrElse(false)) {
+        listOf("-Dglass.platform=Monocle", "-Dmonocle.platform=Headless", "-Dprism.order=sw")
+    } else {
+        emptyList()
+    }
+
 tasks.test {
     useJUnitPlatform()
+    jvmArgs(headlessJavaFxArgs)
 }
 
 jacoco {
@@ -117,6 +126,7 @@ pitest {
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false
     threads = 4
+    jvmArgs = headlessJavaFxArgs
 }
 
 spotbugs {
