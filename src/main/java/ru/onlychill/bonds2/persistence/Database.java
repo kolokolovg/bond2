@@ -6,29 +6,13 @@ import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.time.Clock;
 import java.time.Duration;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Stream;
-import org.flywaydb.core.Flyway;
-import org.flywaydb.core.api.FlywayException;
-import org.flywaydb.core.api.MigrationInfo;
-import org.flywaydb.core.api.MigrationState;
 import org.sqlite.SQLiteConfig;
 
 /**
@@ -37,7 +21,9 @@ import org.sqlite.SQLiteConfig;
  * busy_timeout}, {@code BEGIN IMMEDIATE} для записи).
  *
  * <p>Жизненный цикл: {@link #create(Path)}, {@link #initialize(Path)} для пустого файла или {@link
- * #open(Path)}, затем транзакции, затем {@link #close()}.
+ * #open(Path)}, затем транзакции, затем {@link #close()}. Проверку схемы выполняет {@code
+ * SchemaInspector}, резервные копии и откат файла — {@code BackupManager}, низкоуровневые операции
+ * с SQLite — {@code SqliteSupport}.
  */
 public final class Database implements AutoCloseable {
 
@@ -53,32 +39,20 @@ public final class Database implements AutoCloseable {
     /** Применены миграции, неизвестные приложению: схема новее приложения. */
     TOO_NEW,
     /**
-     * Файл пуст: 0 байт либо SQLite без пользовательских таблиц. Его инициализирует {@link
+     * Файл пуст: 0 байт либо SQLite без объектов схемы ({@code sqlite_master} пуст, {@code
+     * application_id} и {@code user_version} равны 0). Его инициализирует {@link
      * Database#initialize(Path)}.
      */
     EMPTY,
     /**
-     * SQLite-файл с таблицами, но без истории миграций приложения: чужая база, файл не меняется.
+     * SQLite-файл без истории миграций приложения, не являющийся пустым (есть объекты схемы или
+     * ненулевые {@code application_id}/{@code user_version}): чужая база, файл не меняется.
      */
     FOREIGN
   }
 
   /** Набор миграций приложения. */
   private static final String MIGRATIONS = "classpath:db/migration";
-
-  /** Таблица истории миграций Flyway: по ней БД приложения отличается от чужой SQLite-базы. */
-  private static final String HISTORY_TABLE = "flyway_schema_history";
-
-  /** Служебные файлы SQLite рядом с основным файлом БД. */
-  private static final String[] SIDECAR_SUFFIXES = {"-wal", "-shm", "-journal"};
-
-  private static final DateTimeFormatter BACKUP_STAMP =
-      DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
-
-  /** Сколько резервных копий файла БД хранится после успешной миграции. */
-  private static final int BACKUPS_KEPT = 3;
-
-  private static final System.Logger LOG = System.getLogger(Database.class.getName());
 
   private final String url;
   private final Properties writeProperties;
@@ -90,10 +64,15 @@ public final class Database implements AutoCloseable {
   /** Флаг закрытия; читается и пишется только под {@link #lock}. */
   private boolean closed;
 
+  private final Duration busyTimeout;
+
   private Database(String url, Duration busyTimeout) {
     this.url = url;
-    this.writeProperties = properties(busyTimeout, SQLiteConfig.TransactionMode.IMMEDIATE);
-    this.readProperties = properties(busyTimeout, SQLiteConfig.TransactionMode.DEFERRED);
+    this.busyTimeout = busyTimeout;
+    this.writeProperties =
+        SqliteSupport.properties(busyTimeout, SQLiteConfig.TransactionMode.IMMEDIATE);
+    this.readProperties =
+        SqliteSupport.properties(busyTimeout, SQLiteConfig.TransactionMode.DEFERRED);
   }
 
   /** Создаёт новую БД с актуальной схемой; см. {@link #create(Path, Duration)}. */
@@ -116,15 +95,12 @@ public final class Database implements AutoCloseable {
   static Database create(Path file, Duration busyTimeout, String... locations) {
     Path absolute = file.toAbsolutePath();
     createEmptyFile(absolute);
-    String url = url(absolute);
+    String url = SqliteSupport.url(absolute);
     try {
-      flyway(url, locations).migrate();
+      SchemaInspector.flyway(url, locations).migrate();
     } catch (RuntimeException e) {
       // Файл создан этим вызовом, поэтому удаляем его: повторная попытка должна быть возможна
-      deleteQuietly(absolute, e);
-      for (String suffix : SIDECAR_SUFFIXES) {
-        deleteQuietly(withSuffix(absolute, suffix), e);
-      }
+      SqliteSupport.deleteWithSidecarsQuietly(absolute, e);
       throw new PersistenceException("Не удалось создать БД: " + absolute, e);
     }
     return new Database(url, busyTimeout);
@@ -133,7 +109,8 @@ public final class Database implements AutoCloseable {
   /**
    * Определяет состояние существующего файла без его изменения: {@link State#UP_TO_DATE}, {@link
    * State#NEEDS_MIGRATION}, {@link State#TOO_NEW}, {@link State#EMPTY} (0 байт или SQLite без
-   * таблиц) либо {@link State#FOREIGN} (таблицы есть, истории миграций приложения нет).
+   * объектов схемы и с нулевыми {@code application_id}/{@code user_version}) либо {@link
+   * State#FOREIGN} (истории миграций приложения нет, файл не пуст).
    *
    * @throws PersistenceException если файла нет, он не является БД SQLite или история миграций не
    *     соответствует миграциям приложения
@@ -144,37 +121,7 @@ public final class Database implements AutoCloseable {
 
   /** Проверка состояния по набору миграций {@code locations}. */
   static State inspect(Path file, String... locations) {
-    Path absolute = file.toAbsolutePath();
-    if (Files.notExists(absolute)) {
-      throw new PersistenceException("Файл БД не найден: " + absolute);
-    }
-    if (isZeroBytes(absolute)) {
-      return State.EMPTY;
-    }
-    List<String> tables = userTables(absolute);
-    if (tables.isEmpty()) {
-      return State.EMPTY;
-    }
-    if (!tables.contains(HISTORY_TABLE)) {
-      return State.FOREIGN;
-    }
-    Flyway flyway = flyway(url(absolute), locations);
-    try {
-      MigrationInfo[] migrations = flyway.info().all();
-      if (Arrays.stream(migrations).anyMatch(Database::isNewer)) {
-        return State.TOO_NEW;
-      }
-      var validation = flyway.validateWithResult();
-      if (!validation.validationSuccessful) {
-        throw new PersistenceException(
-            "История миграций не соответствует приложению: " + validation.getAllErrorMessages());
-      }
-      boolean pending =
-          Arrays.stream(migrations).anyMatch(m -> m.getState() == MigrationState.PENDING);
-      return pending ? State.NEEDS_MIGRATION : State.UP_TO_DATE;
-    } catch (FlywayException e) {
-      throw new PersistenceException("Не удалось прочитать схему БД: " + absolute, e);
-    }
+    return SchemaInspector.inspect(file, locations);
   }
 
   /** Открывает БД с актуальной схемой; см. {@link #open(Path, Duration)}. */
@@ -197,8 +144,8 @@ public final class Database implements AutoCloseable {
   /** Открытие по набору миграций {@code locations}. */
   static Database open(Path file, Duration busyTimeout, String... locations) {
     Path absolute = file.toAbsolutePath();
-    return switch (inspect(absolute, locations)) {
-      case UP_TO_DATE -> new Database(url(absolute), busyTimeout);
+    return switch (SchemaInspector.inspect(absolute, locations)) {
+      case UP_TO_DATE -> new Database(SqliteSupport.url(absolute), busyTimeout);
       case NEEDS_MIGRATION ->
           throw new PersistenceException("Схема БД устарела, требуется миграция: " + absolute);
       case TOO_NEW -> throw new PersistenceException("Схема БД новее приложения: " + absolute);
@@ -211,9 +158,9 @@ public final class Database implements AutoCloseable {
   }
 
   /**
-   * Инициализирует существующий пустой файл актуальной схемой: 0 байт либо SQLite без таблиц. Файл
-   * не создаётся и не удаляется. Если миграции завершились ошибкой, файл возвращается к пустому
-   * состоянию, поэтому повторная попытка возможна.
+   * Инициализирует существующий пустой файл актуальной схемой: 0 байт либо SQLite без объектов
+   * схемы. Файл не создаётся и не удаляется. Если миграции завершились ошибкой, файл возвращается к
+   * пустому состоянию, поэтому повторная попытка возможна.
    *
    * @throws PersistenceException если файла нет, он не пуст (в том числе БД приложения или чужая
    *     база) либо миграции не применились
@@ -225,16 +172,16 @@ public final class Database implements AutoCloseable {
   /** Инициализация по набору миграций {@code locations}. */
   static Database initialize(Path file, Duration busyTimeout, String... locations) {
     Path absolute = file.toAbsolutePath();
-    if (inspect(absolute, locations) != State.EMPTY) {
+    if (SchemaInspector.inspect(absolute, locations) != State.EMPTY) {
       throw new PersistenceException(
           "Инициализация возможна только для пустого файла БД: " + absolute);
     }
-    String url = url(absolute);
+    String url = SqliteSupport.url(absolute);
     try {
-      flyway(url, locations).migrate();
+      SchemaInspector.flyway(url, locations).migrate();
     } catch (RuntimeException e) {
       // Файл существовал до вызова, поэтому его не удаляем, а возвращаем к пустому состоянию
-      resetToEmpty(absolute, e);
+      BackupManager.resetToEmpty(absolute, e);
       throw new PersistenceException("Не удалось инициализировать БД: " + absolute, e);
     }
     return new Database(url, busyTimeout);
@@ -260,20 +207,7 @@ public final class Database implements AutoCloseable {
 
   /** Миграция по набору {@code locations}; время в имени копии берётся из {@code clock}. */
   static Path migrateWithBackup(Path file, Clock clock, String... locations) {
-    Path absolute = file.toAbsolutePath();
-    State state = inspect(absolute, locations);
-    if (state != State.NEEDS_MIGRATION) {
-      throw new PersistenceException(refusal(state, absolute));
-    }
-    Path backup = createBackup(absolute, clock);
-    verifyBackup(backup);
-    try {
-      flyway(url(absolute), locations).migrate();
-    } catch (RuntimeException e) {
-      throw restore(absolute, backup, e);
-    }
-    pruneBackups(absolute);
-    return backup;
+    return BackupManager.migrateWithBackup(file.toAbsolutePath(), clock, locations);
   }
 
   /**
@@ -309,8 +243,11 @@ public final class Database implements AutoCloseable {
     lock.writeLock().lock();
     try {
       if (!closed) {
-        closed = true;
-        checkpoint(url);
+        try {
+          SqliteSupport.checkpoint(url, busyTimeout);
+        } finally {
+          closed = true;
+        }
       }
     } catch (SQLException e) {
       throw new PersistenceException("Не удалось перенести WAL в файл БД при закрытии", e);
@@ -325,14 +262,14 @@ public final class Database implements AutoCloseable {
       if (closed) {
         throw new PersistenceException("БД закрыта");
       }
-      try (Connection c = connect(url, props)) {
+      try (Connection c = SqliteSupport.connect(url, props)) {
         c.setAutoCommit(false);
         try {
           T result = work.execute(c);
           c.commit();
           return result;
         } catch (Throwable t) {
-          rollbackQuietly(c, t);
+          SqliteSupport.rollbackQuietly(c, t);
           throw t;
         }
       }
@@ -359,266 +296,6 @@ public final class Database implements AutoCloseable {
       throw new PersistenceException("Файл БД уже существует: " + file, e);
     } catch (IOException e) {
       throw new PersistenceException("Не удалось создать файл БД: " + file, e);
-    }
-  }
-
-  /**
-   * Переносит WAL в основной файл и копирует его рядом; существующую копию не перезаписывает, а при
-   * совпадении имени добавляет числовой суффикс.
-   */
-  private static Path createBackup(Path file, Clock clock) {
-    String base = ".bak-" + LocalDateTime.now(clock).format(BACKUP_STAMP);
-    Path backup = withSuffix(file, base);
-    try {
-      checkpoint(url(file));
-      for (int i = 1; ; i++) {
-        try {
-          Files.copy(file, backup);
-          return backup;
-        } catch (FileAlreadyExistsException e) {
-          backup = withSuffix(file, base + "-" + i);
-        }
-      }
-    } catch (SQLException e) {
-      throw new MigrationException(
-          "Не удалось перенести WAL в файл БД, миграция не выполнена: " + file, e);
-    } catch (IOException e) {
-      var failure =
-          new MigrationException(
-              "Не удалось создать резервную копию, миграция не выполнена: " + backup, e);
-      deleteQuietly(backup, failure);
-      throw failure;
-    }
-  }
-
-  /**
-   * Оставляет {@link #BACKUPS_KEPT} самых новых копий файла БД; порядок — по метке времени в имени,
-   * затем по числовому суффиксу. Другие файлы не затрагиваются, сбой удаления пишется в лог.
-   */
-  private static void pruneBackups(Path file) {
-    Path dir = file.getParent();
-    var pattern =
-        Pattern.compile(
-            Pattern.quote(file.getFileName() + ".bak-") + "(\\d{8}-\\d{6})(?:-(\\d+))?");
-    record Found(Path path, String stamp, int number) {}
-    List<Found> found = new ArrayList<>();
-    try (Stream<Path> files = Files.list(dir)) {
-      files.forEach(
-          p -> {
-            Matcher m = pattern.matcher(String.valueOf(p.getFileName()));
-            if (m.matches() && Files.isRegularFile(p)) {
-              found.add(new Found(p, m.group(1), m.group(2) == null ? 0 : parseSuffix(m.group(2))));
-            }
-          });
-    } catch (IOException e) {
-      LOG.log(System.Logger.Level.WARNING, "Не удалось просмотреть резервные копии: " + dir, e);
-      return;
-    }
-    found.sort(Comparator.comparing(Found::stamp).thenComparingInt(Found::number).reversed());
-    for (Found old : found.subList(Math.min(BACKUPS_KEPT, found.size()), found.size())) {
-      try {
-        Files.deleteIfExists(old.path());
-      } catch (IOException e) {
-        LOG.log(System.Logger.Level.WARNING, "Не удалось удалить старую копию: " + old.path(), e);
-      }
-    }
-  }
-
-  private static int parseSuffix(String digits) {
-    try {
-      return Integer.parseInt(digits);
-    } catch (NumberFormatException e) {
-      return Integer.MAX_VALUE;
-    }
-  }
-
-  /** Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. */
-  private static void verifyBackup(Path backup) {
-    String result;
-    try {
-      result = integrityCheck(url(backup));
-    } catch (SQLException e) {
-      throw rejectBackup(backup, e);
-    }
-    if (!"ok".equals(result)) {
-      throw rejectBackup(backup, new SQLException("PRAGMA integrity_check: " + result));
-    }
-  }
-
-  private static MigrationException rejectBackup(Path backup, SQLException cause) {
-    var failure =
-        new MigrationException(
-            "Резервная копия не прошла проверку целостности, миграция не выполнена: " + backup,
-            cause);
-    deleteQuietly(backup, failure);
-    return failure;
-  }
-
-  /**
-   * Возвращает файл БД к состоянию резервной копии после неудачной миграции. К этому моменту
-   * соединения Flyway уже закрыты; служебные файлы WAL и журнала удаляются, чтобы не применяться к
-   * восстановленному файлу.
-   */
-  private static MigrationException restore(Path file, Path backup, RuntimeException cause) {
-    try {
-      for (String suffix : SIDECAR_SUFFIXES) {
-        Files.deleteIfExists(withSuffix(file, suffix));
-      }
-      Files.copy(backup, file, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
-      return new MigrationException(
-          "Миграция не выполнена, и восстановить БД из резервной копии не удалось. Восстановите"
-              + " файл вручную из: "
-              + backup,
-          cause);
-    }
-    return new MigrationException(
-        "Миграция не выполнена, БД восстановлена из резервной копии "
-            + backup
-            + ": "
-            + cause.getMessage(),
-        cause);
-  }
-
-  /** Причина отказа в миграции для состояния, кроме {@link State#NEEDS_MIGRATION}. */
-  private static String refusal(State state, Path file) {
-    return switch (state) {
-      case TOO_NEW -> "Схема БД новее приложения, миграция невозможна: " + file;
-      case EMPTY -> "Файл БД пуст, миграция невозможна: " + file;
-      case FOREIGN -> "Файл не база данных приложения, миграция невозможна: " + file;
-      default -> "Миграция не требуется, схема БД актуальна: " + file;
-    };
-  }
-
-  /**
-   * Возвращает существующий файл к пустому состоянию после неудачной инициализации: удаляет
-   * служебные файлы WAL и журнала и обрезает основной файл до 0 байт. Ошибка добавляется к {@code
-   * cause}.
-   */
-  private static void resetToEmpty(Path file, Throwable cause) {
-    try {
-      for (String suffix : SIDECAR_SUFFIXES) {
-        Files.deleteIfExists(withSuffix(file, suffix));
-      }
-      Files.write(file, new byte[0]);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
-    }
-  }
-
-  private static boolean isNewer(MigrationInfo migration) {
-    return migration.getState() == MigrationState.FUTURE_SUCCESS
-        || migration.getState() == MigrationState.FUTURE_FAILED;
-  }
-
-  /** Переносит WAL в основной файл и обрезает его; если WAL занят другим соединением, ошибка. */
-  private static void checkpoint(String url) throws SQLException {
-    try (Connection c = connect(url, maintenanceProperties());
-        Statement st = c.createStatement();
-        ResultSet rs = st.executeQuery("PRAGMA wal_checkpoint(TRUNCATE)")) {
-      if (!rs.next() || rs.getInt(1) != 0) {
-        throw new SQLException("WAL занят другим соединением");
-      }
-    }
-  }
-
-  /** Результат {@code PRAGMA integrity_check}: строка {@code ok} для целой БД. */
-  private static String integrityCheck(String url) throws SQLException {
-    try (Connection c = connect(url, maintenanceProperties());
-        Statement st = c.createStatement();
-        ResultSet rs = st.executeQuery("PRAGMA integrity_check")) {
-      return rs.next() ? rs.getString(1) : "";
-    }
-  }
-
-  /**
-   * Имена пользовательских таблиц из {@code sqlite_master}; служебные таблицы {@code sqlite_*}
-   * (например, {@code sqlite_sequence}) не учитываются. Соединение не меняет файл.
-   */
-  private static List<String> userTables(Path file) {
-    try (Connection c = connect(url(file), maintenanceProperties());
-        Statement st = c.createStatement();
-        ResultSet rs = st.executeQuery("SELECT name FROM sqlite_master WHERE type = 'table'")) {
-      var names = new ArrayList<String>();
-      while (rs.next()) {
-        String name = rs.getString(1);
-        if (!name.startsWith("sqlite_")) {
-          names.add(name);
-        }
-      }
-      return names;
-    } catch (SQLException e) {
-      throw new PersistenceException("Не удалось прочитать схему БД: " + file, e);
-    }
-  }
-
-  /**
-   * Файл размером 0 байт; такой файл SQLite читает как пустую БД, и его не открывают соединением.
-   */
-  private static boolean isZeroBytes(Path file) {
-    try {
-      return Files.size(file) == 0;
-    } catch (IOException e) {
-      throw new PersistenceException("Не удалось прочитать схему БД: " + file, e);
-    }
-  }
-
-  private static Flyway flyway(String url, String... locations) {
-    return Flyway.configure()
-        .dataSource(url, null, null)
-        .locations(locations)
-        // Неприменённые и более новые миграции не ошибка валидации: их состояние определяет inspect
-        .ignoreMigrationPatterns("*:pending", "*:future")
-        .load();
-  }
-
-  private static Connection connect(String url, Properties props) throws SQLException {
-    return new org.sqlite.JDBC().connect(url, props);
-  }
-
-  private static void rollbackQuietly(Connection c, Throwable cause) {
-    try {
-      c.rollback();
-    } catch (SQLException e) {
-      cause.addSuppressed(e);
-    }
-  }
-
-  private static Properties properties(Duration busyTimeout, SQLiteConfig.TransactionMode mode) {
-    var config = new SQLiteConfig();
-    config.setJournalMode(SQLiteConfig.JournalMode.WAL);
-    config.setSynchronous(SQLiteConfig.SynchronousMode.NORMAL);
-    config.enforceForeignKeys(true);
-    config.setBusyTimeout((int) busyTimeout.toMillis());
-    config.setTransactionMode(mode);
-    return config.toProperties();
-  }
-
-  /**
-   * Настройки служебных соединений (проверки, WAL, копия): не переводят файл в WAL и не меняют его,
-   * ожидание блокировки — по умолчанию.
-   */
-  private static Properties maintenanceProperties() {
-    var config = new SQLiteConfig();
-    config.setBusyTimeout((int) DEFAULT_BUSY_TIMEOUT.toMillis());
-    return config.toProperties();
-  }
-
-  private static String url(Path file) {
-    return "jdbc:sqlite:" + file.toAbsolutePath();
-  }
-
-  private static Path withSuffix(Path file, String suffix) {
-    return file.resolveSibling(file.getFileName() + suffix);
-  }
-
-  /** Удаляет файл, если он есть; ошибка добавляется к {@code cause} как подавленная. */
-  private static void deleteQuietly(Path file, Throwable cause) {
-    try {
-      Files.deleteIfExists(file);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
     }
   }
 }

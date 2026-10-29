@@ -99,7 +99,7 @@ tasks.jacocoTestCoverageVerification {
     classDirectories.setFrom(
         files(
             classDirectories.files.map {
-                fileTree(it) { exclude("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/MainWindowApp.class") }
+                fileTree(it) { exclude("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/ui/MainWindowApp.class") }
             },
         ),
     )
@@ -121,7 +121,7 @@ pitest {
     pitestVersion = "1.30.1"
     junit5PluginVersion = "1.2.3"
     targetClasses = setOf("ru.onlychill.bonds2.*")
-    excludedClasses = setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.MainWindowApp")
+    excludedClasses = setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.ui.MainWindowApp")
     mutationThreshold = providers.gradleProperty("mutation.threshold").map { it.toInt() }
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false

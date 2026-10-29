@@ -73,6 +73,25 @@ class DatabaseTest {
     return db;
   }
 
+  /**
+   * Открывает читателя с читающей транзакцией на текущем снимке и фиксирует запись: пока читатель
+   * держит старый снимок, WAL нельзя перенести в основной файл. Соединение закрывает вызывающий.
+   */
+  private Connection readerBehindWrite(Database db) throws SQLException {
+    Connection reader = DriverManager.getConnection("jdbc:sqlite:" + testFile());
+    reader.setAutoCommit(false);
+    try (var st = reader.createStatement();
+        var rs = st.executeQuery("SELECT count(*) FROM counter")) {
+      rs.next();
+    }
+    db.inTransaction(
+        c -> {
+          exec(c, "UPDATE counter SET value = 5");
+          return null;
+        });
+    return reader;
+  }
+
   @Test
   void connectionsUseWalForeignKeysAndBusyTimeout() {
     var db = Database.create(dir.resolve("p.db"), Duration.ofMillis(1234));
@@ -335,6 +354,36 @@ class DatabaseTest {
 
       assertThat(wal)
           .satisfiesAnyOf(p -> assertThat(p).doesNotExist(), p -> assertThat(p).isEmptyFile());
+    }
+  }
+
+  @Test
+  void closeMarksDatabaseClosedEvenWhenCheckpointFails() throws SQLException {
+    var db = withCounter(Duration.ofMillis(100));
+
+    try (Connection reader = readerBehindWrite(db)) {
+      assertThatThrownBy(db::close)
+          .isInstanceOf(PersistenceException.class)
+          .hasMessageContaining("WAL")
+          .hasCauseInstanceOf(SQLException.class);
+    }
+
+    // Несмотря на сбой переноса WAL, БД закрыта: новые транзакции отклоняются
+    assertThatThrownBy(() -> db.inTransaction(c -> null))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("закрыта");
+    assertThatCode(db::close).doesNotThrowAnyException();
+  }
+
+  @Test
+  void closeGivesUpWalCheckpointAfterConfiguredBusyTimeout() throws SQLException {
+    var db = withCounter(Duration.ofMillis(100));
+
+    try (Connection reader = readerBehindWrite(db)) {
+      long started = System.nanoTime();
+      assertThatThrownBy(db::close).isInstanceOf(PersistenceException.class);
+      // Ожидание по умолчанию (5 с) заняло бы заметно дольше
+      assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
     }
   }
 }

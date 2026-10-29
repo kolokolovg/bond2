@@ -3,6 +3,7 @@
 package ru.onlychill.bonds2;
 
 import javafx.application.Application;
+import ru.onlychill.bonds2.ui.MainWindowApp;
 
 /** Точка входа: запускает главное окно. */
 public final class Main {

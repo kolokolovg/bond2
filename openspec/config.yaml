@@ -1,32 +1,43 @@
 schema: spec-driven
 
-# Project context (optional)
-# Add only constraints that should guide OpenSpec artifacts and workflows.
-# Include constraints an agent cannot infer by reading the code.
-# Keep general project documentation and discoverable codebase facts out.
-# Example:
-#   context: |
-#     Designs and tasks must cover Windows, macOS, and Linux
-#     Write all artifacts in Spanish
+context: |
+  Артефакты, комментарии и Javadoc, сообщения пользователю и README пишутся
+  на русском языке. Идентификаторы в коде и ключи настроек — на английском.
+  Каждый Java-файл начинается с `// SPDX-License-Identifier: Apache-2.0`.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always state what is out of scope
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Платформы: Linux, macOS, Windows. Любое решение, связанное с путями,
+  файловой системой или блокировками, должно учитывать все три.
 
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+  Данные пользователя в SQLite нельзя терять и портить. Код не изменяет
+  файл, который не распознан как БД приложения. Изменения в хранении и
+  миграциях обязаны описывать поведение при сбое.
+
+  Обязательные проверки до завершения задачи: `./gradlew check` (spotless,
+  errorprone с NullAway, spotbugs, тесты, покрытие строк не ниже порога из
+  gradle.properties). Для логики БД и настроек запускается также `pitest`.
+  Код в `src/verified` проверяется `openjmlProve`; его контракты JML
+  менять только вместе с доказательством. Тесты UI идут с `-Pheadless=true`.
+
+rules:
+  proposal:
+    - Отмечать несовместимые изменения как **BREAKING**.
+    - Перечислять затронутые существующие спеки точным именем из `openspec/specs/`.
+    - Указывать, что выходит за рамки изменения.
+  specs:
+    - Одно требование описывает одно поведение; длиннее 500 символов — делить на несколько.
+    - Крайние случаи выносить в сценарии, а не в текст требования.
+    - Изменяя требование (MODIFIED), сохранять названия всех существующих сценариев.
+  design:
+    - Для каждого решения указывать рассмотренную альтернативу.
+    - Для изменений хранилища и файлов описывать поведение при сбое и откат.
+    - Для путей и файловых операций указывать поведение на Windows, macOS и Linux.
+  tasks:
+    - Каждая задача — не более двух часов работы с проверяемым результатом.
+    - Для каждого изменения поведения предусматривать тесты, включая граничные случаи.
+    - Последняя группа — обновление README и прогон проверок (`check`, при необходимости `pitest`).
+
+operations:
+  apply:
+    guidance:
+      - Не менять файлы вне области задач; форматирование выполняет spotless.
+      - Отмечать задачу выполненной только после зелёных тестов её области.

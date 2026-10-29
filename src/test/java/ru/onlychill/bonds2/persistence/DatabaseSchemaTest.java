@@ -20,8 +20,12 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 class DatabaseSchemaTest {
 
@@ -146,9 +150,7 @@ class DatabaseSchemaTest {
   }
 
   @Test
-  void inspectSqliteWithOnlyInternalTablesIsEmpty() throws Exception {
-    // Таблица с AUTOINCREMENT удалена, а служебная sqlite_sequence осталась: пользовательских
-    // таблиц нет
+  void inspectSqliteWithOnlyInternalSequenceTableIsForeign() throws Exception {
     Path file = dir.resolve("internal.db");
     executeSql(
         file,
@@ -159,8 +161,55 @@ class DatabaseSchemaTest {
       assertThat(queryLong(c, "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence'"))
           .isEqualTo(1);
     }
+    byte[] before = Files.readAllBytes(file);
 
-    assertThat(Database.inspect(file)).isEqualTo(Database.State.EMPTY);
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.FOREIGN);
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @ParameterizedTest
+  @MethodSource("foreignWithoutTables")
+  void inspectSqliteWithoutTablesButWithOtherObjectsIsForeignAndStaysUntouched(
+      String name, String[] sql) throws Exception {
+    Path file = dir.resolve(name + ".db");
+    executeSql(file, sql);
+    byte[] before = Files.readAllBytes(file);
+
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.FOREIGN);
+    assertThatThrownBy(() -> Database.initialize(file, TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("только для пустого файла");
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  static Stream<Arguments> foreignWithoutTables() {
+    return Stream.of(
+        Arguments.of(
+            "view",
+            new String[] {
+              "CREATE TABLE t (x INTEGER)", "CREATE VIEW v AS SELECT 1 AS a", "DROP TABLE t"
+            }),
+        Arguments.of(
+            "trigger",
+            new String[] {
+              "CREATE TABLE t (x INTEGER)",
+              "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+              "CREATE TABLE u (x INTEGER)",
+              "DROP TABLE u"
+            }),
+        Arguments.of(
+            "stat1",
+            new String[] {
+              "CREATE TABLE t (x INTEGER)",
+              "CREATE INDEX i ON t (x)",
+              "INSERT INTO t VALUES (1)",
+              "ANALYZE",
+              "DROP TABLE t"
+            }),
+        Arguments.of("user-version", new String[] {"PRAGMA user_version = 5"}),
+        Arguments.of("application-id", new String[] {"PRAGMA application_id = 123"}));
   }
 
   @Test

@@ -2,7 +2,9 @@
 
 package ru.onlychill.bonds2.persistence;
 
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.function.UnaryOperator;
 
 /** Расположение файла БД в пользовательском каталоге данных. */
@@ -45,15 +47,27 @@ public final class DataDirectory {
     String os = osName.toLowerCase(java.util.Locale.ROOT);
     Path base;
     if (os.contains("win")) {
-      String appData = env.apply("APPDATA");
-      base =
-          appData == null || appData.isBlank() ? home.resolve("AppData/Roaming") : Path.of(appData);
+      // Local, а не Roaming: каталог содержит БД с WAL и файл блокировки
+      base = absoluteEnv(env, "LOCALAPPDATA").orElse(home.resolve("AppData/Local"));
     } else if (os.contains("mac")) {
       base = home.resolve("Library/Application Support");
     } else {
-      String xdg = env.apply("XDG_DATA_HOME");
-      base = xdg == null || xdg.isBlank() ? home.resolve(".local/share") : Path.of(xdg);
+      base = absoluteEnv(env, "XDG_DATA_HOME").orElse(home.resolve(".local/share"));
     }
     return base.resolve("bonds2");
+  }
+
+  /** Переменная окружения как путь: только непустая, корректная и абсолютная. */
+  private static Optional<Path> absoluteEnv(UnaryOperator<String> env, String name) {
+    String value = env.apply(name);
+    if (value == null || value.isBlank()) {
+      return Optional.empty();
+    }
+    try {
+      Path path = Path.of(value);
+      return path.isAbsolute() ? Optional.of(path) : Optional.empty();
+    } catch (InvalidPathException e) {
+      return Optional.empty();
+    }
   }
 }
