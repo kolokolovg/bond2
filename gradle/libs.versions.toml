@@ -1,0 +1,23 @@
+[versions]
+junit = "6.1.3"
+assertj = "3.27.7"
+jqwik = "1.10.2"
+errorprone = "2.51.0"
+nullaway = "0.14.3"
+jacoco = "0.8.16"
+
+[libraries]
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+assertj = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+jqwik = { module = "net.jqwik:jqwik", version.ref = "jqwik" }
+errorprone-core = { module = "com.google.errorprone:error_prone_core", version.ref = "errorprone" }
+nullaway = { module = "com.uber.nullaway:nullaway", version.ref = "nullaway" }
+jspecify = { module = "org.jspecify:jspecify", version = "1.0.0" }
+
+[plugins]
+errorprone = { id = "net.ltgt.errorprone", version = "5.1.1" }
+spotless = { id = "com.diffplug.spotless", version = "8.10.4" }
+spotbugs = { id = "com.github.spotbugs", version = "6.5.13" }
+pitest = { id = "info.solidsoft.pitest", version = "1.19.0" }
