@@ -2,10 +2,12 @@
 
 package ru.onlychill.bonds2.ui;
 
+import java.util.concurrent.CompletableFuture;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Alert.AlertType;
 import javafx.scene.control.ButtonBar.ButtonData;
 import javafx.scene.control.ButtonType;
+import javafx.stage.Modality;
 import javafx.stage.Window;
 
 /** Диалоги JavaFX: модальные {@link Alert} поверх главного окна. Вызываются из потока JavaFX. */
@@ -18,22 +20,30 @@ final class FxDialogs implements Dialogs {
   }
 
   @Override
-  public boolean confirmMigration(String question) {
+  public CompletableFuture<Boolean> confirmMigration(String question) {
     var apply = new ButtonType("Применить", ButtonData.OK_DONE);
-    return alert(AlertType.CONFIRMATION, "Миграция базы", question, apply, ButtonType.CANCEL)
-        .showAndWait()
-        .filter(apply::equals)
-        .isPresent();
+    Alert alert =
+        alert(AlertType.CONFIRMATION, "Миграция базы", question, apply, ButtonType.CANCEL);
+    var result = new CompletableFuture<Boolean>();
+    alert.setOnHidden(event -> result.complete(apply.equals(alert.getResult())));
+    result.whenComplete(
+        (confirmed, error) -> {
+          if (result.isCancelled()) {
+            alert.close();
+          }
+        });
+    alert.show();
+    return result;
   }
 
   @Override
   public void warn(String message) {
-    alert(AlertType.WARNING, "Внимание", message, ButtonType.OK).showAndWait();
+    alert(AlertType.WARNING, "Внимание", message, ButtonType.OK).show();
   }
 
   @Override
   public void error(String message) {
-    alert(AlertType.ERROR, "Ошибка", message, ButtonType.OK).showAndWait();
+    alert(AlertType.ERROR, "Ошибка", message, ButtonType.OK).show();
   }
 
   private Alert alert(AlertType type, String title, String message, ButtonType... buttons) {
@@ -41,6 +51,7 @@ final class FxDialogs implements Dialogs {
     alert.setTitle(title);
     alert.setHeaderText(null);
     alert.initOwner(owner);
+    alert.initModality(Modality.WINDOW_MODAL);
     return alert;
   }
 }

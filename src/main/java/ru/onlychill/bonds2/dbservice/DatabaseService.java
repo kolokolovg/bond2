@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
@@ -125,42 +126,60 @@ public final class DatabaseService {
   }
 
   /**
-   * Останавливает сервис: ждёт завершения текущей операции не дольше {@code timeout}, затем
-   * закрывает БД. Во время миграции и ожидания решения о ней отказывает. По истечении срока
-   * ожидание прекращается, а БД, открытая позже, закрывается без публикации состояния. Повторный
-   * вызов после остановки возвращает {@link ShutdownResult#STOPPED}.
+   * Останавливает сервис и ждёт не дольше {@code timeout}: обёртка над {@link
+   * #shutdownAsync(Duration)}. Вызов блокирует вызывающего, поэтому из потока интерфейса его
+   * применять не следует.
    */
   public ShutdownResult shutdown(Duration timeout) {
-    CompletableFuture<ShutdownResult> done;
-    synchronized (shutdownLock) {
-      CompletableFuture<ShutdownResult> existing = shutdownFuture;
-      if (existing != null) {
-        done = existing;
-      } else if (mustNotStop(state)) {
-        return ShutdownResult.REFUSED;
-      } else {
-        done = new CompletableFuture<>();
-        shutdownFuture = done;
-        stopping = true;
-        try {
-          executor.execute(() -> runShutdown(done));
-        } catch (RejectedExecutionException e) {
-          done.complete(ShutdownResult.STOPPED);
-        }
-      }
-    }
+    CompletableFuture<ShutdownResult> done = shutdownAsync(timeout);
     try {
       return done.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     } catch (TimeoutException e) {
       LOG.log(System.Logger.Level.WARNING, "Операция с БД не завершилась при остановке", e);
-    } catch (java.util.concurrent.ExecutionException e) {
+    } catch (ExecutionException e) {
       LOG.log(System.Logger.Level.WARNING, "Остановка сервиса БД завершилась ошибкой", e);
       return ShutdownResult.STOPPED;
     }
     abandoned = true;
     return ShutdownResult.TIMED_OUT;
+  }
+
+  /**
+   * Останавливает сервис, не блокируя вызывающего: ждёт завершения текущей операции не дольше
+   * {@code timeout}, затем закрывает БД. Во время миграции и ожидания решения о ней результат —
+   * {@link ShutdownResult#REFUSED}. По истечении срока результат — {@link
+   * ShutdownResult#TIMED_OUT}, а БД, открытая позже, закрывается без публикации состояния.
+   * Повторный вызов после начала остановки возвращает future с тем же результатом.
+   */
+  @SuppressWarnings("FutureReturnValueIgnored")
+  public CompletableFuture<ShutdownResult> shutdownAsync(Duration timeout) {
+    synchronized (shutdownLock) {
+      CompletableFuture<ShutdownResult> existing = shutdownFuture;
+      if (existing != null) {
+        return existing.copy();
+      }
+      if (mustNotStop(state)) {
+        return CompletableFuture.completedFuture(ShutdownResult.REFUSED);
+      }
+      var done = new CompletableFuture<ShutdownResult>();
+      shutdownFuture = done;
+      stopping = true;
+      try {
+        executor.execute(() -> runShutdown(done));
+      } catch (RejectedExecutionException e) {
+        done.complete(ShutdownResult.STOPPED);
+      }
+      done.completeOnTimeout(ShutdownResult.TIMED_OUT, timeout.toMillis(), TimeUnit.MILLISECONDS);
+      done.thenAccept(
+          result -> {
+            if (result == ShutdownResult.TIMED_OUT) {
+              abandoned = true;
+            }
+          });
+      return done;
+    }
   }
 
   private static boolean mustNotStop(DbState current) {
@@ -189,7 +208,8 @@ public final class DatabaseService {
       executor.shutdown();
       done.complete(ShutdownResult.STOPPED);
     } catch (RuntimeException | Error e) {
-      done.completeExceptionally(e);
+      LOG.log(System.Logger.Level.WARNING, "Остановка сервиса БД завершилась ошибкой", e);
+      done.complete(ShutdownResult.STOPPED);
       throw e;
     }
   }

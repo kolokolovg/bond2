@@ -24,6 +24,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -424,9 +425,32 @@ class DatabaseControllerTest {
     var db = controller();
 
     db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void repeatedExitRequestIsIgnoredWhileStopping() throws InterruptedException {
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+
+    db.requestExit();
+    db.requestExit();
+    // Поток «интерфейса» не заблокирован: остановка ждёт открытия, выхода ещё нет
+    ui.settle();
+    assertThat(exits.get()).isZero();
+
+    storage.openGate.release();
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
 
     assertThat(exits.get()).isEqualTo(1);
-    assertThat(dialogs.warnings).isEmpty();
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 
   @Test
@@ -438,22 +462,13 @@ class DatabaseControllerTest {
     var db = controller();
     db.openDatabase();
     assertThat(storage.openGate.awaitEntered()).isTrue();
-    var releaser =
-        new Thread(
-            () -> {
-              try {
-                Thread.sleep(200);
-              } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-              }
-              storage.openGate.release();
-            });
-    releaser.start();
 
     db.requestExit();
-    releaser.join();
+    ui.settle();
+    assertThat(exits.get()).isZero();
+    storage.openGate.release();
+    ui.pumpUntil(() -> exits.get() == 1);
 
-    assertThat(exits.get()).isEqualTo(1);
     assertThat(storage.opened).hasSize(1);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
     assertThat(dialogs.warnings).isEmpty();
@@ -480,36 +495,73 @@ class DatabaseControllerTest {
     storage.migrateGate.release();
     ui.pumpUntil(() -> isOpen(db));
     db.requestExit();
-    assertThat(exits.get()).isEqualTo(1);
+    ui.pumpUntil(() -> exits.get() == 1);
   }
 
   @Test
-  void exitWhileMigrationDialogIsOpenDoesNothing() throws SQLException {
+  void exitWhileMigrationDialogIsOpenCancelsDialogDeclinesAndExits()
+      throws SQLException, IOException {
+    TestDatabases.outdatedAt(userFile());
+    byte[] before = Files.readAllBytes(userFile());
+    saveSettings(userFile(), true);
+    var db = controller();
+    dialogs.pending = new CompletableFuture<>();
+
+    db.openOnStartup();
+    ui.pumpUntil(() -> dialogs.questions.size() == 1);
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
+
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+
+    assertThat(dialogs.pending).isCancelled();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+    assertThat(backupsIn(dataDir())).isEmpty();
+  }
+
+  @Test
+  void migrationDialogCancelledByAnotherWayIsNotReportedAsError() throws SQLException {
     TestDatabases.outdatedAt(userFile());
     saveSettings(userFile(), true);
     var db = controller();
-    dialogs.onQuestion = db::requestExit;
+    dialogs.pending = new CompletableFuture<>();
 
     db.openOnStartup();
-    settleAfterOperation(db);
+    ui.pumpUntil(() -> dialogs.questions.size() == 1);
+    dialogs.pending.cancel(true);
+    ui.settle();
 
-    assertThat(dialogs.questions).hasSize(1);
-    assertThat(dialogs.warnings).isEmpty();
-    assertThat(exits.get()).isZero();
-    assertThat(isOpen(db)).isTrue();
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(db.stateProperty().get()).isInstanceOf(DbState.AwaitingMigration.class);
   }
 
   @Test
-  void exitWhileAwaitingMigrationDecisionDoesNothing() throws SQLException {
+  void declinedMigrationClosesDatabaseWithoutChangingFile() throws SQLException, IOException {
+    TestDatabases.outdatedAt(userFile());
+    byte[] before = Files.readAllBytes(userFile());
+    saveSettings(userFile(), true);
+    var db = controller();
+    dialogs.migrationAnswer = false;
+
+    db.openOnStartup();
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
+
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+  }
+
+  @Test
+  void exitWhileAwaitingMigrationDecisionDeclinesAndExits() throws SQLException {
     TestDatabases.outdatedAt(userFile());
     var db = controller();
-    // Диалог уже закрыт, решение не отправлено: сервис ждёт команду, выход блокирован
+    // Диалога нет, решение не отправлено: сервис ждёт команду
     service.open(userFile(), false).join();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
 
     db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
 
-    assertThat(exits.get()).isZero();
     assertThat(dialogs.warnings).isEmpty();
     assertThat(dialogs.questions).isEmpty();
   }
@@ -672,6 +724,23 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void shutdownTimeoutsMatchSpecification() {
+    assertThat(DatabaseController.STOP_TIMEOUT).isEqualTo(Duration.ofSeconds(5));
+    assertThat(DatabaseController.SHUTDOWN_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+    assertThat(DatabaseController.MIGRATION_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+  }
+
+  @Test
+  void shutdownAfterExitThroughMenuIsIdempotent() {
+    var db = opened();
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+
+    assertThatCode(db::shutdown).doesNotThrowAnyException();
+    assertThat(exits.get()).isEqualTo(1);
+  }
+
+  @Test
   void shutdownWhileClosedDoesNothing() {
     var db = controller();
 
@@ -778,13 +847,14 @@ class DatabaseControllerTest {
     final List<String> warnings = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
     boolean migrationAnswer = true;
-    Runnable onQuestion = () -> {};
+
+    /** Если задан, диалог остаётся открытым, пока тест не завершит этот future. */
+    @Nullable CompletableFuture<Boolean> pending;
 
     @Override
-    public boolean confirmMigration(String question) {
+    public CompletableFuture<Boolean> confirmMigration(String question) {
       questions.add(question);
-      onQuestion.run();
-      return migrationAnswer;
+      return pending != null ? pending : CompletableFuture.completedFuture(migrationAnswer);
     }
 
     @Override

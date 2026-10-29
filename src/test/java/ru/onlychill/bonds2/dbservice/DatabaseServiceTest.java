@@ -445,6 +445,56 @@ class DatabaseServiceTest {
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
   }
 
+  @Test
+  void shutdownAsyncDoesNotBlockCallerAndCompletesAfterOperation() throws InterruptedException {
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+
+    var stopping = service.shutdownAsync(Duration.ofSeconds(30));
+
+    assertThat(stopping).isNotDone();
+    storage.openGate.release();
+    assertThat(get(stopping)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  @Test
+  void shutdownAsyncTimesOutAndLateDatabaseIsClosed() throws InterruptedException {
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+
+    var stopping = service.shutdownAsync(Duration.ofMillis(50));
+
+    assertThat(get(stopping)).isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+    assertThat(
+            Eventually.holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
+        .isTrue();
+  }
+
+  @Test
+  void shutdownAsyncIsIdempotent() {
+    var first = service.shutdownAsync(Duration.ofSeconds(30));
+    var second = service.shutdownAsync(Duration.ofSeconds(30));
+
+    assertThat(get(first)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(get(second)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(get(service.shutdownAsync(Duration.ofSeconds(1)))).isEqualTo(ShutdownResult.STOPPED);
+  }
+
+  @Test
+  void shutdownAsyncIsRefusedWhileAwaitingMigrationDecision() throws SQLException {
+    TestDatabases.outdatedAt(file());
+    get(service.open(file(), false));
+
+    assertThat(get(service.shutdownAsync(Duration.ofSeconds(1)))).isEqualTo(ShutdownResult.REFUSED);
+  }
+
   private static void release(GatedStorage.Gate gate) {
     try {
       Thread.sleep(100);

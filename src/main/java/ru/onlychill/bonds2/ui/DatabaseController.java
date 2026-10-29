@@ -5,6 +5,7 @@ package ru.onlychill.bonds2.ui;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -43,8 +44,14 @@ final class DatabaseController {
   private static final String MIGRATION_EXIT_WARNING =
       "Идёт миграция базы. Дождитесь её завершения, затем закройте окно.";
 
-  /** Сколько ждать окончания открытия или создания при завершении приложения. */
+  /** Сколько ждать окончания открытия или создания при выходе через меню и окно. */
   static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(30);
+
+  /** Сколько ждать открытия или создания при завершении в обход меню. */
+  static final Duration STOP_TIMEOUT = Duration.ofSeconds(5);
+
+  /** Сколько ждать окончания миграции при завершении в обход меню. */
+  static final Duration MIGRATION_TIMEOUT = Duration.ofSeconds(30);
 
   private static final System.Logger LOG = System.getLogger(DatabaseController.class.getName());
 
@@ -66,8 +73,14 @@ final class DatabaseController {
   /** Копия испорченного файла настроек; {@code null}, если её нет. */
   private final @Nullable Path badCopy;
 
-  /** Диалог миграции открыт: пока он виден, выход блокируется. */
-  private boolean migrationDialogOpen;
+  /** Открытый диалог миграции; {@code null}, если диалога нет. */
+  private @Nullable CompletableFuture<Boolean> migrationDialog;
+
+  /** Запущенная миграция; {@code null}, если её не было. */
+  private @Nullable CompletableFuture<OpenResult> migration;
+
+  /** Выход начат: повторный запрос игнорируется. */
+  private boolean exiting;
 
   /** Приложение завершается: поздние результаты сервиса игнорируются. */
   private boolean stopped;
@@ -172,51 +185,79 @@ final class DatabaseController {
 
   /**
    * «Файл → Выход» и закрытие окна кнопкой. Во время миграции выход откладывается с сообщением;
-   * пока ждут решения о миграции или открыт её диалог, ничего не происходит; иначе сервис
-   * останавливается (открытие и создание ждут не дольше {@link #SHUTDOWN_TIMEOUT}) и приложение
-   * завершается.
+   * повторный запрос игнорируется. Ожидаемая миграция считается отклонённой, её диалог закрывается.
+   * Остановка сервиса идёт в фоне (открытие и создание ждут не дольше {@link #SHUTDOWN_TIMEOUT}),
+   * приложение завершается по её итогу.
    */
+  @SuppressWarnings("FutureReturnValueIgnored")
   void requestExit() {
     DbState current = state.get();
     if (current instanceof DbState.Migrating) {
       dialogs.warn(MIGRATION_EXIT_WARNING);
-    } else if (current instanceof DbState.AwaitingMigration || migrationDialogOpen) {
       return;
-    } else if (shutdown(SHUTDOWN_TIMEOUT) == ShutdownResult.REFUSED) {
+    }
+    if (exiting) {
+      return;
+    }
+    exiting = true;
+    CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
+    if (current instanceof DbState.AwaitingMigration) {
+      cancelMigrationDialog();
+      prepared = service.declineMigration();
+    }
+    prepared
+        .thenCompose(ignored -> service.shutdownAsync(SHUTDOWN_TIMEOUT))
+        .thenAcceptAsync(this::onExitResult, uiExecutor)
+        .exceptionally(
+            error -> {
+              LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД", error);
+              return null;
+            });
+  }
+
+  private void onExitResult(ShutdownResult result) {
+    if (result == ShutdownResult.REFUSED) {
+      exiting = false;
       dialogs.warn(MIGRATION_EXIT_WARNING);
     } else {
+      stopped = true;
       exit.run();
     }
   }
 
-  /**
-   * Вызывается при завершении приложения: останавливает сервис и ждёт его не дольше {@link
-   * #SHUTDOWN_TIMEOUT}. Результаты, пришедшие позже, игнорируются.
-   */
-  void shutdown() {
-    if (shutdown(SHUTDOWN_TIMEOUT) != ShutdownResult.REFUSED) {
-      return;
+  private void cancelMigrationDialog() {
+    CompletableFuture<Boolean> dialog = migrationDialog;
+    migrationDialog = null;
+    if (dialog != null) {
+      dialog.cancel(true);
     }
-    // Выход в обход меню: миграция доводится до конца, ожидание решения считается отказом
-    if (service.state() instanceof DbState.AwaitingMigration) {
-      service
-          .declineMigration()
-          .orTimeout(SHUTDOWN_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-          .join();
-    }
-    long deadline = System.nanoTime() + SHUTDOWN_TIMEOUT.toNanos();
-    while (service.state() instanceof DbState.Migrating && System.nanoTime() < deadline) {
-      try {
-        Thread.sleep(20);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        return;
-      }
-    }
-    shutdown(SHUTDOWN_TIMEOUT);
   }
 
-  /** Остановка сервиса с отказом поздним результатам, если отказа в остановке не было. */
+  /**
+   * Вызывается при завершении приложения в обход меню: останавливает сервис и ждёт не дольше {@link
+   * #STOP_TIMEOUT}. Ожидающая решения миграция считается отклонённой, идущая доводится до конца не
+   * дольше {@link #MIGRATION_TIMEOUT}. Результаты, пришедшие позже, игнорируются.
+   */
+  void shutdown() {
+    if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
+      return;
+    }
+    cancelMigrationDialog();
+    CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
+    if (service.state() instanceof DbState.AwaitingMigration) {
+      prepared = service.declineMigration();
+    } else if (migration != null) {
+      prepared = migration.copy();
+    }
+    prepared
+        .orTimeout(MIGRATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+        .handle((value, error) -> null)
+        .thenCompose(ignored -> service.shutdownAsync(MIGRATION_TIMEOUT))
+        .join();
+    stopped = true;
+  }
+
+  /** Синхронная остановка сервиса; поздние результаты игнорируются, если отказа не было. */
   ShutdownResult shutdown(Duration timeout) {
     ShutdownResult result = service.shutdown(timeout);
     if (result != ShutdownResult.REFUSED) {
@@ -271,19 +312,30 @@ final class DatabaseController {
   }
 
   /** Спрашивает согласие на миграцию; без согласия файл не меняется и БД не открывается. */
+  @SuppressWarnings("FutureReturnValueIgnored")
   private void askAboutMigration() {
-    migrationDialogOpen = true;
-    boolean confirmed;
-    try {
-      confirmed = dialogs.confirmMigration(MIGRATION_QUESTION);
-    } finally {
-      migrationDialogOpen = false;
-    }
+    CompletableFuture<Boolean> dialog = dialogs.confirmMigration(MIGRATION_QUESTION);
+    migrationDialog = dialog;
+    dialog
+        .thenComposeAsync(this::onMigrationAnswer, uiExecutor)
+        .exceptionally(
+            error -> {
+              if (!(error instanceof CancellationException)
+                  && !(error.getCause() instanceof CancellationException)) {
+                LOG.log(System.Logger.Level.ERROR, "Сбой операции с БД", error);
+              }
+              return null;
+            });
+  }
+
+  private CompletableFuture<Void> onMigrationAnswer(boolean confirmed) {
+    migrationDialog = null;
     if (confirmed) {
-      deliver(service.migrate(), this::onMigrationResult);
-    } else {
-      deliver(service.declineMigration(), result -> {});
+      CompletableFuture<OpenResult> started = service.migrate();
+      migration = started;
+      return started.thenAcceptAsync(this::onMigrationResult, uiExecutor);
     }
+    return service.declineMigration().thenAccept(result -> {});
   }
 
   private void onMigrationResult(OpenResult result) {
