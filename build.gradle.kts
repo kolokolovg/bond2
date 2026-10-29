@@ -4,6 +4,7 @@ import net.ltgt.gradle.errorprone.errorprone
 plugins {
     application
     jacoco
+    alias(libs.plugins.javafx)
     alias(libs.plugins.pitest)
     alias(libs.plugins.errorprone)
     alias(libs.plugins.spotbugs)
@@ -19,6 +20,11 @@ java {
     }
 }
 
+javafx {
+    version = libs.versions.javafx.get()
+    modules = listOf("javafx.controls")
+}
+
 // Верифицируемый код (JML) компилируется вместе с основным
 sourceSets.main {
     java.srcDir("src/verified/java")
@@ -30,6 +36,8 @@ repositories {
 
 dependencies {
     compileOnly(libs.jspecify)
+    implementation(libs.sqlite.jdbc)
+    implementation(libs.flyway.core)
     errorprone(libs.errorprone.core)
     errorprone(libs.nullaway)
 
@@ -78,6 +86,14 @@ tasks.jacocoTestReport {
 }
 
 tasks.jacocoTestCoverageVerification {
+    // GUI-обвязка (запуск JavaFX, показ окна) не покрывается автоматическими тестами
+    classDirectories.setFrom(
+        files(
+            classDirectories.files.map {
+                fileTree(it) { exclude("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/MainWindowApp.class") }
+            },
+        ),
+    )
     violationRules {
         rule {
             limit {
@@ -96,7 +112,7 @@ pitest {
     pitestVersion = "1.30.1"
     junit5PluginVersion = "1.2.3"
     targetClasses = setOf("ru.onlychill.bonds2.*")
-    excludedClasses = setOf("ru.onlychill.bonds2.Main")
+    excludedClasses = setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.MainWindowApp")
     mutationThreshold = providers.gradleProperty("mutation.threshold").map { it.toInt() }
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false
