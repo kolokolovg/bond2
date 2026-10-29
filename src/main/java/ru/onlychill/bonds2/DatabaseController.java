@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 import java.io.UncheckedIOException;
@@ -36,6 +38,10 @@ final class DatabaseController {
       "Схема БД устарела. Применить миграции? Перед миграцией будет создана резервная копия файла"
           + " БД.";
 
+  /** Выход во время миграции откладывается: прервать миграцию посреди нельзя. */
+  private static final String MIGRATION_EXIT_WARNING =
+      "Идёт миграция базы. Дождитесь её завершения, затем закройте окно.";
+
   private static final String STATUS_CLOSED = "БД не открыта";
   private static final String STATUS_OPEN = "БД открыта: ";
   private static final String STATUS_OPENING = "Открытие базы…";
@@ -45,6 +51,7 @@ final class DatabaseController {
   private static final String REASON_MISSING = "файл не найден";
   private static final String REASON_OUTDATED = "схема устарела";
   private static final String REASON_TOO_NEW = "схема новее приложения";
+  private static final String REASON_FOREIGN = "не база bonds2";
   private static final String REASON_OPEN = "ошибка открытия";
   private static final String REASON_CREATE = "ошибка создания";
   private static final String REASON_MIGRATION = "ошибка миграции";
@@ -52,6 +59,11 @@ final class DatabaseController {
 
   /** Сколько ждать окончания фоновой операции при завершении приложения. */
   static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(30);
+
+  /**
+   * Сколько ждать окончания фоновой операции, если пользователь выбрал «Выйти» во время открытия.
+   */
+  static final Duration FORCED_EXIT_TIMEOUT = Duration.ofSeconds(3);
 
   private static final System.Logger LOG = System.getLogger(DatabaseController.class.getName());
 
@@ -79,6 +91,12 @@ final class DatabaseController {
      */
     boolean confirmMigration(String question);
 
+    /**
+     * Вопрос при выходе во время открытия или создания БД: «Дождаться» или «Выйти». {@code true},
+     * если пользователь выбрал «Выйти».
+     */
+    boolean confirmExitDuringOpen();
+
     /** Предупреждение: операция отложена или выполнена частично, приложение продолжает работу. */
     void warn(String message);
 
@@ -91,12 +109,17 @@ final class DatabaseController {
   private final Background background;
   private final Dialogs dialogs;
   private final Runnable exit;
-  private final Duration shutdownTimeout;
 
   private final ReadOnlyObjectWrapper<DbState> state = new ReadOnlyObjectWrapper<>(DbState.CLOSED);
   private final ReadOnlyStringWrapper status = new ReadOnlyStringWrapper(STATUS_CLOSED);
 
   private Settings settings;
+
+  /** Файл настроек при запуске был испорчен и сброшен. */
+  private final boolean recovered;
+
+  /** Копия испорченного файла настроек; {@code null}, если её нет. */
+  private final @Nullable Path badCopy;
 
   /** Открытая БД: не {@code null} ровно тогда, когда состояние {@link DbState#OPEN}. */
   private @Nullable Database database;
@@ -120,24 +143,15 @@ final class DatabaseController {
       Background background,
       Dialogs dialogs,
       Runnable exit) {
-    this(store, defaultDatabaseFile, background, dialogs, exit, SHUTDOWN_TIMEOUT);
-  }
-
-  /** Конструктор с заданным сроком ожидания фоновой операции при завершении. */
-  DatabaseController(
-      SettingsStore store,
-      Path defaultDatabaseFile,
-      Background background,
-      Dialogs dialogs,
-      Runnable exit,
-      Duration shutdownTimeout) {
-    this.shutdownTimeout = shutdownTimeout;
     this.store = store;
     this.defaultDatabaseFile = defaultDatabaseFile;
     this.background = background;
     this.dialogs = dialogs;
     this.exit = exit;
-    this.settings = store.load();
+    SettingsStore.LoadResult loaded = store.load();
+    this.settings = loaded.settings();
+    this.recovered = loaded.recovered();
+    this.badCopy = loaded.badCopy();
   }
 
   /** Текущее состояние БД; меню и кнопки подписываются на него. */
@@ -157,18 +171,28 @@ final class DatabaseController {
 
   /** Автооткрытие после показа окна: открывает БД, только если это включено в настройках. */
   void openOnStartup() {
+    if (recovered) {
+      dialogs.warn(
+          "Файл настроек был повреждён, настройки сброшены к значениям по умолчанию."
+              + (badCopy != null ? " Копия повреждённого файла: " + badCopy : ""));
+    }
     if (settings.autoOpen()) {
-      openDatabase();
+      open(!recovered);
     }
   }
 
   /** «Файл → Открыть базу»: открывает БД по пути из настроек. */
   void openDatabase() {
+    open(true);
+  }
+
+  /** Открытие; {@code autoCreate} разрешает создать БД по пути по умолчанию, если файла нет. */
+  private void open(boolean autoCreate) {
     if (!state.get().allowsOpen()) {
       return;
     }
     Path file = databaseFile();
-    boolean defaultPath = settings.databasePath() == null;
+    boolean defaultPath = autoCreate && settings.databasePath() == null;
     setState(DbState.OPENING, STATUS_OPENING);
     pendingWork =
         background.run(
@@ -228,28 +252,51 @@ final class DatabaseController {
   }
 
   /**
-   * «Файл → Выход» и закрытие окна кнопкой: во время операций с БД выход откладывается с
-   * сообщением, иначе приложение завершается.
+   * «Файл → Выход» и закрытие окна кнопкой: во время миграции выход откладывается с сообщением; во
+   * время открытия или создания спрашивает «Дождаться» или «Выйти»; иначе приложение завершается.
    */
   void requestExit() {
     DbState current = state.get();
     if (current == DbState.MIGRATING) {
-      dialogs.warn("Идёт миграция базы. Дождитесь её завершения, затем закройте окно.");
+      dialogs.warn(MIGRATION_EXIT_WARNING);
     } else if (current == DbState.OPENING) {
-      dialogs.warn("Идёт открытие или создание базы. Дождитесь завершения, затем закройте окно.");
+      if (dialogs.confirmExitDuringOpen()) {
+        exitAfterOpening();
+      }
     } else {
       exit.run();
     }
   }
 
   /**
-   * Вызывается при завершении приложения. Ждёт окончания фоновой операции не дольше срока ожидания
-   * и закрывает полученную БД, затем закрывает открытую БД. Результаты, пришедшие позже,
-   * игнорируются.
+   * Выход, выбранный во время открытия: ждёт операцию не дольше {@link #FORCED_EXIT_TIMEOUT} и
+   * завершает приложение. Пока показывался диалог, операция могла перейти в миграцию: тогда выход
+   * откладывается, как и во время миграции.
+   */
+  private void exitAfterOpening() {
+    if (state.get() == DbState.MIGRATING) {
+      dialogs.warn(MIGRATION_EXIT_WARNING);
+      return;
+    }
+    shutdown(FORCED_EXIT_TIMEOUT);
+    exit.run();
+  }
+
+  /**
+   * Вызывается при завершении приложения: ждёт окончания фоновой операции не дольше {@link
+   * #SHUTDOWN_TIMEOUT}, затем закрывает БД. Результаты, пришедшие позже, игнорируются.
    */
   void shutdown() {
+    shutdown(SHUTDOWN_TIMEOUT);
+  }
+
+  /**
+   * Завершение со сроком ожидания фоновой операции {@code timeout}. По истечении срока ожидание
+   * прекращается, операция не прерывается, а её результат игнорируется.
+   */
+  void shutdown(Duration timeout) {
     stopped = true;
-    awaitPendingWork();
+    awaitPendingWork(timeout);
     Database opened = database;
     if (opened == null) {
       return;
@@ -263,15 +310,15 @@ final class DatabaseController {
     }
   }
 
-  /** Ждёт фоновую работу и закрывает БД, которую она открыла; по сроку или ошибке идёт дальше. */
-  private void awaitPendingWork() {
+  /** Ждёт фоновую работу не дольше {@code timeout} и закрывает БД, которую она открыла. */
+  private void awaitPendingWork(Duration timeout) {
     Future<OpenResult> work = pendingWork;
     pendingWork = null;
     if (work == null) {
       return;
     }
     try {
-      discard(work.get(shutdownTimeout.toMillis(), TimeUnit.MILLISECONDS));
+      discard(work.get(timeout.toMillis(), TimeUnit.MILLISECONDS));
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     } catch (TimeoutException e) {
@@ -380,7 +427,8 @@ final class DatabaseController {
 
   /**
    * Фоновая часть открытия: по наличию файла и состоянию схемы выбирает действие. Файл по пути из
-   * настроек не создаётся, но путь по умолчанию создаётся автоматически.
+   * настроек не создаётся, но путь по умолчанию создаётся автоматически. Пустой файл
+   * инициализируется без вопроса о миграции; чужой файл отклоняется и не меняется.
    */
   private static OpenResult attempt(Path file, boolean defaultPath) {
     if (Files.notExists(file)) {
@@ -391,6 +439,8 @@ final class DatabaseController {
         case UP_TO_DATE -> new OpenResult.Opened(Database.open(file));
         case NEEDS_MIGRATION -> new OpenResult.NeedsMigration();
         case TOO_NEW -> tooNew(file);
+        case EMPTY -> new OpenResult.Opened(Database.initialize(file));
+        case FOREIGN -> foreign(file);
       };
     } catch (PersistenceException e) {
       return new OpenResult.Failed(REASON_OPEN, ErrorMessages.of(e));
@@ -429,5 +479,11 @@ final class DatabaseController {
         "Схема БД новее этой версии приложения. Файл не изменён: "
             + file
             + ". Обновите приложение.");
+  }
+
+  /** Чужая SQLite-база: её не открывают, миграцию не предлагают, файл не меняют. */
+  private static OpenResult.Failed foreign(Path file) {
+    return new OpenResult.Failed(
+        REASON_FOREIGN, "Файл " + file + " не является базой данных bonds2. Файл не изменён.");
   }
 }

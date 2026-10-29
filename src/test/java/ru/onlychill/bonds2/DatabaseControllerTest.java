@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -63,17 +65,6 @@ class DatabaseControllerTest {
     return controllerWith(settingsFile(), background);
   }
 
-  private DatabaseController controller(
-      DatabaseController.Background background, Duration shutdownTimeout) {
-    return new DatabaseController(
-        new SettingsStore(settingsFile()),
-        defaultFile(),
-        background,
-        dialogs,
-        exits::incrementAndGet,
-        shutdownTimeout);
-  }
-
   private DatabaseController controllerWith(
       Path settings, DatabaseController.Background background) {
     return new DatabaseController(
@@ -133,6 +124,51 @@ class DatabaseControllerTest {
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + defaultFile());
   }
 
+  private void corruptSettings() throws IOException {
+    Files.createDirectories(dir.resolve("cfg"));
+    Files.writeString(settingsFile(), "database.autoOpen=maybe\n");
+  }
+
+  @Test
+  void resetSettingsWarnAndDoNotCreateDefaultDatabase() throws IOException {
+    corruptSettings();
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(dialogs.warnings).hasSize(1);
+    assertThat(dialogs.warnings.get(0)).contains("settings.properties.bad-");
+    assertThat(defaultFile()).doesNotExist();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
+    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: файл не найден");
+    assertThat(dialogs.errors).hasSize(1);
+    assertThat(dialogs.errors.get(0)).contains("Создать базу");
+  }
+
+  @Test
+  void resetSettingsStillOpenExistingDefaultDatabase() throws IOException {
+    newDatabaseAt(defaultFile());
+    corruptSettings();
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(dialogs.warnings).hasSize(1);
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void firstRunWithoutSettingsFileCreatesDefaultDatabaseWithoutWarning() {
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(defaultFile()).isRegularFile();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
+  }
+
   @Test
   void missingUserFileIsNotCreatedAndHintsAtCreation() {
     saveSettings(userFile(), true);
@@ -148,8 +184,8 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void outdatedSchemaIsMigratedAfterConfirmationWithBackup() throws IOException {
-    emptyUserFile();
+  void outdatedSchemaIsMigratedAfterConfirmationWithBackup() throws SQLException, IOException {
+    outdatedUserDatabase();
     saveSettings(userFile(), true);
     var db = immediate();
 
@@ -164,8 +200,9 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void refusedMigrationLeavesFileUntouchedAndDatabaseClosed() throws IOException {
-    emptyUserFile();
+  void refusedMigrationLeavesFileUntouchedAndDatabaseClosed() throws SQLException, IOException {
+    outdatedUserDatabase();
+    byte[] before = Files.readAllBytes(userFile());
     saveSettings(userFile(), true);
     dialogs.migrationAnswer = false;
     var db = immediate();
@@ -175,9 +212,61 @@ class DatabaseControllerTest {
     assertThat(dialogs.questions).hasSize(1);
     assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: схема устарела");
-    assertThat(userFile()).isEmptyFile();
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
     assertThat(backupsIn(dataDir())).isEmpty();
     assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void emptyFileIsInitializedWithoutMigrationQuestion() throws IOException {
+    emptyUserFile();
+    saveSettings(userFile(), true);
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
+    assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(Database.inspect(userFile())).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void sqliteWithoutTablesIsInitializedWithoutMigrationQuestion() throws SQLException, IOException {
+    Files.createDirectories(dataDir());
+    executeSql(userFile(), "CREATE TABLE tmp (x INTEGER)", "DROP TABLE tmp");
+    saveSettings(userFile(), true);
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(Database.inspect(userFile())).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void foreignDatabaseIsRejectedWithoutChangesAndWithoutMigrationOffer()
+      throws SQLException, IOException {
+    foreignUserDatabase();
+    byte[] before = Files.readAllBytes(userFile());
+    saveSettings(userFile(), true);
+    var db = immediate();
+
+    db.openOnStartup();
+
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
+    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: не база bonds2");
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(dialogs.errors).hasSize(1);
+    assertThat(dialogs.errors.get(0))
+        .contains("не является базой данных bonds2")
+        .contains("Файл не изменён");
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+    assertThat(backupsIn(dataDir())).isEmpty();
   }
 
   @Test
@@ -278,23 +367,44 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void exitIsDelayedWithMessageWhileOpening() {
+  void exitDuringOpeningWaitingKeepsAppRunningUntilOperationFinishes() {
     saveSettings(null, true);
     var background = FakeBackground.deferred();
     var db = controller(background);
     db.openDatabase();
+    dialogs.exitAnswer = false;
 
     db.requestExit();
 
+    assertThat(dialogs.exitQuestions).isEqualTo(1);
     assertThat(db.stateProperty().get()).isEqualTo(DbState.OPENING);
-    assertThat(dialogs.warnings).hasSize(1);
-    assertThat(dialogs.warnings.get(0)).contains("Идёт открытие");
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(exits.get()).isZero();
+
+    background.runNext();
+
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
     assertThat(exits.get()).isZero();
   }
 
   @Test
-  void exitIsDelayedWithMessageWhileMigratingAndAllowedAfterwards() throws IOException {
-    emptyUserFile();
+  void exitDuringOpeningExitsWhenUserChoosesExit() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    dialogs.exitAnswer = true;
+
+    db.requestExit();
+
+    assertThat(dialogs.exitQuestions).isEqualTo(1);
+    assertThat(exits.get()).isEqualTo(1);
+  }
+
+  @Test
+  void exitIsDelayedWithMessageWhileMigratingAndAllowedAfterwards()
+      throws SQLException, IOException {
+    outdatedUserDatabase();
     saveSettings(userFile(), true);
     var background = FakeBackground.deferred();
     var db = controller(background);
@@ -311,6 +421,24 @@ class DatabaseControllerTest {
     assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
     db.requestExit();
     assertThat(exits.get()).isEqualTo(1);
+  }
+
+  @Test
+  void migrationBlocksExitWithoutOfferingToExit() throws SQLException, IOException {
+    outdatedUserDatabase();
+    saveSettings(userFile(), true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    dialogs.exitAnswer = true;
+    db.openDatabase();
+    background.runNext();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.MIGRATING);
+
+    db.requestExit();
+
+    assertThat(dialogs.exitQuestions).isZero();
+    assertThat(dialogs.warnings).singleElement().asString().contains("Идёт миграция");
+    assertThat(exits.get()).isZero();
   }
 
   @Test
@@ -333,7 +461,8 @@ class DatabaseControllerTest {
     assertThat(db.stateProperty().get()).isEqualTo(DbState.OPEN);
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
     assertThat(userFile()).isRegularFile();
-    assertThat(new SettingsStore(settingsFile()).load()).isEqualTo(new Settings(userFile(), false));
+    assertThat(new SettingsStore(settingsFile()).load().settings())
+        .isEqualTo(new Settings(userFile(), false));
     assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
     assertThat(dialogs.errors).isEmpty();
   }
@@ -428,10 +557,10 @@ class DatabaseControllerTest {
   void lateResultAfterShutdownClosesItsDatabaseAndStaysSilent() {
     saveSettings(null, true);
     var background = FakeBackground.deferred();
-    var db = controller(background, Duration.ofMillis(50));
+    var db = controller(background);
     db.openDatabase();
 
-    db.shutdown();
+    db.shutdown(Duration.ofMillis(50));
     background.runNext();
 
     assertThat(background.results).hasSize(1);
@@ -459,8 +588,8 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void shutdownDuringMigrationClosesMigratedDatabase() throws IOException {
-    emptyUserFile();
+  void shutdownDuringMigrationClosesMigratedDatabase() throws SQLException, IOException {
+    outdatedUserDatabase();
     saveSettings(userFile(), true);
     var background = FakeBackground.deferred();
     var db = controller(background);
@@ -481,10 +610,10 @@ class DatabaseControllerTest {
   void shutdownStopsWaitingWhenWorkDoesNotFinishInTime() {
     saveSettings(null, true);
     var background = FakeBackground.deferred();
-    var db = controller(background, Duration.ofMillis(50));
+    var db = controller(background);
     db.openDatabase();
 
-    assertTimeoutPreemptively(Duration.ofSeconds(10), db::shutdown);
+    assertTimeoutPreemptively(Duration.ofSeconds(10), () -> db.shutdown(Duration.ofMillis(50)));
 
     assertThat(dialogs.errors).isEmpty();
   }
@@ -493,18 +622,69 @@ class DatabaseControllerTest {
   void errorAfterShutdownIsNotReported() {
     saveSettings(null, true);
     var background = FakeBackground.deferred();
-    var db = controller(background, Duration.ofMillis(50));
+    var db = controller(background);
     db.openDatabase();
 
-    db.shutdown();
+    db.shutdown(Duration.ofMillis(50));
     background.runNext();
 
     assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
-  void migrationAnswerAfterShutdownDoesNotStartMigration() throws IOException {
-    emptyUserFile();
+  void forcedExitStopsWaitingForHungOperationAfterThreeSeconds() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    dialogs.exitAnswer = true;
+    long started = System.nanoTime();
+
+    assertTimeoutPreemptively(Duration.ofSeconds(10), db::requestExit);
+
+    assertThat(Duration.ofNanos(System.nanoTime() - started))
+        .isGreaterThanOrEqualTo(Duration.ofMillis(2_900));
+    assertThat(exits.get()).isEqualTo(1);
+  }
+
+  @Test
+  void forcedExitClosesDatabaseWhoseOperationFinishesWhileDialogIsOpen() {
+    saveSettings(null, true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    dialogs.exitAnswer = true;
+    dialogs.onExitQuestion = background::runNext;
+
+    db.requestExit();
+
+    assertDatabaseClosed(background.results.get(0));
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
+    assertThat(exits.get()).isEqualTo(1);
+  }
+
+  @Test
+  void exitChosenWhileOpeningTurnsIntoMigrationIsStillDelayed() throws SQLException, IOException {
+    outdatedUserDatabase();
+    saveSettings(userFile(), true);
+    var background = FakeBackground.deferred();
+    var db = controller(background);
+    db.openDatabase();
+    dialogs.exitAnswer = true;
+    // Пока спрашивают о выходе, открытие находит устаревшую схему; пользователь согласен на
+    // миграцию
+    dialogs.onExitQuestion = background::runNext;
+
+    db.requestExit();
+
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.MIGRATING);
+    assertThat(dialogs.warnings).singleElement().asString().contains("Идёт миграция");
+    assertThat(exits.get()).isZero();
+  }
+
+  @Test
+  void migrationAnswerAfterShutdownDoesNotStartMigration() throws SQLException, IOException {
+    outdatedUserDatabase();
     saveSettings(userFile(), true);
     var background = FakeBackground.deferred();
     var db = controller(background);
@@ -554,7 +734,8 @@ class DatabaseControllerTest {
     db.saveSettings(new Settings(userFile(), false));
 
     assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
-    assertThat(new SettingsStore(settingsFile()).load()).isEqualTo(new Settings(userFile(), false));
+    assertThat(new SettingsStore(settingsFile()).load().settings())
+        .isEqualTo(new Settings(userFile(), false));
   }
 
   @Test
@@ -568,10 +749,25 @@ class DatabaseControllerTest {
     assertThat(db.settings()).isEqualTo(Settings.defaults());
   }
 
-  /** Создаёт пустой файл пользовательской БД: в нём нет схемы, значит миграции устарели. */
+  /** Создаёт пустой файл пользовательской БД: его инициализируют без вопроса о миграции. */
   private void emptyUserFile() throws IOException {
     Files.createDirectories(dataDir());
     Files.createFile(userFile());
+  }
+
+  /**
+   * Создаёт файл пользовательской БД с устаревшей схемой: история миграций есть, но ни одна
+   * миграция не применена. Таблица {@code app_info} удаляется, чтобы миграция её создала.
+   */
+  private void outdatedUserDatabase() throws SQLException {
+    newDatabaseAt(userFile());
+    executeSql(userFile(), "DELETE FROM flyway_schema_history", "DROP TABLE app_info");
+  }
+
+  /** Создаёт чужую SQLite-базу: таблица есть, истории миграций приложения нет. */
+  private void foreignUserDatabase() throws SQLException, IOException {
+    Files.createDirectories(dataDir());
+    executeSql(userFile(), "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
   }
 
   /**
@@ -723,12 +919,22 @@ class DatabaseControllerTest {
     final List<String> errors = new ArrayList<>();
     boolean migrationAnswer = true;
     Runnable onQuestion = () -> {};
+    int exitQuestions;
+    boolean exitAnswer;
+    Runnable onExitQuestion = () -> {};
 
     @Override
     public boolean confirmMigration(String question) {
       questions.add(question);
       onQuestion.run();
       return migrationAnswer;
+    }
+
+    @Override
+    public boolean confirmExitDuringOpen() {
+      exitQuestions++;
+      onExitQuestion.run();
+      return exitAnswer;
     }
 
     @Override

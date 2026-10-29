@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 /** Расчёт купона облигации. */

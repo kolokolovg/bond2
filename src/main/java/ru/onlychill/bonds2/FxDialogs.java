@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 import javafx.scene.control.Alert;
@@ -21,6 +23,23 @@ final class FxDialogs implements DatabaseController.Dialogs {
     return alert(AlertType.CONFIRMATION, "Миграция базы", question, apply, ButtonType.CANCEL)
         .showAndWait()
         .filter(apply::equals)
+        .isPresent();
+  }
+
+  @Override
+  public boolean confirmExitDuringOpen() {
+    // «Дождаться» — кнопка отмены: закрытие диалога означает продолжение работы, а не выход
+    var wait = new ButtonType("Дождаться", ButtonData.CANCEL_CLOSE);
+    var exit = new ButtonType("Выйти", ButtonData.OTHER);
+    return alert(
+            AlertType.CONFIRMATION,
+            "Выход",
+            "Идёт открытие или создание базы. Дождаться окончания или выйти? При выходе приложение"
+                + " ждёт операцию не дольше 3 секунд и завершается.",
+            wait,
+            exit)
+        .showAndWait()
+        .filter(exit::equals)
         .isPresent();
   }
 

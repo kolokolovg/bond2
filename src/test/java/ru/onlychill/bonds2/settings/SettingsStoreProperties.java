@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2.settings;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -20,7 +22,7 @@ class SettingsStoreProperties {
       Path file = dir.resolve("settings.properties");
       Files.write(file, bytes);
 
-      Settings loaded = new SettingsStore(file).load();
+      Settings loaded = new SettingsStore(file).load().settings();
 
       Path path = loaded.databasePath();
       assertThat(path == null || path.isAbsolute()).isTrue();
@@ -37,9 +39,9 @@ class SettingsStoreProperties {
       Files.writeString(file, "database.autoOpen=" + text.replace('\n', ' ') + "\n");
       var store = new SettingsStore(file);
 
-      Settings first = store.load();
+      Settings first = store.load().settings();
 
-      assertThat(store.load()).isEqualTo(first);
+      assertThat(store.load().settings()).isEqualTo(first);
     } finally {
       deleteTree(dir);
     }

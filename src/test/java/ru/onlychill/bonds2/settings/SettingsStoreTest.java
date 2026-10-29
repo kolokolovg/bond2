@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2.settings;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -34,7 +36,7 @@ class SettingsStoreTest {
   }
 
   private Settings loadFromSettingsFile() {
-    return new SettingsStore(settingsFile()).load();
+    return new SettingsStore(settingsFile()).load().settings();
   }
 
   private void writeSettingsFile(String content) throws IOException {
@@ -120,27 +122,36 @@ class SettingsStoreTest {
   void corruptedContentIsBackedUpAndReset(String content) throws IOException {
     writeSettingsFile(content);
 
-    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    var result = storeAt(FIXED).load();
+    assertThat(result.settings()).isEqualTo(Settings.defaults());
+    assertThat(result.recovered()).isTrue();
 
     Path backup = dir.resolve("bonds2/settings.properties.bad-20260102-030405");
+    assertThat(result.badCopy()).isEqualTo(backup);
     assertThat(Files.readString(backup, StandardCharsets.UTF_8)).isEqualTo(content);
     assertThat(Files.readAllLines(settingsFile(), StandardCharsets.UTF_8))
         .contains("database.path=", "database.autoOpen=true");
     // Повторная загрузка файл уже не считает испорченным
-    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    var again = storeAt(FIXED).load();
+    assertThat(again.settings()).isEqualTo(Settings.defaults());
+    assertThat(again.recovered()).isFalse();
+    assertThat(again.badCopy()).isNull();
     assertThat(namesIn(dir.resolve("bonds2")))
         .containsExactly("settings.properties", "settings.properties.bad-20260102-030405");
   }
 
   @Test
   void missingFileAndMissingKeysAreNotCorruption() throws IOException {
-    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    var missing = storeAt(FIXED).load();
+    assertThat(missing.settings()).isEqualTo(Settings.defaults());
+    assertThat(missing.recovered()).isFalse();
+    assertThat(missing.badCopy()).isNull();
     assertThat(dir.resolve("bonds2")).doesNotExist();
 
     writeSettingsFile("database.autoOpen=false\n");
-    assertThat(storeAt(FIXED).load()).isEqualTo(new Settings(null, false));
+    assertThat(storeAt(FIXED).load().settings()).isEqualTo(new Settings(null, false));
     writeSettingsFile("# только комментарий\n");
-    assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+    assertThat(storeAt(FIXED).load().settings()).isEqualTo(Settings.defaults());
     assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
   }
 
@@ -166,7 +177,10 @@ class SettingsStoreTest {
         dir.resolve("bonds2"),
         java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"));
     try {
-      assertThat(storeAt(FIXED).load()).isEqualTo(Settings.defaults());
+      var result = storeAt(FIXED).load();
+      assertThat(result.settings()).isEqualTo(Settings.defaults());
+      assertThat(result.recovered()).isTrue();
+      assertThat(result.badCopy()).isNull();
       assertThat(Files.readString(settingsFile())).isEqualTo("database.autoOpen=maybe\n");
     } finally {
       Files.setPosixFilePermissions(

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -8,6 +10,7 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.OLD;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.TOO_NEW;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createDatabase;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createOldDatabaseWithRow;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.executeSql;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
 
@@ -86,19 +89,65 @@ class DatabaseMigrationTest {
   }
 
   @Test
-  void backupCreationFailureStopsMigrationBeforeAnyChange() throws Exception {
+  void existingBackupWithSameStampGetsNumericSuffix() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Имя копии занято каталогом: создать копию нельзя, существующее не трогаем
-    Path occupied = Files.createDirectory(dir.resolve(BACKUP_NAME));
+    // Имя копии занято (в том числе каталогом): существующее не трогаем
+    Path occupied = Files.writeString(dir.resolve(BACKUP_NAME), "other");
+    Files.createDirectory(dir.resolve(BACKUP_NAME + "-1"));
     byte[] before = Files.readAllBytes(file);
 
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("уже существует");
+    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
 
-    assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(occupied).isDirectory();
-    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
+    assertThat(backup.getFileName()).hasToString(BACKUP_NAME + "-2");
+    assertThat(Files.readAllBytes(backup)).isEqualTo(before);
+    assertThat(Files.readString(occupied)).isEqualTo("other");
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+  }
+
+  @Test
+  void successfulMigrationKeepsOnlyThreeNewestBackupsOfThisFile() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    for (String name :
+        List.of(
+            "app.db.bak-20200101-000000",
+            "app.db.bak-20250101-000000",
+            "app.db.bak-20250101-000000-1",
+            "app.db.bak-20250101-000000-10",
+            "app.db.bak-20250101-000000-2")) {
+      Files.writeString(dir.resolve(name), name);
+    }
+    Files.writeString(dir.resolve("other.db.bak-20200101-000000"), "x");
+    Files.writeString(dir.resolve("app.db.bak-old"), "x");
+    Files.writeString(dir.resolve("app.db.bak-20200101-000000.txt"), "x");
+
+    Database.migrateWithBackup(file, CLOCK, NEW_OK);
+
+    assertThat(backupNames())
+        .containsExactlyInAnyOrder(
+            BACKUP_NAME,
+            "app.db.bak-20250101-000000-10",
+            "app.db.bak-20250101-000000-2",
+            "other.db.bak-20200101-000000",
+            "app.db.bak-old",
+            "app.db.bak-20200101-000000.txt");
+  }
+
+  @Test
+  void failedMigrationDeletesNoBackups() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    for (String name :
+        List.of(
+            "app.db.bak-20200101-000000",
+            "app.db.bak-20210101-000000",
+            "app.db.bak-20220101-000000",
+            "app.db.bak-20230101-000000")) {
+      Files.writeString(dir.resolve(name), name);
+    }
+
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
+        .isInstanceOf(MigrationException.class);
+
+    assertThat(backupNames()).hasSize(5).contains("app.db.bak-20200101-000000", BACKUP_NAME);
   }
 
   @Test
@@ -128,15 +177,30 @@ class DatabaseMigrationTest {
   }
 
   @Test
-  void publicMigrationAppliesMainMigrationsToEmptyFile() throws Exception {
-    // Пустой файл SQLite — это БД без схемы: набор приложения применяется целиком
+  void migrationRefusesEmptyFileAndKeepsItEmpty() throws Exception {
+    // Пустой файл не мигрируют, а инициализируют (Database.initialize): копия не нужна
     Path file = Files.createFile(dir.resolve("empty.db"));
 
-    Path backup = Database.migrateWithBackup(file);
+    assertThatThrownBy(() -> Database.migrateWithBackup(file))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("пуст");
 
-    assertThat(backup.getFileName().toString()).matches("empty\\.db\\.bak-\\d{8}-\\d{6}");
-    assertThat(backup).isEmptyFile();
-    assertThat(Database.inspect(file)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(file).isEmptyFile();
+    assertThat(backupsOf(file)).isEmpty();
+  }
+
+  @Test
+  void migrationRefusesForeignDatabaseAndKeepsIt() throws Exception {
+    Path file = dir.resolve("app.db");
+    executeSql(file, "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
+    byte[] before = Files.readAllBytes(file);
+
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("не база данных приложения");
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+    assertThat(backupsOf(file)).isEmpty();
   }
 
   private static String valueOf(Path file, String locations) {
@@ -151,6 +215,15 @@ class DatabaseMigrationTest {
               db,
               "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '" + table + "'")
           > 0;
+    }
+  }
+
+  private List<String> backupNames() throws IOException {
+    try (Stream<Path> files = Files.list(dir)) {
+      return files
+          .map(p -> String.valueOf(p.getFileName()))
+          .filter(n -> n.contains(".bak-"))
+          .toList();
     }
   }
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -104,19 +106,27 @@ class FxBackgroundTest {
   }
 
   @Test
-  void workThreadIsNotDaemon() throws Exception {
-    var daemon = new AtomicReference<Boolean>();
+  void hungWorkRunsOnDaemonThreadSoItDoesNotKeepJvmAlive() throws InterruptedException {
+    var started = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var daemon = new AtomicBoolean();
+    try {
+      new FxBackground()
+          .run(
+              () -> {
+                daemon.set(Thread.currentThread().isDaemon());
+                started.countDown();
+                // Операция «зависла»: ждёт, пока тест её отпустит (finally отпускает всегда)
+                release.await();
+                return new OpenResult.NeedsMigration();
+              },
+              result -> {},
+              error -> {});
 
-    new FxBackground()
-        .run(
-            () -> {
-              daemon.set(Thread.currentThread().isDaemon());
-              return new OpenResult.NeedsMigration();
-            },
-            result -> {},
-            error -> {})
-        .get(30, TimeUnit.SECONDS);
-
-    assertThat(daemon.get()).isFalse();
+      assertThat(started.await(30, TimeUnit.SECONDS)).isTrue();
+      assertThat(daemon).isTrue();
+    } finally {
+      release.countDown();
+    }
   }
 }

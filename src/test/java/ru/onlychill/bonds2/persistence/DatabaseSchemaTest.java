@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -9,11 +11,14 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.TOO_NEW;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createDatabase;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createOldDatabaseWithRow;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.exec;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.executeSql;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -120,6 +125,80 @@ class DatabaseSchemaTest {
   }
 
   @Test
+  void inspectZeroByteFileIsEmptyAndStaysUntouched() throws Exception {
+    Path file = Files.createFile(dir.resolve("empty.db"));
+
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.EMPTY);
+
+    assertThat(file).isEmptyFile();
+  }
+
+  @Test
+  void inspectSqliteWithoutTablesIsEmptyAndStaysUntouched() throws Exception {
+    Path file = dir.resolve("no-tables.db");
+    executeSql(file, "CREATE TABLE tmp (x INTEGER)", "DROP TABLE tmp");
+    assertThat(file).isNotEmptyFile();
+    byte[] before = Files.readAllBytes(file);
+
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.EMPTY);
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @Test
+  void inspectSqliteWithOnlyInternalTablesIsEmpty() throws Exception {
+    // Таблица с AUTOINCREMENT удалена, а служебная sqlite_sequence осталась: пользовательских
+    // таблиц нет
+    Path file = dir.resolve("internal.db");
+    executeSql(
+        file,
+        "CREATE TABLE tmp (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+        "INSERT INTO tmp DEFAULT VALUES",
+        "DROP TABLE tmp");
+    try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file)) {
+      assertThat(queryLong(c, "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_sequence'"))
+          .isEqualTo(1);
+    }
+
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.EMPTY);
+  }
+
+  @Test
+  void inspectSqliteWithTablesButNoHistoryIsForeignAndStaysUntouched() throws Exception {
+    Path file = dir.resolve("foreign.db");
+    executeSql(file, "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
+    byte[] before = Files.readAllBytes(file);
+
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.FOREIGN);
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @Test
+  void openRejectsZeroByteFileAndKeepsIt() throws Exception {
+    Path file = Files.createFile(dir.resolve("empty.db"));
+
+    assertThatThrownBy(() -> Database.open(file))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("пуст");
+
+    assertThat(file).isEmptyFile();
+  }
+
+  @Test
+  void openRejectsForeignDatabaseAndKeepsIt() throws Exception {
+    Path file = dir.resolve("foreign.db");
+    executeSql(file, "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
+    byte[] before = Files.readAllBytes(file);
+
+    assertThatThrownBy(() -> Database.open(file))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("не база данных приложения");
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @Test
   void inspectMissingFileFailsWithoutCreatingIt() {
     Path file = dir.resolve("missing.db");
 
@@ -207,5 +286,90 @@ class DatabaseSchemaTest {
 
     assertThatThrownBy(() -> Database.open(file)).isInstanceOf(PersistenceException.class);
     assertThat(file).doesNotExist();
+  }
+
+  @Test
+  void initializeAppliesCurrentSchemaToEmptyFile() throws Exception {
+    Path file = Files.createFile(dir.resolve("empty.db"));
+
+    try (var db = Database.initialize(file, TIMEOUT, NEW_OK)) {
+      assertThat(appliedMigrations(db)).isEqualTo(3);
+    }
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+  }
+
+  @Test
+  void initializePublicAppliesMainSchemaToEmptyFile() throws Exception {
+    Path file = Files.createFile(dir.resolve("empty.db"));
+
+    try (var db = Database.initialize(file)) {
+      assertThat(appliedMigrations(db)).isEqualTo(1);
+    }
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.UP_TO_DATE);
+  }
+
+  @Test
+  void initializeSqliteWithoutTablesAppliesCurrentSchema() throws Exception {
+    Path file = dir.resolve("no-tables.db");
+    executeSql(file, "CREATE TABLE tmp (x INTEGER)", "DROP TABLE tmp");
+
+    try (var db = Database.initialize(file, TIMEOUT, NEW_OK)) {
+      assertThat(appliedMigrations(db)).isEqualTo(3);
+    }
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+  }
+
+  @Test
+  void initializeFailureKeepsFileEmptyAndRetryIsPossible() throws Exception {
+    // NEW_FAIL применяет V2 и падает на V3: частичная схема должна исчезнуть, файл не удаляется
+    Path file = Files.createFile(dir.resolve("empty.db"));
+
+    assertThatThrownBy(() -> Database.initialize(file, TIMEOUT, NEW_FAIL))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("Не удалось инициализировать БД");
+
+    assertThat(file).isEmptyFile();
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.EMPTY);
+    try (var db = Database.initialize(file, TIMEOUT, NEW_OK)) {
+      assertThat(appliedMigrations(db)).isEqualTo(3);
+    }
+  }
+
+  @Test
+  void initializeRejectsDatabaseWithTablesAndKeepsIt() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    byte[] before = Files.readAllBytes(file);
+
+    assertThatThrownBy(() -> Database.initialize(file, TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("только для пустого файла");
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @Test
+  void initializeRejectsForeignDatabaseAndKeepsIt() throws Exception {
+    Path file = dir.resolve("foreign.db");
+    executeSql(file, "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
+    byte[] before = Files.readAllBytes(file);
+
+    assertThatThrownBy(() -> Database.initialize(file, TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("только для пустого файла");
+
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+  }
+
+  @Test
+  void initializeMissingFileFailsWithoutCreatingIt() {
+    Path file = dir.resolve("missing.db");
+
+    assertThatThrownBy(() -> Database.initialize(file)).isInstanceOf(PersistenceException.class);
+    assertThat(file).doesNotExist();
+  }
+
+  /** Число успешно применённых миграций по истории Flyway. */
+  private static long appliedMigrations(Database db) {
+    return queryLong(db, "SELECT count(*) FROM flyway_schema_history WHERE success = 1");
   }
 }

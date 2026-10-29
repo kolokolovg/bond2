@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2;
 
 import java.util.concurrent.Callable;
@@ -17,8 +19,8 @@ final class FxBackground implements DatabaseController.Background {
     task.setOnSucceeded(event -> onDone.accept(task.getValue()));
     task.setOnFailed(event -> onError.accept(task.getException()));
     var thread = new Thread(task, "bonds2-db");
-    // Не демон: при завершении приложения операцию с БД не обрывают, её ждёт контроллер
-    thread.setDaemon(false);
+    // Демон: зависшая операция с БД не удерживает JVM; ожидание при выходе ведёт контроллер
+    thread.setDaemon(true);
     thread.start();
     return outcome;
   }

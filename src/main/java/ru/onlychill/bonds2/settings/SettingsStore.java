@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 package ru.onlychill.bonds2.settings;
 
 import java.io.IOException;
@@ -24,6 +26,15 @@ import org.jspecify.annotations.Nullable;
  * целевым, затем переименование поверх старого файла.
  */
 public final class SettingsStore {
+
+  /**
+   * Результат чтения настроек.
+   *
+   * @param settings настройки
+   * @param badCopy копия испорченного файла; {@code null}, если сброса не было или копия не создана
+   * @param recovered файл был испорчен и сброшен к значениям по умолчанию
+   */
+  public record LoadResult(Settings settings, @Nullable Path badCopy, boolean recovered) {}
 
   /** Ключ пути к файлу БД; пустое значение означает путь по умолчанию. */
   static final String KEY_DATABASE_PATH = "database.path";
@@ -61,11 +72,11 @@ public final class SettingsStore {
    * settings.properties.bad-<yyyyMMdd-HHmmss>} и заменяется значениями по умолчанию. Отсутствие
    * файла и отдельных ключей повреждением не считается. Сбой копирования или записи пишется в лог.
    *
-   * @return настройки из файла либо {@link Settings#defaults()}
+   * @return настройки из файла либо {@link Settings#defaults()} с признаком сброса и путём к копии
    */
-  public Settings load() {
+  public LoadResult load() {
     if (Files.notExists(file)) {
-      return Settings.defaults();
+      return new LoadResult(Settings.defaults(), null, false);
     }
     var props = new Properties();
     try (Reader in = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
@@ -81,22 +92,25 @@ public final class SettingsStore {
     if (pathBroken || autoOpen == null) {
       return recover();
     }
-    return new Settings(path, autoOpen);
+    return new LoadResult(new Settings(path, autoOpen), null, false);
   }
 
   /** Сохраняет испорченный файл рядом и записывает значения по умолчанию. */
-  private Settings recover() {
+  private LoadResult recover() {
     Settings defaults = Settings.defaults();
+    Path copy = null;
     try {
       if (!Files.isRegularFile(file)) {
         throw new IOException("не обычный файл: " + file);
       }
-      Files.copy(file, badCopyPath());
+      Path target = badCopyPath();
+      Files.copy(file, target);
+      copy = target;
       save(defaults);
     } catch (IOException | UncheckedIOException e) {
       LOG.log(System.Logger.Level.WARNING, "Не удалось восстановить настройки: " + file, e);
     }
-    return defaults;
+    return new LoadResult(defaults, copy, true);
   }
 
   /** Свободное имя копии; при совпадении метки времени добавляется числовой суффикс. */
