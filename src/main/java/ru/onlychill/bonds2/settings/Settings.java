@@ -5,7 +5,6 @@ package ru.onlychill.bonds2.settings;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import org.jspecify.annotations.Nullable;
-import ru.onlychill.bonds2.persistence.DataDirectory;
 
 /**
  * Настройки приложения, связанные с БД: путь к файлу и флаг автооткрытия при запуске.
@@ -21,12 +20,6 @@ public record Settings(@Nullable Path databasePath, boolean autoOpen) {
   /** Настройки по умолчанию: путь к БД не задан, автооткрытие включено. */
   public static Settings defaults() {
     return new Settings(null, DEFAULT_AUTO_OPEN);
-  }
-
-  /** Путь к файлу БД: заданный в настройках либо путь по умолчанию из {@link DataDirectory}. */
-  public Path resolvedDatabasePath() {
-    Path path = databasePath;
-    return path != null ? path : DataDirectory.databaseFile();
   }
 
   /**

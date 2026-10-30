@@ -24,12 +24,11 @@ class OpenFailuresTest {
   }
 
   @Test
-  void busyCodeIsClassifiedAsBusyAndRetryable() {
+  void busyCodeIsClassifiedAsBusy() {
     var failure = OpenFailures.openFailed(dbFailure(5, "database is locked"));
 
     assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
     assertThat(failure.message()).contains("занята").contains("Повторите").contains("позже");
-    assertThat(OpenFailures.retryable(failure)).isTrue();
   }
 
   @Test
@@ -37,7 +36,6 @@ class OpenFailuresTest {
     var failure = OpenFailures.createFailed(dbFailure(6, "database table is locked"));
 
     assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
-    assertThat(OpenFailures.retryable(failure)).isTrue();
   }
 
   @Test
@@ -49,7 +47,6 @@ class OpenFailuresTest {
         .contains("места")
         .doesNotContain("занята")
         .doesNotContain("повреждён");
-    assertThat(OpenFailures.retryable(failure)).isFalse();
   }
 
   @Test
@@ -61,7 +58,6 @@ class OpenFailuresTest {
         .contains("повреждён")
         .doesNotContain("занята")
         .doesNotContain("места");
-    assertThat(OpenFailures.retryable(failure)).isFalse();
   }
 
   @Test
@@ -70,7 +66,6 @@ class OpenFailuresTest {
 
     assertThat(failure.reason()).isEqualTo("файл БД недоступен");
     assertThat(failure.message()).contains("недоступен");
-    assertThat(OpenFailures.retryable(failure)).isFalse();
   }
 
   @Test
@@ -89,7 +84,6 @@ class OpenFailuresTest {
 
     assertThat(failure.reason()).isEqualTo("ошибка открытия");
     assertThat(failure.message()).isEqualTo("Ошибка работы с БД Причина: UNIQUE constraint failed");
-    assertThat(OpenFailures.retryable(failure)).isFalse();
 
     var creation = OpenFailures.createFailed(dbFailure(19, "UNIQUE constraint failed"));
     assertThat(creation.reason()).isEqualTo("ошибка создания");
@@ -111,7 +105,6 @@ class OpenFailuresTest {
 
     assertThat(failure.reason()).isEqualTo("ошибка открытия");
     assertThat(failure.message()).isEqualTo("Ошибка работы с БД Причина: disk I/O error");
-    assertThat(OpenFailures.retryable(failure)).isFalse();
   }
 
   @Test
@@ -124,7 +117,6 @@ class OpenFailuresTest {
         OpenFailures.migrationFailed(new MigrationException("Миграция не выполнена", middle));
 
     assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
-    assertThat(OpenFailures.retryable(failure)).isTrue();
   }
 
   @Test
@@ -135,7 +127,6 @@ class OpenFailuresTest {
     var failure = OpenFailures.openFailed(new PersistenceException("Ошибка работы с БД", head));
 
     assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
-    assertThat(OpenFailures.retryable(failure)).isTrue();
   }
 
   @Test
@@ -146,14 +137,12 @@ class OpenFailuresTest {
 
     assertThat(unexpected.reason()).isEqualTo("внутренняя ошибка");
     assertThat(unexpected.message()).contains("database is locked");
-    assertThat(OpenFailures.retryable(unexpected)).isFalse();
   }
 
   @Test
   void placeReasonsAreUnchanged() {
     var missing = OpenFailures.missing(Path.of("data", "bonds.db"));
     assertThat(missing.reason()).isEqualTo("файл не найден");
-    assertThat(OpenFailures.retryable(missing)).isFalse();
   }
 
   @Test

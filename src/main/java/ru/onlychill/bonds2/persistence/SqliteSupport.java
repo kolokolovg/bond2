@@ -96,10 +96,6 @@ final class SqliteSupport {
     return existingFileProperties(Database.DEFAULT_BUSY_TIMEOUT);
   }
 
-  static Properties maintenanceProperties(Duration busyTimeout) {
-    return existingFileProperties(busyTimeout);
-  }
-
   /**
    * DataSource соединений Flyway к существующему файлу БД: каждое {@link #getConnection()}
    * открывает новое соединение со свойствами «только существующий файл», поэтому Flyway (чтение

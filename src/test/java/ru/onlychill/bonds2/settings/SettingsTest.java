@@ -7,7 +7,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import ru.onlychill.bonds2.persistence.DataDirectory;
 
 class SettingsTest {
 
@@ -19,18 +18,6 @@ class SettingsTest {
 
     assertThat(defaults.databasePath()).isNull();
     assertThat(defaults.autoOpen()).isTrue();
-  }
-
-  @Test
-  void missingPathResolvesToDefaultDatabaseFile() {
-    assertThat(Settings.defaults().resolvedDatabasePath()).isEqualTo(DataDirectory.databaseFile());
-  }
-
-  @Test
-  void configuredPathResolvesToItself() {
-    Path custom = dir.resolve("custom/bonds.db");
-
-    assertThat(new Settings(custom, false).resolvedDatabasePath()).isEqualTo(custom);
   }
 
   @Test

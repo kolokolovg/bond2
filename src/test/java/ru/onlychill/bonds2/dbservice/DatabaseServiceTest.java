@@ -357,7 +357,7 @@ class DatabaseServiceTest {
   }
 
   @Test
-  void busyDatabaseMigrationIsClassifiedAsBusyAndRetryable() throws SQLException {
+  void busyDatabaseMigrationIsClassifiedAsBusy() throws SQLException {
     // Сценарий «БД занята» на настоящей БД: постороннее соединение держит незавершённую транзакцию
     // записи, миграция ждёт busy_timeout драйвера и получает SQLITE_BUSY
     TestDatabases.outdatedAt(file());
@@ -376,7 +376,6 @@ class DatabaseServiceTest {
       var failure = (OpenResult.Failed) result;
       assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
       assertThat(failure.message()).contains("занята").contains("Повторите").contains("позже");
-      assertThat(OpenFailures.retryable(failure)).isTrue();
       assertThat(service.state())
           .isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
     }

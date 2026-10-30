@@ -77,8 +77,6 @@ class SqliteSupportTest {
     // Служебные соединения и миграции Flyway: синхронизация полная, как у транзакций
     var timeout = Duration.ofMillis(100);
     assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isEqualTo("FULL");
-    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("synchronous"))
-        .isEqualTo("FULL");
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous"))
         .isEqualTo("FULL");
   }
@@ -88,7 +86,6 @@ class SqliteSupportTest {
     // Режим журнала файла остаётся его собственным: соединение проверки или копии его не меняет
     var timeout = Duration.ofMillis(100);
     assertThat(SqliteSupport.maintenanceProperties().getProperty("journal_mode")).isNull();
-    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("journal_mode")).isNull();
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("journal_mode")).isNull();
   }
 
@@ -136,7 +133,7 @@ class SqliteSupportTest {
     assertThatThrownBy(
             () ->
                 SqliteSupport.connect(
-                    url, SqliteSupport.maintenanceProperties(Duration.ofMillis(100))))
+                    url, SqliteSupport.existingFileProperties(Duration.ofMillis(100))))
         .isInstanceOf(SQLException.class);
     assertThat(file).doesNotExist();
     assertThat(sibling(file, "-wal")).doesNotExist();
@@ -165,7 +162,7 @@ class SqliteSupportTest {
     try (Connection c =
         SqliteSupport.connect(
             SqliteSupport.url(file),
-            SqliteSupport.maintenanceProperties(Duration.ofMillis(1234)))) {
+            SqliteSupport.existingFileProperties(Duration.ofMillis(1234)))) {
       assertThat(busyTimeout(c)).isEqualTo("1234");
     }
   }
