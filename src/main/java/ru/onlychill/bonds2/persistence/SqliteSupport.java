@@ -6,16 +6,19 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.Properties;
 import org.sqlite.SQLiteConfig;
+import org.sqlite.SQLiteOpenMode;
 
 /**
  * Низкоуровневые операции с SQLite: JDBC-адрес, соединения и их настройки, перенос WAL в основной
- * файл, проверка целостности и служебные файлы рядом с БД. Схему и миграции не знает.
+ * файл, копия {@code VACUUM INTO}, проверка целостности и служебные файлы рядом с БД. Схему и
+ * миграции не знает.
  */
 final class SqliteSupport {
 
@@ -33,8 +36,13 @@ final class SqliteSupport {
     return new org.sqlite.JDBC().connect(url, props);
   }
 
+  /**
+   * Настройки соединения транзакций. Файл открывается только существующим, поэтому удалённый или
+   * перемещённый файл БД даёт ошибку открытия, а пустой файл на его месте не появляется.
+   */
   static Properties properties(Duration busyTimeout, SQLiteConfig.TransactionMode mode) {
     var config = new SQLiteConfig();
+    existingFileOnly(config);
     config.setJournalMode(SQLiteConfig.JournalMode.WAL);
     config.setSynchronous(SQLiteConfig.SynchronousMode.NORMAL);
     config.enforceForeignKeys(true);
@@ -43,8 +51,25 @@ final class SqliteSupport {
     return config.toProperties();
   }
 
+  /** Флаг создания файла снят: соединение открывает только существующий файл. */
+  private static void existingFileOnly(SQLiteConfig config) {
+    config.setOpenMode(SQLiteOpenMode.READWRITE);
+    config.resetOpenMode(SQLiteOpenMode.CREATE);
+  }
+
   /**
-   * Настройки служебных соединений (проверки, WAL, копия): не переводят файл в WAL и не меняют его,
+   * Настройки соединения переноса WAL: как у транзакций, файл открывается только существующим.
+   * Отсутствующий файл БД даёт ошибку, а пустой файл на его месте не появляется.
+   */
+  static Properties checkpointProperties(Duration busyTimeout) {
+    var config = new SQLiteConfig();
+    existingFileOnly(config);
+    config.setBusyTimeout((int) busyTimeout.toMillis());
+    return config.toProperties();
+  }
+
+  /**
+   * Настройки служебных соединений (проверки, копия): не переводят файл в WAL и не меняют его,
    * ожидание блокировки — по умолчанию.
    */
   static Properties maintenanceProperties() {
@@ -57,13 +82,12 @@ final class SqliteSupport {
     return config.toProperties();
   }
 
-  /** Переносит WAL в основной файл и обрезает его; если WAL занят другим соединением, ошибка. */
-  static void checkpoint(String url) throws SQLException {
-    checkpoint(url, Database.DEFAULT_BUSY_TIMEOUT);
-  }
-
+  /**
+   * Переносит WAL в основной файл и обрезает его; если WAL занят другим соединением, ошибка. Файл
+   * БД не создаётся: если его нет, соединение не открывается и бросает {@link SQLException}.
+   */
   static void checkpoint(String url, Duration busyTimeout) throws SQLException {
-    try (Connection c = connect(url, maintenanceProperties(busyTimeout));
+    try (Connection c = connect(url, checkpointProperties(busyTimeout));
         Statement st = c.createStatement();
         ResultSet rs = st.executeQuery("PRAGMA wal_checkpoint(TRUNCATE)")) {
       if (!rs.next() || rs.getInt(1) != 0) {
@@ -78,6 +102,20 @@ final class SqliteSupport {
         Statement st = c.createStatement();
         ResultSet rs = st.executeQuery("PRAGMA integrity_check")) {
       return rs.next() ? rs.getString(1) : "";
+    }
+  }
+
+  /**
+   * Пишет согласованную копию БД в файл {@code target} командой {@code VACUUM INTO}. Команда читает
+   * данные вместе с журналом WAL, поэтому перенос WAL перед копией не нужен. Файл назначения должен
+   * быть пустым или отсутствовать, иначе SQLite отказывает. Путь передаётся связанным параметром, а
+   * не вставляется в текст SQL, поэтому кавычки и апострофы в пути не требуют экранирования.
+   */
+  static void vacuumInto(String url, Path target) throws SQLException {
+    try (Connection c = connect(url, maintenanceProperties());
+        PreparedStatement st = c.prepareStatement("VACUUM INTO ?")) {
+      st.setString(1, target.toAbsolutePath().toString());
+      st.execute();
     }
   }
 

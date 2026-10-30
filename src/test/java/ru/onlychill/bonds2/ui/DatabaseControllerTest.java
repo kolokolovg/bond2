@@ -331,7 +331,6 @@ class DatabaseControllerTest {
   @Test
   void failedMigrationRestoresFileAndShowsErrorWithRestoreNote() throws SQLException, IOException {
     TestDatabases.forgottenHistoryAt(userFile());
-    byte[] before = Files.readAllBytes(userFile());
     saveSettings(userFile(), true);
     var db = controller();
 
@@ -341,7 +340,11 @@ class DatabaseControllerTest {
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка миграции");
     assertThat(dialogs.errors).hasSize(1);
     assertThat(dialogs.errors.get(0)).contains("восстановлена").contains(".bak-");
-    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+    // Файл восстановлен копией: VACUUM INTO пишет компактный файл, поэтому сравниваем с копией
+    List<String> backups = backupsIn(dataDir());
+    assertThat(backups).hasSize(1);
+    assertThat(Files.readAllBytes(userFile()))
+        .isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
   }
 
   @Test
@@ -499,6 +502,36 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void exitRefusedByMigrationStartedBeforeUiUpdateKeepsWarningAndExitsAfterwards()
+      throws SQLException, InterruptedException {
+    TestDatabases.outdatedAt(userFile());
+    saveSettings(userFile(), true);
+    storage.migrateGate.hold();
+    var db = controller();
+    // Интерфейс ничего не применяет до pumpUntil: он отстаёт от сервиса
+    db.openDatabase();
+    assertThat(Eventually(() -> service.state() instanceof DbState.AwaitingMigration)).isTrue();
+    var migration = service.migrate();
+    assertThat(storage.migrateGate.awaitEntered()).isTrue();
+
+    db.requestExit();
+    ui.pumpUntil(() -> !dialogs.warnings.isEmpty());
+
+    assertThat(dialogs.warnings).singleElement().asString().contains("Идёт миграция");
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(exits.get()).isZero();
+
+    storage.migrateGate.release();
+    assertThat(migration.join()).isEqualTo(new OpenResult.Opened(userFile()));
+    ui.pumpUntil(() -> isOpen(db));
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+
+    assertThat(dialogs.warnings).hasSize(1);
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  @Test
   void exitWhileMigrationDialogIsOpenCancelsDialogDeclinesAndExits()
       throws SQLException, IOException {
     TestDatabases.outdatedAt(userFile());
@@ -564,6 +597,78 @@ class DatabaseControllerTest {
 
     assertThat(dialogs.warnings).isEmpty();
     assertThat(dialogs.questions).isEmpty();
+  }
+
+  @Test
+  void migrationResultArrivingAfterExitRequestOpensNoDialogAndRunsNoMigration()
+      throws SQLException, IOException, InterruptedException {
+    TestDatabases.outdatedAt(userFile());
+    byte[] before = Files.readAllBytes(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
+
+    // Выход запрошен, пока открытие ещё идёт; результат «нужна миграция» приходит после запроса
+    db.requestExit();
+    storage.openGate.release();
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
+
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(exits.get()).isEqualTo(1);
+    assertThat(service.state()).isEqualTo(new DbState.Closed("схема устарела", null));
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+    assertThat(backupsIn(dataDir())).isEmpty();
+  }
+
+  @Test
+  void exitRequestedBeforeUiAppliesAwaitingMigrationExitsWithoutDialogOrWarning()
+      throws SQLException, IOException, InterruptedException {
+    TestDatabases.outdatedAt(userFile());
+    byte[] before = Files.readAllBytes(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
+
+    // Сервис уже ждёт решения, а интерфейс ещё не применил ни состояние, ни результат открытия
+    storage.openGate.release();
+    assertThat(Eventually(() -> service.state() instanceof DbState.AwaitingMigration)).isTrue();
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
+
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(exits.get()).isEqualTo(1);
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
+    assertThat(backupsIn(dataDir())).isEmpty();
+  }
+
+  @Test
+  void repeatedExitRequestWhileAwaitingMigrationDecisionIsIgnored() throws SQLException {
+    TestDatabases.outdatedAt(userFile());
+    var db = controller();
+    // Диалога нет, решение не отправлено: сервис ждёт команду
+    service.open(userFile(), false).join();
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
+
+    db.requestExit();
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
+
+    assertThat(exits.get()).isEqualTo(1);
+    assertThat(dialogs.questions).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
   }
 
   @Test

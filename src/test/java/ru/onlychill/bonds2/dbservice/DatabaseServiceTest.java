@@ -256,7 +256,6 @@ class DatabaseServiceTest {
   void failedMigrationRestoresFileAndClosesWithReason() throws SQLException, IOException {
     TestDatabases.forgottenHistoryAt(file());
     // Файл с «забытой» историей считается устаревшим: миграция падает и восстанавливает файл
-    byte[] before = Files.readAllBytes(file());
     get(service.open(file(), false));
 
     var result = get(service.migrate());
@@ -266,7 +265,10 @@ class DatabaseServiceTest {
     assertThat(failure.reason()).isEqualTo("ошибка миграции");
     assertThat(failure.message()).contains("восстановлена").contains(".bak-");
     assertThat(service.state()).isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
-    assertThat(Files.readAllBytes(file())).isEqualTo(before);
+    // Файл восстановлен копией: VACUUM INTO пишет компактный файл, поэтому сравниваем с копией
+    List<String> backups = backupsIn(dataDir());
+    assertThat(backups).hasSize(1);
+    assertThat(Files.readAllBytes(file())).isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
   }
 
   @Test
@@ -350,6 +352,22 @@ class DatabaseServiceTest {
     assertThat(((CloseResult.Closed) results.get(0)).warning())
         .contains("Не удалось полностью закрыть БД");
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
+  void closeAfterFileDeletionPublishesClosedWithWarningAndCreatesNoFile() throws IOException {
+    newDatabaseAt(file());
+    get(service.open(file(), false));
+    var states = record();
+    Files.delete(file());
+
+    var result = get(service.close());
+
+    assertThat(result).isInstanceOf(CloseResult.Closed.class);
+    assertThat(((CloseResult.Closed) result).warning()).contains("Не удалось полностью закрыть БД");
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Open(file()), DbState.CLOSED);
+    assertThat(file()).doesNotExist();
   }
 
   @Test

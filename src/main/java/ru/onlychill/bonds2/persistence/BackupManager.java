@@ -14,6 +14,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -37,8 +38,8 @@ final class BackupManager {
 
   /**
    * Миграция существующей БД с резервной копией; см. {@link Database#migrateWithBackup(Path)}.
-   * Перед миграцией WAL переносится в основной файл, копия создаётся рядом и проверяется {@code
-   * PRAGMA integrity_check}. Если миграция завершилась ошибкой, файл восстанавливается из копии.
+   * Копия создаётся рядом командой {@code VACUUM INTO} и проверяется {@code PRAGMA
+   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией.
    *
    * @param absolute абсолютный путь к файлу БД
    * @return путь к резервной копии
@@ -55,7 +56,7 @@ final class BackupManager {
     } catch (RuntimeException e) {
       throw restore(absolute, backup, e);
     }
-    pruneBackups(absolute);
+    pruneBackups(absolute, backup);
     return backup;
   }
 
@@ -74,26 +75,18 @@ final class BackupManager {
   }
 
   /**
-   * Переносит WAL в основной файл и копирует его рядом; существующую копию не перезаписывает, а при
-   * совпадении имени добавляет числовой суффикс.
+   * Создаёт копию командой {@code VACUUM INTO}: она читает согласованный снимок вместе с журналом
+   * WAL, поэтому перенос WAL перед копированием не нужен. Имя копии занимает пустой файл, созданный
+   * атомарно, поэтому существующая копия не перезаписывается. Если копию создать не удалось,
+   * частично записанный файл удаляется.
    */
   private static Path createBackup(Path file, Clock clock) {
     String base = ".bak-" + LocalDateTime.now(clock).format(BACKUP_STAMP);
-    Path backup = SqliteSupport.withSuffix(file, base);
+    Path backup = reserveBackupFile(file, base);
     try {
-      SqliteSupport.checkpoint(SqliteSupport.url(file));
-      for (int i = 1; ; i++) {
-        try {
-          Files.copy(file, backup);
-          return backup;
-        } catch (FileAlreadyExistsException e) {
-          backup = SqliteSupport.withSuffix(file, base + "-" + i);
-        }
-      }
+      SqliteSupport.vacuumInto(SqliteSupport.url(file), backup);
+      return backup;
     } catch (SQLException e) {
-      throw new MigrationException(
-          "Не удалось перенести WAL в файл БД, миграция не выполнена: " + file, e);
-    } catch (IOException e) {
       var failure =
           new MigrationException(
               "Не удалось создать резервную копию, миграция не выполнена: " + backup, e);
@@ -102,8 +95,29 @@ final class BackupManager {
     }
   }
 
-  /** Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. */
-  private static void verifyBackup(Path backup) {
+  /**
+   * Создаёт пустой файл с первым свободным именем: {@code base}, затем {@code base-1}, {@code
+   * base-2} и так далее. Занятое имя (файл или каталог) не трогается.
+   */
+  private static Path reserveBackupFile(Path file, String base) {
+    Path candidate = SqliteSupport.withSuffix(file, base);
+    for (int i = 1; ; i++) {
+      try {
+        return Files.createFile(candidate);
+      } catch (FileAlreadyExistsException e) {
+        candidate = SqliteSupport.withSuffix(file, base + "-" + i);
+      } catch (IOException e) {
+        throw new MigrationException(
+            "Не удалось создать резервную копию, миграция не выполнена: " + candidate, e);
+      }
+    }
+  }
+
+  /**
+   * Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. Пакетный доступ нужен
+   * тестам: копию, которую создал {@code VACUUM INTO}, проверочный отказ напрямую не получить.
+   */
+  static void verifyBackup(Path backup) {
     String result;
     try {
       result = SqliteSupport.integrityCheck(SqliteSupport.url(backup));
@@ -125,21 +139,25 @@ final class BackupManager {
   }
 
   /**
-   * Оставляет {@link #BACKUPS_KEPT} самых новых копий файла БД; порядок — по метке времени в имени,
-   * затем по числовому суффиксу. Другие файлы не затрагиваются, сбой удаления пишется в лог.
+   * Оставляет новую копию {@code created} и самые новые из остальных копий файла БД, всего не
+   * больше {@link #BACKUPS_KEPT}. Новая копия не участвует в сортировке, поэтому не удаляется при
+   * любом порядке меток времени, например после перевода часов назад. Остальные копии упорядочены
+   * по метке времени в имени, затем по числовому суффиксу. Другие файлы не затрагиваются, сбой
+   * удаления пишется в лог.
    */
-  private static void pruneBackups(Path file) {
+  private static void pruneBackups(Path file, Path created) {
     Path dir = file.getParent();
     var pattern =
         Pattern.compile(
             Pattern.quote(file.getFileName() + ".bak-") + "(\\d{8}-\\d{6})(?:-(\\d+))?");
+    Path createdName = created.getFileName();
     record Found(Path path, String stamp, int number) {}
     List<Found> found = new ArrayList<>();
     try (Stream<Path> files = Files.list(dir)) {
       files.forEach(
           p -> {
             Matcher m = pattern.matcher(String.valueOf(p.getFileName()));
-            if (m.matches() && Files.isRegularFile(p)) {
+            if (m.matches() && Files.isRegularFile(p) && !createdName.equals(p.getFileName())) {
               found.add(new Found(p, m.group(1), m.group(2) == null ? 0 : parseSuffix(m.group(2))));
             }
           });
@@ -148,7 +166,7 @@ final class BackupManager {
       return;
     }
     found.sort(Comparator.comparing(Found::stamp).thenComparingInt(Found::number).reversed());
-    for (Found old : found.subList(Math.min(BACKUPS_KEPT, found.size()), found.size())) {
+    for (Found old : found.subList(Math.min(BACKUPS_KEPT - 1, found.size()), found.size())) {
       try {
         Files.deleteIfExists(old.path());
       } catch (IOException e) {
@@ -165,17 +183,31 @@ final class BackupManager {
     }
   }
 
+  /** Каталог файла БД: абсолютный путь к файлу БД всегда содержит родительский каталог. */
+  private static Path directoryOf(Path file) {
+    return Objects.requireNonNull(file.toAbsolutePath().getParent(), "каталог файла БД");
+  }
+
   /**
    * Возвращает файл БД к состоянию резервной копии после неудачной миграции. К этому моменту
-   * соединения Flyway уже закрыты; служебные файлы WAL и журнала удаляются, чтобы не применяться к
-   * восстановленному файлу.
+   * соединения Flyway уже закрыты. Копия сначала переносится во временный файл рядом с БД (в том же
+   * каталоге, чтобы перемещение оставалось в пределах одной файловой системы). Затем удаляются
+   * служебные файлы WAL и журнала, и временный файл атомарно заменяет БД, поэтому частично
+   * записанная копия никогда не окажется на месте БД. При сбое временный файл удаляется, а ошибка
+   * несёт путь к копии для ручного восстановления. Пакетный доступ нужен тестам.
    */
-  private static MigrationException restore(Path file, Path backup, RuntimeException cause) {
+  static MigrationException restore(Path file, Path backup, RuntimeException cause) {
+    Path staged = null;
     try {
+      staged = Files.createTempFile(directoryOf(file), file.getFileName() + ".", ".restore");
+      Files.copy(backup, staged, StandardCopyOption.REPLACE_EXISTING);
       SqliteSupport.deleteSidecars(file);
-      Files.copy(backup, file, StandardCopyOption.REPLACE_EXISTING);
+      Files.move(staged, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     } catch (IOException e) {
       cause.addSuppressed(e);
+      if (staged != null) {
+        SqliteSupport.deleteQuietly(staged, cause);
+      }
       return new MigrationException(
           "Миграция не выполнена, и восстановить БД из резервной копии не удалось. Восстановите"
               + " файл вручную из: "

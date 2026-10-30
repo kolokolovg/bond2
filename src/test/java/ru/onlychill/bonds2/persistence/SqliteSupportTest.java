@@ -4,6 +4,7 @@ package ru.onlychill.bonds2.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -72,6 +73,26 @@ class SqliteSupportTest {
         SqliteSupport.connect(SqliteSupport.url(file), SqliteSupport.maintenanceProperties())) {
       assertThat(busyTimeout(c)).isEqualTo("5000");
     }
+  }
+
+  @Test
+  void checkpointOfMissingFileFailsWithoutCreatingIt() {
+    Path file = dir.resolve("missing.db");
+    String url = SqliteSupport.url(file);
+
+    assertThatThrownBy(() -> SqliteSupport.checkpoint(url, Duration.ofMillis(100)))
+        .isInstanceOf(SQLException.class);
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+  }
+
+  @Test
+  void checkpointOfExistingFileSucceeds() throws SQLException {
+    Path file = createDatabase();
+
+    SqliteSupport.checkpoint(SqliteSupport.url(file), Duration.ofMillis(100));
+
+    assertThat(file).isRegularFile();
   }
 
   @Test

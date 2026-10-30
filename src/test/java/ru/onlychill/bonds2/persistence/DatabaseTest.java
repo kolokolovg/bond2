@@ -9,6 +9,8 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.exec;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -358,6 +360,51 @@ class DatabaseTest {
   }
 
   @Test
+  void closeAfterFileDeletionFailsWithoutCreatingFile() throws IOException {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    Files.delete(testFile());
+
+    assertThatThrownBy(db::close)
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("WAL")
+        .hasCauseInstanceOf(SQLException.class);
+    assertThat(testFile()).doesNotExist();
+    assertThatThrownBy(() -> db.inTransaction(c -> null))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("закрыта");
+  }
+
+  @Test
+  void closeWithExistingFileTransfersWalIntoMainFile() throws Exception {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    Path wal = sibling(testFile(), "-wal");
+    Path copy = dir.resolve("copy.db");
+    // Простаивающее соединение не даёт SQLite перенести WAL при закрытии последнего соединения
+    try (Connection holder = DriverManager.getConnection("jdbc:sqlite:" + testFile())) {
+      try (var st = holder.createStatement();
+          var rs = st.executeQuery("SELECT count(*) FROM counter")) {
+        rs.next();
+      }
+      db.inTransaction(
+          c -> {
+            exec(c, "UPDATE counter SET value = 21");
+            return null;
+          });
+      assertThat(wal).isNotEmptyFile();
+
+      db.close();
+
+      assertThat(wal)
+          .satisfiesAnyOf(p -> assertThat(p).doesNotExist(), p -> assertThat(p).isEmptyFile());
+      // Журнал пуст, значит значение 21 есть в основном файле: копия одного файла его сохраняет
+      Files.copy(testFile(), copy);
+    }
+    try (var reopened = Database.open(copy)) {
+      assertThat(read(reopened)).isEqualTo(21);
+    }
+  }
+
+  @Test
   void closeMarksDatabaseClosedEvenWhenCheckpointFails() throws SQLException {
     var db = withCounter(Duration.ofMillis(100));
 
@@ -385,5 +432,37 @@ class DatabaseTest {
       // Ожидание по умолчанию (5 с) заняло бы заметно дольше
       assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(3));
     }
+  }
+
+  @Test
+  void transactionsFailWithoutCreatingDeletedDatabaseFile() throws IOException {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    Files.delete(testFile());
+
+    assertThatThrownBy(() -> db.inTransaction(c -> null))
+        .isInstanceOf(PersistenceException.class)
+        .hasCauseInstanceOf(SQLException.class);
+    assertThatThrownBy(() -> db.inReadTransaction(c -> null))
+        .isInstanceOf(PersistenceException.class)
+        .hasCauseInstanceOf(SQLException.class);
+    assertThat(testFile()).doesNotExist();
+  }
+
+  @Test
+  void transactionsFailWhileFileIsMovedAwayAndWorkAgainWhenItIsReturned() throws IOException {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    Path moved = dir.resolve("moved.db");
+    Files.move(testFile(), moved);
+
+    assertThatThrownBy(() -> db.inTransaction(c -> null)).isInstanceOf(PersistenceException.class);
+    assertThat(testFile()).doesNotExist();
+
+    Files.move(moved, testFile());
+    db.inTransaction(
+        c -> {
+          exec(c, "UPDATE counter SET value = 11");
+          return null;
+        });
+    assertThat(read(db)).isEqualTo(11);
   }
 }

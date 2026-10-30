@@ -186,10 +186,10 @@ final class DatabaseController {
   /**
    * «Файл → Выход» и закрытие окна кнопкой. Во время миграции выход откладывается с сообщением;
    * повторный запрос игнорируется. Ожидаемая миграция считается отклонённой, её диалог закрывается.
-   * Остановка сервиса идёт в фоне (открытие и создание ждут не дольше {@link #SHUTDOWN_TIMEOUT}),
-   * приложение завершается по её итогу.
+   * Если результат «нужна миграция» приходит после запроса, диалог не показывается. Остановка
+   * сервиса идёт в фоне (открытие и создание ждут не дольше {@link #SHUTDOWN_TIMEOUT}), приложение
+   * завершается по её итогу.
    */
-  @SuppressWarnings("FutureReturnValueIgnored")
   void requestExit() {
     DbState current = state.get();
     if (current instanceof DbState.Migrating) {
@@ -200,13 +200,28 @@ final class DatabaseController {
       return;
     }
     exiting = true;
-    CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
     if (current instanceof DbState.AwaitingMigration) {
       cancelMigrationDialog();
-      prepared = service.declineMigration();
+      declineAndStop();
+    } else {
+      deliverExitResult(service.shutdownAsync(SHUTDOWN_TIMEOUT));
     }
-    prepared
-        .thenCompose(ignored -> service.shutdownAsync(SHUTDOWN_TIMEOUT))
+  }
+
+  /**
+   * Отклоняет ожидающую решения миграцию и затем останавливает сервис: миграция считается
+   * отклонённой, файл БД не меняется, а сервис допускает остановку.
+   */
+  private void declineAndStop() {
+    CompletableFuture<ShutdownResult> stopping =
+        service.declineMigration().thenCompose(ignored -> service.shutdownAsync(SHUTDOWN_TIMEOUT));
+    deliverExitResult(stopping);
+  }
+
+  /** Передаёт итог остановки в поток JavaFX; сбой попадает в журнал. */
+  @SuppressWarnings("FutureReturnValueIgnored")
+  private void deliverExitResult(CompletableFuture<ShutdownResult> stopping) {
+    stopping
         .thenAcceptAsync(this::onExitResult, uiExecutor)
         .exceptionally(
             error -> {
@@ -215,13 +230,20 @@ final class DatabaseController {
             });
   }
 
+  /**
+   * Итог остановки в потоке JavaFX. Отказ, пока сервис ждёт решения о миграции (результат «нужна
+   * миграция» пришёл после запроса выхода), отклоняет миграцию и повторяет остановку без диалога и
+   * предупреждения. Отказ из-за настоящей миграции показывает «Идёт миграция».
+   */
   private void onExitResult(ShutdownResult result) {
-    if (result == ShutdownResult.REFUSED) {
-      exiting = false;
-      dialogs.warn(MIGRATION_EXIT_WARNING);
-    } else {
+    if (result != ShutdownResult.REFUSED) {
       stopped = true;
       exit.run();
+    } else if (service.state() instanceof DbState.AwaitingMigration) {
+      declineAndStop();
+    } else {
+      exiting = false;
+      dialogs.warn(MIGRATION_EXIT_WARNING);
     }
   }
 
@@ -311,9 +333,15 @@ final class DatabaseController {
     }
   }
 
-  /** Спрашивает согласие на миграцию; без согласия файл не меняется и БД не открывается. */
+  /**
+   * Спрашивает согласие на миграцию; без согласия файл не меняется и БД не открывается. Если выход
+   * уже начат или приложение остановлено, диалог не показывается и миграция не запускается.
+   */
   @SuppressWarnings("FutureReturnValueIgnored")
   private void askAboutMigration() {
+    if (exiting || stopped) {
+      return;
+    }
     CompletableFuture<Boolean> dialog = dialogs.confirmMigration(MIGRATION_QUESTION);
     migrationDialog = dialog;
     dialog
