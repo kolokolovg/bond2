@@ -10,6 +10,7 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.OLD;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.TOO_NEW;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createDatabase;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createOldDatabaseWithRow;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.exec;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.executeSql;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
@@ -33,6 +34,7 @@ import java.util.stream.Stream;
 import org.flywaydb.core.api.FlywayException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.sqlite.SQLiteConfig;
 
 class DatabaseMigrationTest {
 
@@ -41,6 +43,9 @@ class DatabaseMigrationTest {
       Clock.fixed(Instant.parse("2026-10-29T10:15:30Z"), ZoneOffset.UTC);
 
   private static final String BACKUP_NAME = "app.db.bak-20261029-101530";
+
+  /** Новая версия: V2 создаёт таблицы с внешним ключом, V3 вставляет строку-сироту и падает. */
+  private static final String FK_FAIL = "classpath:migrations/fk_fail";
 
   @TempDir Path dir;
 
@@ -55,6 +60,27 @@ class DatabaseMigrationTest {
     assertThat(Database.inspect(backup, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
     assertThat(valueOf(backup, OLD)).isEqualTo("v");
     assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
+  }
+
+  @Test
+  void migrationKeepsWalJournalModeOfExistingFile() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Файл переводится в WAL напрямую тем же способом, что и соединения транзакций приложения
+    try (Connection c =
+        SqliteSupport.connect(
+            SqliteSupport.url(file),
+            SqliteSupport.properties(
+                Database.DEFAULT_BUSY_TIMEOUT, SQLiteConfig.TransactionMode.DEFERRED))) {
+      exec(c, "UPDATE app_info SET value = 'v' WHERE key = 'k'");
+    }
+    assertThat(journalMode(file)).isEqualToIgnoringCase("wal");
+
+    Database.migrateWithBackup(file, CLOCK, NEW_OK);
+
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    // Режим журнала файла остался прежним: соединения миграции его не задают
+    assertThat(journalMode(file)).isEqualToIgnoringCase("wal");
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
   }
 
@@ -74,6 +100,24 @@ class DatabaseMigrationTest {
     assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
     assertThat(tableExists(file, OLD, "item")).isFalse();
     assertThat(rowCount(file, OLD, "app_info")).isEqualTo(1);
+    assertThat(valueOf(file, OLD)).isEqualTo("kept");
+  }
+
+  @Test
+  void foreignKeyViolationFailsMigrationAndBackupIsRestored() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "kept");
+
+    // Внешние ключи включены и у соединений миграции: строка-сирота из V3 не применяется
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, FK_FAIL))
+        .isInstanceOf(MigrationException.class)
+        .hasMessageContaining("восстановлена")
+        .hasCauseInstanceOf(FlywayException.class)
+        .hasRootCauseInstanceOf(SQLException.class);
+
+    // Файл возвращён к состоянию копии: таблиц с внешним ключом нет, сирота не появилась
+    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(tableExists(file, OLD, "parent")).isFalse();
+    assertThat(tableExists(file, OLD, "child")).isFalse();
     assertThat(valueOf(file, OLD)).isEqualTo("kept");
   }
 
@@ -255,6 +299,35 @@ class DatabaseMigrationTest {
     assertThat(backup.getParent()).isEqualTo(apostropheDir);
     assertThat(valueOf(backup, OLD)).isEqualTo("v");
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
+  }
+
+  @Test
+  void migrationRemovesLeftoverRestoreFileOfThisDatabase() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Обрывок отката от прерванного восстановления: удаляется до создания копии
+    Files.writeString(dir.resolve("app.db.abc123.restore"), "обрывок");
+
+    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+
+    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(namesInDir()).doesNotContain("app.db.abc123.restore");
+    assertThat(namesInDir()).noneMatch(name -> name.endsWith(".restore"));
+  }
+
+  @Test
+  void restoreLeftoverDirectoryDoesNotStopMigration() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Необычная запись с именем временного файла: пропускается и миграции не мешает
+    Path leftoverDir = Files.createDirectory(dir.resolve("app.db.xyz.restore"));
+    Files.writeString(leftoverDir.resolve("keep.txt"), "не трогать");
+
+    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+
+    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(leftoverDir).isDirectory();
+    assertThat(leftoverDir.resolve("keep.txt")).hasContent("не трогать");
   }
 
   @Test
@@ -505,36 +578,31 @@ class DatabaseMigrationTest {
   }
 
   @Test
-  void failedWalTransferKeepsSidecarsAndCommittedDataIsAvailableOnReopen() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
-    // Читатель держит снимок: перенос WAL невозможен, зафиксированные данные остаются только в WAL
+  void busyWalDoesNotStopRestoreAndBackupReplacesMainFile() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "current");
+    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "MARKER-9102");
+    // Читатель держит снимок: перенос WAL невозможен, восстановление продолжается без него
     try (Connection reader = DriverManager.getConnection("jdbc:sqlite:" + file)) {
       reader.setAutoCommit(false);
       queryLong(reader, "SELECT count(*) FROM app_info");
       executeSql(file, "UPDATE app_info SET value = 'in-wal' WHERE key = 'k'");
-      assertThat(Files.readString(file, StandardCharsets.ISO_8859_1)).doesNotContain("in-wal");
-      Path wal = sibling(file, "-wal");
 
       MigrationException failure =
           BackupManager.restore(file, backup, new IllegalStateException("миграция"));
 
-      assertThat(failure).hasMessageContaining("вручную").hasMessageContaining(BACKUP_NAME);
-      // Сайдкары не удалены до успешного переноса: WAL цел, данные в нём
-      assertThat(wal).exists();
-      assertThat(Files.readString(wal, StandardCharsets.ISO_8859_1)).contains("in-wal");
-      assertThat(namesInDir()).contains("app.db", "app.db-wal", BACKUP_NAME);
-      assertThat(namesInDir()).noneMatch(name -> name.contains(".restore"));
+      assertThat(failure).hasMessageContaining("восстановлена").hasMessageContaining(BACKUP_NAME);
+      // Замена состоялась несмотря на занятый WAL: на месте БД данные только из копии
+      assertThat(valueOf(file, OLD)).isEqualTo("MARKER-9102");
     }
-    // Данные из WAL доступны при повторном открытии
-    assertThat(valueOf(file, OLD)).isEqualTo("in-wal");
+    // Сайдкары занятого WAL удалены, временный файл не остался
+    assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);
   }
 
   @Test
   void failedReplacementKeepsDatabaseNamesBackupAndLeavesNoTempFile() throws Exception {
     Path backup = Files.writeString(dir.resolve(BACKUP_NAME), "копия");
     // Занятый каталогом путь БД — SQLite не может открыть каталог, сбой происходит на шаге
-    // переноса WAL, до замены файла
+    // переноса WAL, который продолжается по возможности, а затем на шаге замены файла
     Path file = Files.createDirectory(dir.resolve("app.db"));
     Files.writeString(file.resolve("keep.txt"), "не трогать");
     var cause = new IllegalStateException("миграция");
@@ -542,8 +610,8 @@ class DatabaseMigrationTest {
     MigrationException failure = BackupManager.restore(file, backup, cause);
 
     assertThat(failure).hasMessageContaining(backup.toString()).hasMessageContaining("вручную");
-    // Причина сбоя переноса WAL прикладывается к исходной ошибке миграции
-    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(SQLException.class);
+    // Сбой замены файла прикладывается к исходной ошибке миграции; сбой переноса WAL пишется в лог
+    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(IOException.class);
     assertThat(file).isDirectory();
     assertThat(file.resolve("keep.txt")).hasContent("не трогать");
     assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);
@@ -573,6 +641,17 @@ class DatabaseMigrationTest {
   private static String valueOf(Path file, String locations) {
     try (var db = Database.open(file, Database.DEFAULT_BUSY_TIMEOUT, locations)) {
       return queryString(db, "SELECT value FROM app_info WHERE key = 'k'");
+    }
+  }
+
+  /**
+   * Режим журнала файла, прочитанный служебным соединением: оно не задаёт режим, поэтому не
+   * подменяет проверяемое значение.
+   */
+  private static String journalMode(Path file) throws SQLException {
+    try (Connection c =
+        SqliteSupport.connect(SqliteSupport.url(file), SqliteSupport.maintenanceProperties())) {
+      return queryString(c, "PRAGMA journal_mode");
     }
   }
 

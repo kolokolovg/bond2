@@ -10,6 +10,8 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -18,6 +20,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -41,6 +44,29 @@ class DatabaseTest {
       rs.next();
       return rs.getString(1);
     }
+  }
+
+  /**
+   * Соединение-прокси: выбранные методы бросают {@link SQLException} вместо делегирования, что
+   * позволяет проверить сбои {@code commit()} и {@code close()} при остальной работоспособном
+   * соединении. Остальные вызовы передаются реальному соединению.
+   */
+  private static Connection failing(Connection delegate, String... failingMethods) {
+    var failing = Set.of(failingMethods);
+    return (Connection)
+        Proxy.newProxyInstance(
+            DatabaseTest.class.getClassLoader(),
+            new Class<?>[] {Connection.class},
+            (proxy, method, args) -> {
+              if (failing.contains(method.getName())) {
+                throw new SQLException("Сбой метода " + method.getName());
+              }
+              try {
+                return method.invoke(delegate, args);
+              } catch (InvocationTargetException e) {
+                throw e.getCause();
+              }
+            });
   }
 
   private static long counter(Connection c) throws SQLException {
@@ -476,5 +502,85 @@ class DatabaseTest {
           return null;
         });
     assertThat(read(db)).isEqualTo(11);
+  }
+
+  @Test
+  void closeFailureAfterCommitKeepsResult() throws SQLException {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    // Прокси перехватывает только close() внутри транзакции; реальные соединения закрывает тест
+    var real = new ArrayList<Connection>();
+    var brokenClose =
+        new Database(
+            SqliteSupport.url(testFile()),
+            Database.DEFAULT_BUSY_TIMEOUT,
+            (url, props) -> {
+              Connection connection = SqliteSupport.connect(url, props);
+              real.add(connection);
+              return failing(connection, "close");
+            });
+    try {
+      long result =
+          brokenClose.inTransaction(
+              c -> {
+                exec(c, "UPDATE counter SET value = 42");
+                return counter(c);
+              });
+
+      // Фиксация успешна: сбой закрытия соединения не превращает операцию в ошибку
+      assertThat(result).isEqualTo(42);
+      // Зафиксированная строка видна последующей читающей транзакцией
+      assertThat(read(db)).isEqualTo(42);
+    } finally {
+      for (Connection connection : real) {
+        connection.close();
+      }
+    }
+
+    brokenClose.close();
+    db.close();
+  }
+
+  @Test
+  void commitAndCloseFailuresSurfaceAsCommitError() throws SQLException {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+    // Прокси перехватывает commit() и close() внутри транзакции; реальные соединения закрывает тест
+    var real = new ArrayList<Connection>();
+    var brokenCommitAndClose =
+        new Database(
+            SqliteSupport.url(testFile()),
+            Database.DEFAULT_BUSY_TIMEOUT,
+            (url, props) -> {
+              Connection connection = SqliteSupport.connect(url, props);
+              real.add(connection);
+              return failing(connection, "commit", "close");
+            });
+    try {
+      assertThatThrownBy(
+              () ->
+                  brokenCommitAndClose.inTransaction(
+                      c -> {
+                        exec(c, "UPDATE counter SET value = 1");
+                        return null;
+                      }))
+          .isInstanceOf(PersistenceException.class)
+          .hasMessage("Ошибка работы с БД")
+          .cause()
+          .isInstanceOf(SQLException.class)
+          .hasMessage("Сбой метода commit")
+          .satisfies(
+              commitError ->
+                  assertThat(commitError.getSuppressed())
+                      .anySatisfy(s -> assertThat(s).hasMessage("Сбой метода close")));
+
+      // Ошибка фиксации означает откат: значение счётчика не изменилось
+      assertThat(read(db)).isZero();
+    } finally {
+      for (Connection connection : real) {
+        connection.close();
+      }
+    }
+
+    brokenCommitAndClose.close();
+    db.close();
   }
 }

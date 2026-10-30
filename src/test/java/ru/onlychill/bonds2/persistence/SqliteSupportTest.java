@@ -73,12 +73,14 @@ class SqliteSupportTest {
   }
 
   @Test
-  void serviceConnectionsDoNotSetSynchronousMode() {
-    // Служебные соединения (проверка схемы, копия, перенос WAL) данных не пишут и режим не задают
+  void serviceConnectionsRequestFullSynchronousMode() {
+    // Служебные соединения и миграции Flyway: синхронизация полная, как у транзакций
     var timeout = Duration.ofMillis(100);
-    assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isNull();
-    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("synchronous")).isNull();
-    assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous")).isNull();
+    assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isEqualTo("FULL");
+    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("synchronous"))
+        .isEqualTo("FULL");
+    assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous"))
+        .isEqualTo("FULL");
   }
 
   @Test

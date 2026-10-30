@@ -66,12 +66,15 @@ final class SqliteSupport {
 
   /**
    * Общие свойства соединения «только существующий файл» без смены режима журнала: файл открывается
-   * существующим, ожидание блокировки — по переданному таймауту. Основа служебных свойств и
-   * соединений Flyway.
+   * существующим, ожидание блокировки — по переданному таймауту. Синхронизация полная, внешние
+   * ключи включены: миграции Flyway и служебные соединения соблюдают те же гарантии, что и
+   * транзакции. Основа служебных свойств и соединений Flyway.
    */
   static Properties existingFileProperties(Duration busyTimeout) {
     var config = new SQLiteConfig();
     existingFileOnly(config);
+    config.setSynchronous(SQLiteConfig.SynchronousMode.FULL);
+    config.enforceForeignKeys(true);
     config.setBusyTimeout((int) busyTimeout.toMillis());
     return config.toProperties();
   }

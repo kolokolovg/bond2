@@ -27,6 +27,8 @@ import org.sqlite.SQLiteConfig;
  */
 public final class Database implements AutoCloseable {
 
+  private static final System.Logger LOG = System.getLogger(Database.class.getName());
+
   /** Таймаут ожидания блокировки БД по умолчанию. */
   public static final Duration DEFAULT_BUSY_TIMEOUT = Duration.ofSeconds(5);
 
@@ -58,6 +60,9 @@ public final class Database implements AutoCloseable {
   private final Properties writeProperties;
   private final Properties readProperties;
 
+  /** Фабрика соединений транзакций; тесты подменяют её для проверки сбоев соединения. */
+  private final ConnectionFactory connections;
+
   /** Транзакции держат общую блокировку, {@link #close()} берёт исключительную и ждёт их. */
   private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -66,9 +71,22 @@ public final class Database implements AutoCloseable {
 
   private final Duration busyTimeout;
 
+  /** Фабрика соединений для транзакций; по умолчанию открывает их через {@link SqliteSupport}. */
+  @FunctionalInterface
+  interface ConnectionFactory {
+
+    Connection connect(String url, Properties props) throws SQLException;
+  }
+
   private Database(String url, Duration busyTimeout) {
+    this(url, busyTimeout, SqliteSupport::connect);
+  }
+
+  /** Тестовый конструктор: соединения транзакций открывает переданная фабрика. */
+  Database(String url, Duration busyTimeout, ConnectionFactory connections) {
     this.url = url;
     this.busyTimeout = busyTimeout;
+    this.connections = connections;
     this.writeProperties =
         SqliteSupport.properties(busyTimeout, SQLiteConfig.TransactionMode.IMMEDIATE);
     this.readProperties =
@@ -267,21 +285,47 @@ public final class Database implements AutoCloseable {
       if (closed) {
         throw new PersistenceException("БД закрыта");
       }
-      try (Connection c = SqliteSupport.connect(url, props)) {
-        c.setAutoCommit(false);
+      try {
+        Connection c = connections.connect(url, props);
+        try {
+          c.setAutoCommit(false);
+        } catch (SQLException e) {
+          // Транзакция ещё не началась: откат не нужен, соединение закрывается с подавлением
+          closeQuietly(c, e);
+          throw e;
+        }
         try {
           T result = work.execute(c);
           c.commit();
+          // Фиксация успешна: сбой закрытия соединения не превращает операцию в ошибку
+          try {
+            c.close();
+          } catch (SQLException e) {
+            LOG.log(
+                System.Logger.Level.WARNING,
+                "Не удалось закрыть соединение после фиксации транзакции",
+                e);
+          }
           return result;
         } catch (Throwable t) {
           SqliteSupport.rollbackQuietly(c, t);
+          closeQuietly(c, t);
           throw t;
         }
+      } catch (SQLException e) {
+        throw new PersistenceException("Ошибка работы с БД", e);
       }
-    } catch (SQLException e) {
-      throw new PersistenceException("Ошибка работы с БД", e);
     } finally {
       lock.readLock().unlock();
+    }
+  }
+
+  /** Закрывает соединение; ошибка закрытия добавляется к {@code cause} как подавленная. */
+  private static void closeQuietly(Connection c, Throwable cause) {
+    try {
+      c.close();
+    } catch (SQLException e) {
+      cause.addSuppressed(e);
     }
   }
 

@@ -5,6 +5,8 @@ package ru.onlychill.bonds2.persistence;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -43,7 +45,8 @@ final class BackupManager {
   /**
    * Миграция существующей БД с резервной копией; см. {@link Database#migrateWithBackup(Path)}.
    * Копия создаётся рядом командой {@code VACUUM INTO} и проверяется {@code PRAGMA
-   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией; если к
+   * integrity_check}. Перед созданием копии удаляются временные файлы восстановления, оставшиеся от
+   * прерванного отката. Если миграция завершилась ошибкой, файл атомарно заменяется копией; если к
    * этому моменту основной файл удалён, откат не запускается — ошибка несёт путь к копии для
    * ручного восстановления. После любой попытки миграции, успешной или неудачной, копии
    * ограничиваются лимитом.
@@ -56,6 +59,7 @@ final class BackupManager {
     if (state != Database.State.NEEDS_MIGRATION) {
       throw new PersistenceException(refusal(state, absolute));
     }
+    removeOrphanedRestoreFiles(absolute);
     Path backup = createBackup(absolute, clock);
     verifyBackup(backup);
     try {
@@ -67,6 +71,48 @@ final class BackupManager {
       pruneBackups(absolute, backup);
     }
     return backup;
+  }
+
+  /**
+   * Удаляет временные файлы восстановления ({@code <файл БД>.*.restore}), оставшиеся от прерванного
+   * отката. Это безопасно: приложение работает под блокировкой единственного экземпляра, поэтому
+   * параллельный откат в тот же каталог не идёт. Ошибка просмотра или удаления пишется в лог и
+   * миграцию не прерывает.
+   */
+  private static void removeOrphanedRestoreFiles(Path file) {
+    Path dir = directoryOf(file);
+    try (DirectoryStream<Path> entries =
+        Files.newDirectoryStream(dir, file.getFileName() + ".*.restore")) {
+      for (Path entry : entries) {
+        deleteRestoreLeftover(entry);
+      }
+    } catch (IOException | DirectoryIteratorException e) {
+      LOG.log(
+          System.Logger.Level.WARNING,
+          "Не удалось просмотреть временные файлы восстановления: " + dir,
+          e);
+    }
+  }
+
+  /**
+   * Удаляет оставшийся временный файл, если это обычный файл. Необычная запись (например, каталог)
+   * и файл, который не удалось удалить, пишутся в лог и пропускаются: они не мешают миграции.
+   */
+  private static void deleteRestoreLeftover(Path entry) {
+    try {
+      if (!Files.isRegularFile(entry)) {
+        LOG.log(
+            System.Logger.Level.WARNING,
+            "Временный файл восстановления не обычный файл, пропущен: " + entry);
+        return;
+      }
+      Files.deleteIfExists(entry);
+    } catch (IOException e) {
+      LOG.log(
+          System.Logger.Level.WARNING,
+          "Не удалось удалить временный файл восстановления: " + entry,
+          e);
+    }
   }
 
   /**
@@ -228,12 +274,13 @@ final class BackupManager {
    * соединения Flyway уже закрыты. Копия сначала переносится во временный файл рядом с БД (в том же
    * каталоге, чтобы перемещение оставалось в пределах одной файловой системы) и сбрасывается на
    * диск — потеря питания сразу после замены не оставит укороченный файл. Затем зафиксированные
-   * транзакции переносятся из WAL в основной файл ({@code wal_checkpoint(TRUNCATE)}), делая его
-   * самодостаточным, удаляются служебные файлы WAL и журнала, и временный файл атомарно заменяет
-   * БД; поэтому неудача замены не теряет зафиксированные транзакции, а частично записанная копия
-   * никогда не окажется на месте БД. Если основной файл удалён снаружи, перенос WAL завершается
-   * ошибкой и откат прерывается. При сбое временный файл удаляется, а ошибка несёт путь к копии для
-   * ручного восстановления. Пакетный доступ нужен тестам.
+   * транзакции переносятся из WAL в основной файл ({@code wal_checkpoint(TRUNCATE)}); перенос
+   * выполняется по возможности: если он не удался (например, WAL занят другим соединением), сбой
+   * пишется в лог, и восстановление продолжается — копия самодостаточна, а транзакции, оставшиеся
+   * только в WAL, теряются. Затем удаляются служебные файлы WAL и журнала, и временный файл
+   * атомарно заменяет БД; поэтому частично записанная копия никогда не окажется на месте БД. Если
+   * копию перенести, сбросить на диск или заменить файл не удалось, временный файл удаляется, а
+   * ошибка несёт путь к копии для ручного восстановления. Пакетный доступ нужен тестам.
    */
   static MigrationException restore(Path file, Path backup, RuntimeException cause) {
     Path staged = null;
@@ -244,10 +291,19 @@ final class BackupManager {
       try (FileChannel channel = FileChannel.open(staged, StandardOpenOption.WRITE)) {
         channel.force(true);
       }
-      SqliteSupport.checkpoint(SqliteSupport.url(file), Database.DEFAULT_BUSY_TIMEOUT);
+      // Перенос WAL выполняется по возможности: копия самодостаточна, а занятый другим
+      // соединением WAL не должен оставлять БД в состоянии неудачной миграции
+      try {
+        SqliteSupport.checkpoint(SqliteSupport.url(file), Database.DEFAULT_BUSY_TIMEOUT);
+      } catch (SQLException e) {
+        LOG.log(
+            System.Logger.Level.WARNING,
+            "Не удалось перенести WAL, восстановление продолжается: " + file,
+            e);
+      }
       SqliteSupport.deleteSidecars(file);
       Files.move(staged, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException | SQLException e) {
+    } catch (IOException e) {
       cause.addSuppressed(e);
       if (staged != null) {
         SqliteSupport.deleteQuietly(staged, cause);
