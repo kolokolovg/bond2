@@ -13,7 +13,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -314,6 +317,32 @@ class DatabaseServiceTest {
     List<String> backups = backupsIn(dataDir());
     assertThat(backups).hasSize(1);
     assertThat(Files.readAllBytes(file())).isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
+  }
+
+  @Test
+  void busyDatabaseMigrationIsClassifiedAsBusyAndRetryable() throws SQLException {
+    // Сценарий «БД занята» на настоящей БД: постороннее соединение держит незавершённую транзакцию
+    // записи, миграция ждёт busy_timeout драйвера и получает SQLITE_BUSY
+    TestDatabases.outdatedAt(file());
+    get(service.open(file(), false));
+
+    try (Connection blocker = DriverManager.getConnection("jdbc:sqlite:" + file())) {
+      blocker.setAutoCommit(false);
+      try (Statement statement = blocker.createStatement()) {
+        statement.execute("CREATE TABLE busy_lock (id INTEGER)");
+      }
+
+      // Реальное ожидание busy-timeout SQLite при миграции — щедрый явный бюджет
+      var result = get(service.migrate(), Duration.ofSeconds(30));
+
+      assertThat(result).isInstanceOf(OpenResult.Failed.class);
+      var failure = (OpenResult.Failed) result;
+      assertThat(failure.reason()).isEqualTo(OpenFailures.REASON_BUSY);
+      assertThat(failure.message()).contains("занята").contains("Повторите").contains("позже");
+      assertThat(OpenFailures.retryable(failure)).isTrue();
+      assertThat(service.state())
+          .isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
+    }
   }
 
   @Test
@@ -792,6 +821,43 @@ class DatabaseServiceTest {
     get(service.open(file(), false));
 
     assertThat(get(service.shutdownAsync(Duration.ofSeconds(1)))).isEqualTo(ShutdownResult.REFUSED);
+  }
+
+  @Test
+  void nonPositiveTimeoutIsRejectedWithoutStartingStop() {
+    // Сценарий «Нулевой срок»: ноль и отрицательный срок — ошибка программиста, отвергается
+    // до любых действий
+    assertThatThrownBy(() -> service.shutdown(Duration.ZERO))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("положительн");
+    assertThatThrownBy(() -> service.shutdownAsync(Duration.ZERO))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> service.shutdown(Duration.ofSeconds(-1)))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> service.shutdownAsync(Duration.ofMillis(-5)))
+        .isInstanceOf(IllegalArgumentException.class);
+
+    // Состояние не изменилось, остановка не началась: сервис работает как до отвергнутых вызовов
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(get(service.open(file(), true))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
+    assertThat(file()).isRegularFile();
+  }
+
+  @Test
+  void shutdownAfterRejectedTimeoutProceedsNormally() {
+    // Сценарий «Корректный вызов после отвергнутого»: после отказа остановка с положительным
+    // сроком выполняется по общим правилам
+    assertThatThrownBy(() -> service.shutdownAsync(Duration.ZERO))
+        .isInstanceOf(IllegalArgumentException.class);
+    assertThatThrownBy(() -> service.shutdown(Duration.ofSeconds(-1)))
+        .isInstanceOf(IllegalArgumentException.class);
+
+    // Остановка не началась: БД открывается, а остановка завершается как обычно
+    get(service.create(file()));
+    assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 
   private static void release(GatedStorage.Gate gate) {

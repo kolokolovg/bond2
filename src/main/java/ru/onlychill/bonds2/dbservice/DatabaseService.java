@@ -138,9 +138,14 @@ public final class DatabaseService {
    * #shutdownAsync(Duration)}. Вызов блокирует вызывающего, поэтому из потока интерфейса его
    * применять не следует. «Покинутость» операции определяет только исходная {@code shutdownAsync}
    * по истечении собственного срока: повторная остановка с меньшим сроком лишь возвращает
-   * собственное наблюдение {@link ShutdownResult#TIMED_OUT}.
+   * собственное наблюдение {@link ShutdownResult#TIMED_OUT}. Срок должен быть положительным:
+   * неположительный срок — ошибка программиста, вызов отвергается до любых действий.
+   *
+   * @throws IllegalArgumentException если срок нулевой или отрицательный; состояние сервиса не
+   *     меняется, остановка не начинается
    */
   public ShutdownResult shutdown(Duration timeout) {
+    requirePositiveTimeout(timeout);
     CompletableFuture<ShutdownResult> done = shutdownAsync(timeout);
     try {
       return done.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -160,10 +165,15 @@ public final class DatabaseService {
    * {@code timeout}, затем закрывает БД. Во время миграции и ожидания решения о ней результат —
    * {@link ShutdownResult#REFUSED}. По истечении срока результат — {@link
    * ShutdownResult#TIMED_OUT}, а БД, открытая позже, закрывается без публикации состояния.
-   * Повторный вызов после начала остановки возвращает future с тем же результатом.
+   * Повторный вызов после начала остановки возвращает future с тем же результатом. Срок должен быть
+   * положительным: неположительный срок — ошибка программиста, вызов отвергается до любых действий.
+   *
+   * @throws IllegalArgumentException если срок нулевой или отрицательный; состояние сервиса не
+   *     меняется, остановка не начинается
    */
   @SuppressWarnings("FutureReturnValueIgnored")
   public CompletableFuture<ShutdownResult> shutdownAsync(Duration timeout) {
+    requirePositiveTimeout(timeout);
     synchronized (shutdownLock) {
       CompletableFuture<ShutdownResult> existing = shutdownFuture;
       if (existing != null) {
@@ -193,6 +203,16 @@ public final class DatabaseService {
 
   private static boolean mustNotStop(DbState current) {
     return current instanceof DbState.Migrating || current instanceof DbState.AwaitingMigration;
+  }
+
+  /**
+   * Неположительный срок остановки — ошибка программиста: проверка выполняется до захвата {@code
+   * shutdownLock}, поэтому состояние сервиса не меняется и остановка не начинается.
+   */
+  private static void requirePositiveTimeout(Duration timeout) {
+    if (timeout.isZero() || timeout.isNegative()) {
+      throw new IllegalArgumentException("Срок остановки должен быть положительным: " + timeout);
+    }
   }
 
   private void runShutdown(CompletableFuture<ShutdownResult> done) {

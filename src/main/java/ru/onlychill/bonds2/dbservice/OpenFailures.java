@@ -3,6 +3,7 @@
 package ru.onlychill.bonds2.dbservice;
 
 import java.nio.file.Path;
+import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.persistence.PersistenceException;
 
 /**
@@ -22,6 +23,25 @@ final class OpenFailures {
   private static final String REASON_CREATE = "ошибка создания";
   private static final String REASON_MIGRATION = "ошибка миграции";
   private static final String REASON_UNEXPECTED = "внутренняя ошибка";
+
+  /** Причина занятости: сбой классифицирован как «БД занята», операцию можно повторить позже. */
+  static final String REASON_BUSY = "БД занята";
+
+  private static final String REASON_CORRUPT = "файл БД повреждён";
+  private static final String REASON_FULL = "нет места на диске";
+  private static final String REASON_FILE_UNAVAILABLE = "файл БД недоступен";
+
+  /**
+   * Коды результатов SQLite, различаемые при классификации (имена — по документации SQLite);
+   * литералы вместо зависимостей от классов драйвера.
+   */
+  private static final int SQLITE_BUSY = 5;
+
+  private static final int SQLITE_LOCKED = 6;
+  private static final int SQLITE_IOERR = 10;
+  private static final int SQLITE_CORRUPT = 11;
+  private static final int SQLITE_FULL = 13;
+  private static final int SQLITE_CANTOPEN = 14;
 
   private OpenFailures() {}
 
@@ -63,16 +83,60 @@ final class OpenFailures {
   }
 
   static OpenResult.Failed openFailed(PersistenceException e) {
-    return new OpenResult.Failed(REASON_OPEN, ErrorMessages.of(e));
+    return sqliteCodeOrByPlace(REASON_OPEN, e);
   }
 
   static OpenResult.Failed createFailed(PersistenceException e) {
-    return new OpenResult.Failed(REASON_CREATE, ErrorMessages.of(e));
+    return sqliteCodeOrByPlace(REASON_CREATE, e);
   }
 
   /** Ошибка миграции уже содержит путь к резервной копии. */
   static OpenResult.Failed migrationFailed(PersistenceException e) {
-    return new OpenResult.Failed(REASON_MIGRATION, ErrorMessages.of(e));
+    return sqliteCodeOrByPlace(REASON_MIGRATION, e);
+  }
+
+  /**
+   * Операцию с этой причиной можно повторить позже: сейчас БД занята другим процессом или
+   * соединением. Остальные причины повторимости не имеют.
+   */
+  static boolean retryable(OpenResult.Failed failure) {
+    return REASON_BUSY.equals(failure.reason());
+  }
+
+  /**
+   * Классифицирует сбой по коду результата SQLite из цепочки причин ({@link
+   * ErrorMessages#sqliteResultCode}); известный код даёт отдельную причину с понятным текстом,
+   * неизвестный (включая незаполненный драйвером) — прежнюю классификацию по месту возникновения.
+   */
+  private static OpenResult.Failed sqliteCodeOrByPlace(String placeReason, PersistenceException e) {
+    OpenResult.Failed byCode = bySqliteCode(e);
+    return byCode != null ? byCode : new OpenResult.Failed(placeReason, ErrorMessages.of(e));
+  }
+
+  /** Причина по коду результата SQLite; неизвестный код (в том числе 0) даёт {@code null}. */
+  private static OpenResult.@Nullable Failed bySqliteCode(PersistenceException e) {
+    return switch (ErrorMessages.sqliteResultCode(e)) {
+      case SQLITE_BUSY, SQLITE_LOCKED ->
+          new OpenResult.Failed(
+              REASON_BUSY,
+              "База данных занята другим процессом или соединением. Повторите операцию позже.");
+      case SQLITE_CORRUPT ->
+          new OpenResult.Failed(
+              REASON_CORRUPT,
+              "Файл базы данных повреждён: открыть его нельзя. Используйте резервную копию, если"
+                  + " она есть.");
+      case SQLITE_FULL ->
+          new OpenResult.Failed(
+              REASON_FULL,
+              "На диске нет свободного места: операция не выполнена. Освободите место и повторите"
+                  + " операцию.");
+      case SQLITE_CANTOPEN, SQLITE_IOERR ->
+          new OpenResult.Failed(
+              REASON_FILE_UNAVAILABLE,
+              "Файл базы данных недоступен: его не удалось открыть. Проверьте, что файл на месте"
+                  + " и не занят другой программой.");
+      default -> null;
+    };
   }
 
   /**

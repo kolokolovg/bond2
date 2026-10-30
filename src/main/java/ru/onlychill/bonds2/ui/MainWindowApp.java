@@ -5,7 +5,9 @@ package ru.onlychill.bonds2.ui;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.concurrent.Executor;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.value.ObservableValue;
@@ -28,17 +30,30 @@ import ru.onlychill.bonds2.persistence.DataDirectory;
 import ru.onlychill.bonds2.persistence.InstanceLock;
 import ru.onlychill.bonds2.persistence.PersistenceException;
 import ru.onlychill.bonds2.settings.SettingsStore;
+import ru.onlychill.bonds2.settings.SettingsStore.LoadResult;
 
 /**
  * Главное окно приложения: меню «Файл» (настройки, открытие, создание и закрытие БД, выход) и
- * строка состояния БД внизу. Логика БД — в {@link DatabaseController}, здесь только сборка
- * интерфейса.
+ * строка состояния БД внизу. Чтение настроек при запуске выполняется вне потока интерфейса, логика
+ * БД — в {@link DatabaseController}; здесь сборка интерфейса и действие остановки сервиса для хука
+ * завершения JVM.
  */
 public final class MainWindowApp extends Application {
 
   /** Действия пунктов меню «Файл». */
   record MenuActions(
       Runnable settings, Runnable open, Runnable create, Runnable close, Runnable exit) {}
+
+  /** Имя потока, на котором выполняется чтение настроек при запуске. */
+  static final String SETTINGS_LOAD_THREAD_NAME = "bonds2-settings-load";
+
+  private static final System.Logger LOG = System.getLogger(MainWindowApp.class.getName());
+
+  /**
+   * Лучшая попытка остановки сервиса БД для хука завершения JVM; {@code null}, когда приложение ещё
+   * не дошло до создания контроллера или уже завершилось штатно. Читается хуком из любого потока.
+   */
+  private static volatile @Nullable Runnable externalStop;
 
   private @Nullable DatabaseController controller;
   private @Nullable InstanceLock instanceLock;
@@ -51,15 +66,60 @@ public final class MainWindowApp extends Application {
       Platform.exit();
       return;
     }
+    var store = new SettingsStore(DataDirectory.settingsFile());
+    // Чтение настроек идёт вне потока интерфейса: медленный диск не замораживает запуск
+    loadSettingsThenShow(store::load, settingsLoader(), loaded -> showWindow(stage, store, loaded));
+  }
+
+  /**
+   * Читает настройки вне потока интерфейса и по завершении передаёт готовый результат в поток
+   * JavaFX: там строится окно и выполняется автооткрытие по прочитанным значениям. Чтение по
+   * контракту {@link SettingsStore#load()} не бросает и возвращает значения с признаком сброса,
+   * если файл был испорчен.
+   *
+   * @param load чтение настроек
+   * @param loader выполняет чтение вне потока интерфейса
+   * @param show строит и показывает окно по готовому результату; вызывается в потоке JavaFX
+   */
+  static void loadSettingsThenShow(
+      Supplier<LoadResult> load, Executor loader, Consumer<LoadResult> show) {
+    loader.execute(
+        () -> {
+          LoadResult loaded = load.get();
+          try {
+            Platform.runLater(() -> show.accept(loaded));
+          } catch (IllegalStateException e) {
+            // Тулкит уже завершён: окно не нужно, остановку сервиса делает хук завершения JVM
+          }
+        });
+  }
+
+  /** Исполнитель чтения настроек: отдельный поток-демон читает один раз и завершается. */
+  private static Executor settingsLoader() {
+    return task -> {
+      var thread = new Thread(task, SETTINGS_LOAD_THREAD_NAME);
+      thread.setDaemon(true);
+      thread.start();
+    };
+  }
+
+  /**
+   * Строит меню, показывает окно и запускает автооткрытие по прочитанным настройкам; вызывается в
+   * потоке JavaFX после завершения чтения.
+   */
+  private void showWindow(Stage stage, SettingsStore store, LoadResult loaded) {
     var db =
         new DatabaseController(
-            new SettingsStore(DataDirectory.settingsFile()),
+            store,
+            loaded,
             DataDirectory.databaseFile(),
             new DatabaseService(),
             new FxDialogs(stage),
             Platform::exit,
             Platform::runLater);
     controller = db;
+    // Пока сервис не остановлен штатно, хук завершения JVM может остановить его без JavaFX
+    setExternalStop(() -> db.shutdown(DatabaseController.STOP_TIMEOUT));
 
     var status = new Label();
     status.textProperty().bind(db.statusProperty());
@@ -87,6 +147,31 @@ public final class MainWindowApp extends Application {
     DatabaseController db = controller;
     InstanceLock lock = instanceLock;
     shutDownInOrder(db == null ? () -> {} : db::shutdown, lock == null ? () -> {} : lock::close);
+    // Штатный выход завершён: хук завершения JVM больше ничего не останавливает
+    setExternalStop(null);
+  }
+
+  /**
+   * Тело хука завершения JVM: останавливает сервис БД, если он ещё не остановлен штатным выходом.
+   * Не касается JavaFX — тулкит к моменту внешнего завершения (сигнал, остановка из среды
+   * разработки) может быть уже мёртв. Ошибки остановки журналируются и завершению не мешают;
+   * идемпотентно со штатным выходом, который снимает действие остановки.
+   */
+  public static void stopDatabaseOnExternalShutdown() {
+    Runnable stop = externalStop;
+    if (stop == null) {
+      return;
+    }
+    try {
+      stop.run();
+    } catch (RuntimeException | Error e) {
+      LOG.log(System.Logger.Level.WARNING, "Не удалось остановить сервис БД при завершении", e);
+    }
+  }
+
+  /** Заменяет действие остановки для внешнего завершения; {@code null} снимает его. */
+  static void setExternalStop(@Nullable Runnable stop) {
+    externalStop = stop;
   }
 
   /**
@@ -161,7 +246,10 @@ public final class MainWindowApp extends Application {
         db::requestExit);
   }
 
-  /** Диалог выбора файла для новой БД; пустой результат означает отмену. */
+  /**
+   * Диалог выбора файла для новой БД; пустой результат означает отмену. Имя без расширения
+   * дополняется {@code .db}, чтобы созданный файл был виден фильтрам диалогов приложения.
+   */
   private static Optional<Path> chooseNewDatabase(Stage stage) {
     var chooser = new FileChooser();
     chooser.setTitle("Создать базу данных");
@@ -169,6 +257,26 @@ public final class MainWindowApp extends Application {
     chooser
         .getExtensionFilters()
         .add(new FileChooser.ExtensionFilter("База данных SQLite", "*.db"));
-    return Optional.ofNullable(chooser.showSaveDialog(stage)).map(File::toPath);
+    return Optional.ofNullable(chooser.showSaveDialog(stage))
+        .map(File::toPath)
+        .map(MainWindowApp::withDbExtension);
+  }
+
+  /**
+   * Дописывает расширение {@code .db} к выбранному имени без расширения: по последней точке в имени
+   * файла. Имя с расширением не меняется.
+   */
+  static Path withDbExtension(Path chosen) {
+    Path fileName = chosen.getFileName();
+    if (fileName == null) {
+      // Путь без имени файла (корень): дописывать нечего
+      return chosen;
+    }
+    String name = fileName.toString();
+    int dot = name.lastIndexOf('.');
+    if (dot > 0 && dot < name.length() - 1) {
+      return chosen;
+    }
+    return chosen.resolveSibling(name + ".db");
   }
 }

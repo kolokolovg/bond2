@@ -24,6 +24,9 @@ class StatePublisherTest {
     long initialRequest;
     boolean failOnNext;
 
+    /** Имя класса последней ошибки, переданной в {@code onError}. */
+    String errorClass;
+
     /** Состояние, при доставке которого подписчик бросает фатальную ошибку среды. */
     DbState fatalOnItem;
 
@@ -54,6 +57,7 @@ class StatePublisherTest {
 
     @Override
     public void onError(Throwable error) {
+      this.errorClass = error.getClass().getName();
       events.add("error");
     }
 
@@ -153,6 +157,44 @@ class StatePublisherTest {
     publisher.publish(DbState.CLOSED);
     assertThat(good.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
     assertThat(bad.items).containsExactly(DbState.CLOSED, OPEN);
+  }
+
+  @Test
+  void duplicateSubscriptionGetsErrorWithoutSecondRegistration() {
+    // Сценарий «Повторная подписка»: повтор получает onError и не регистрируется
+    var publisher = new StatePublisher(DbState.CLOSED);
+    var probe = new Probe(Long.MAX_VALUE);
+    publisher.subscribe(probe);
+    assertThat(probe.items).containsExactly(DbState.CLOSED);
+
+    publisher.subscribe(probe);
+
+    assertThat(probe.errorClass).isEqualTo(IllegalStateException.class.getName());
+    assertThat(probe.events).containsExactly("subscribe", "error");
+
+    // Второй регистрации нет: каждое состояние доставляется ровно один раз, публикация продолжается
+    publisher.publish(OPEN);
+    publisher.publish(DbState.CLOSED);
+    assertThat(probe.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
+  }
+
+  @Test
+  void cancelledSubscriberCanSubscribeAgain() {
+    // Признак подписки снимается отменой: повторная подписка после отмены — обычная подписка
+    var publisher = new StatePublisher(DbState.CLOSED);
+    var probe = new Probe(0);
+    publisher.subscribe(probe);
+    probe.subscription.cancel();
+
+    publisher.subscribe(probe);
+
+    // onError нет: записи «subscribe» — от каждой из двух подписок
+    assertThat(probe.errorClass).isNull();
+    assertThat(probe.events).containsExactly("subscribe", "subscribe");
+    probe.subscription.request(Long.MAX_VALUE);
+    assertThat(probe.items).containsExactly(DbState.CLOSED);
+    publisher.publish(OPEN);
+    assertThat(probe.items).containsExactly(DbState.CLOSED, OPEN);
   }
 
   @Test

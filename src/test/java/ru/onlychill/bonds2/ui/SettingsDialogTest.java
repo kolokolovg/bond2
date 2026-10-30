@@ -367,6 +367,7 @@ class SettingsDialogTest {
     var db =
         new DatabaseController(
             store,
+            store.load(),
             dir.resolve("default/bonds2.db"),
             new DatabaseService(),
             new FxDialogs(null),

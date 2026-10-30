@@ -16,6 +16,28 @@ public final class ErrorMessages {
   private ErrorMessages() {}
 
   /**
+   * Первый ненулевой код результата SQLite ({@code getErrorCode()}) среди {@link SQLException}
+   * цепочки причин, включая {@code getNextException()}; обход не идёт глубже {@link
+   * #MAX_CAUSE_DEPTH} причин. Код драйвер не заполняет повсеместно: {@code 0} означает «кода в
+   * цепочке нет», и вызывающий классифицирует ошибку по месту возникновения.
+   */
+  static int sqliteResultCode(Throwable error) {
+    var pending = new ArrayDeque<Throwable>();
+    addCausesOf(error, pending);
+    for (int depth = 0; depth < MAX_CAUSE_DEPTH; depth++) {
+      Throwable cause = pending.poll();
+      if (cause == null) {
+        break;
+      }
+      if (cause instanceof SQLException sql && sql.getErrorCode() != 0) {
+        return sql.getErrorCode();
+      }
+      addCausesOf(cause, pending);
+    }
+    return 0;
+  }
+
+  /**
    * Сообщение исключения. Если у непосредственной причины сообщения нет или оно не вошло в текст,
    * берётся первое непустое сообщение из глубины цепочки причин ({@code getCause()}, а для {@link
    * SQLException} ещё и {@code getNextException()}) не дальше пяти причин; формат: {@code <текст>

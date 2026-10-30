@@ -130,20 +130,35 @@ class DatabaseControllerTest {
   }
 
   private DatabaseController controllerWith(Path settings) {
+    var store = new SettingsStore(settings);
     return new DatabaseController(
-        new SettingsStore(settings), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
+        store, store.load(), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
   }
 
   /** Контроллер с подменённым исполнителем записи настроек: тесты проверяют поток записи. */
   private DatabaseController controllerWith(Path settings, Executor settingsExecutor) {
+    var store = new SettingsStore(settings);
     return new DatabaseController(
-        new SettingsStore(settings),
+        store,
+        store.load(),
         defaultFile(),
         service,
         dialogs,
         exits::incrementAndGet,
         ui,
         settingsExecutor);
+  }
+
+  /** Контроллер с готовым результатом чтения настроек, без обращения к файлу настроек. */
+  private DatabaseController controllerWith(SettingsStore.LoadResult loaded) {
+    return new DatabaseController(
+        new SettingsStore(settingsFile()),
+        loaded,
+        defaultFile(),
+        service,
+        dialogs,
+        exits::incrementAndGet,
+        ui);
   }
 
   /** Однопоточный исполнитель записи настроек с именем потока, как в приложении. */
@@ -168,6 +183,24 @@ class DatabaseControllerTest {
 
   private void saveSettings(Path databasePath, boolean autoOpen) {
     new SettingsStore(settingsFile()).save(new Settings(databasePath, autoOpen));
+  }
+
+  /**
+   * Запись пути БД дошла до файла настроек: содержимое читается напрямую, без {@link
+   * SettingsStore#load()} — очистка временных файлов при чтении удаляет файл идущей фоновой записи.
+   */
+  private static boolean settingsFileHas(Path settingsFile, Path database, boolean autoOpen) {
+    try {
+      if (Files.notExists(settingsFile)) {
+        return false;
+      }
+      String text = Files.readString(settingsFile);
+      return text.contains("database.path=" + database)
+          && text.contains("database.autoOpen=" + autoOpen);
+    } catch (IOException e) {
+      // Чтение в процессе атомарной записи: попробуем при следующей проверке
+      return false;
+    }
   }
 
   private static boolean isOpen(DatabaseController db) {
@@ -216,6 +249,26 @@ class DatabaseControllerTest {
     assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
     assertThat(db.statusProperty().get()).isEqualTo(CLOSED_STATUS);
     assertThat(userFile()).doesNotExist();
+  }
+
+  @Test
+  void autoOpenAndResetWarningComeFromLoadedResultNotDefaults() {
+    newDatabaseAt(userFile());
+    // Прочитанные значения противоречат значениям по умолчанию: автооткрытие выключено
+    // (по умолчанию включено), признак сброса есть (по умолчанию его нет)
+    var loaded = new SettingsStore.LoadResult(new Settings(userFile(), false), null, true);
+    var db = controllerWith(loaded);
+
+    db.openOnStartup();
+    ui.settle();
+
+    // Предупреждение о сбросе — по признаку из прочитанного результата
+    assertThat(dialogs.warnings).hasSize(1);
+    assertThat(dialogs.warnings.get(0)).contains("настройки сброшены");
+    // Автооткрытие — по флагу из прочитанного результата: существующая БД не открылась
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
+    assertThat(userFile()).isRegularFile();
+    assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
@@ -458,6 +511,35 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void repeatedOpenBeforeResultIsDeliveredSendsOnlyOneCommand()
+      throws SQLException, IOException, InterruptedException {
+    TestDatabases.foreignAt(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    // Результат первого открытия ещё не доставлен: состояние в интерфейсе всё ещё «закрыта»
+    db.openDatabase();
+
+    storage.openGate.release();
+    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
+    ui.settle();
+
+    // Признак идущей операции: сервис получил ровно одну команду, повторный запрос проигнорирован
+    assertThat(storage.threads).hasSize(1);
+    assertThat(dialogs.errors).hasSize(1);
+    assertThat(db.stateProperty().get())
+        .isEqualTo(new DbState.Closed("не база bonds2", dialogs.errors.get(0)));
+
+    // Признак сброшен в обработчике результата: новое открытие доходит до сервиса
+    db.openDatabase();
+    ui.pumpUntil(() -> dialogs.errors.size() == 2);
+    assertThat(storage.threads).hasSize(2);
+  }
+
+  @Test
   void statusFollowsOpeningCreatingAndMigrating() throws SQLException, InterruptedException {
     saveSettings(null, false);
     storage.openGate.hold();
@@ -468,12 +550,7 @@ class DatabaseControllerTest {
     storage.openGate.release();
     ui.pumpUntil(() -> isOpen(db));
     // Путь записан в настройки в фоне: без него открытие пошло бы по пути по умолчанию
-    ui.pumpUntil(
-        () ->
-            new SettingsStore(settingsFile())
-                .load()
-                .settings()
-                .equals(new Settings(userFile(), false)));
+    ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
     db.closeDatabase();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
 
@@ -523,9 +600,11 @@ class DatabaseControllerTest {
   @Test
   void exitChainFailureShowsErrorKeepsAppAliveAndRepeatedExitStartsAgain() {
     var failFirst = new AtomicBoolean(true);
+    var store = new SettingsStore(settingsFile());
     var db =
         new DatabaseController(
-            new SettingsStore(settingsFile()),
+            store,
+            store.load(),
             defaultFile(),
             service,
             dialogs,
@@ -554,9 +633,11 @@ class DatabaseControllerTest {
 
   @Test
   void repeatedExitChainFailureResetsExitingAgain() {
+    var store = new SettingsStore(settingsFile());
     var db =
         new DatabaseController(
-            new SettingsStore(settingsFile()),
+            store,
+            store.load(),
             defaultFile(),
             service,
             dialogs,
@@ -803,7 +884,7 @@ class DatabaseControllerTest {
     ui.pumpUntil(() -> isOpen(db));
     var expected = new Settings(userFile(), false);
     // Путь записывается в настройки в фоне: ждём завершения записи
-    ui.pumpUntil(() -> new SettingsStore(settingsFile()).load().settings().equals(expected));
+    ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
 
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
     assertThat(userFile()).isRegularFile();
@@ -824,9 +905,27 @@ class DatabaseControllerTest {
 
     assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
     assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0)).contains("уже существует");
+    assertThat(dialogs.errors.get(0))
+        .contains("уже существует")
+        .contains("Выберите другое имя")
+        .contains("не изменён");
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
     assertThat(settingsFile()).doesNotExist();
+  }
+
+  @Test
+  void createWithDialogNameWithoutExtensionCreatesFileWithDbExtension() {
+    // Диалог дополняет введённое имя без расширения расширением .db
+    Path chosen = MainWindowApp.withDbExtension(dataDir().resolve("новая база"));
+    assertThat(chosen.getFileName().toString()).isEqualTo("новая база.db");
+    var db = controller();
+
+    db.createDatabase(chosen);
+    ui.pumpUntil(() -> isOpen(db));
+
+    assertThat(chosen).isRegularFile();
+    assertThat(dataDir().resolve("новая база")).doesNotExist();
+    assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
@@ -1043,6 +1142,51 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void externalShutdownHookStopsRunningService() {
+    var db = opened();
+    MainWindowApp.setExternalStop(() -> db.shutdown(DatabaseController.STOP_TIMEOUT));
+    try {
+      MainWindowApp.stopDatabaseOnExternalShutdown();
+
+      // Сервис остановлен в пределах короткого срока: БД закрыта, новые операции отклоняются
+      assertThat(isClosed(storage.opened.get(0))).isTrue();
+      ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
+      assertThat(service.open(userFile(), false).join()).isInstanceOf(OpenResult.Rejected.class);
+    } finally {
+      MainWindowApp.setExternalStop(null);
+    }
+  }
+
+  @Test
+  void externalShutdownHookDoesNothingAfterNormalExit() {
+    var db = opened();
+    db.shutdown();
+    // Штатный выход снял действие остановки: хук не делает ничего и завершению не мешает
+    MainWindowApp.setExternalStop(null);
+
+    assertThatCode(MainWindowApp::stopDatabaseOnExternalShutdown).doesNotThrowAnyException();
+
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+    assertThat(service.open(userFile(), false).join())
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> assertThat(rejected.message()).contains("остановлен"));
+  }
+
+  @Test
+  void externalShutdownHookSwallowsStopFailure() {
+    MainWindowApp.setExternalStop(
+        () -> {
+          throw new IllegalStateException("сбой остановки");
+        });
+    try {
+      assertThatCode(MainWindowApp::stopDatabaseOnExternalShutdown).doesNotThrowAnyException();
+    } finally {
+      MainWindowApp.setExternalStop(null);
+    }
+  }
+
+  @Test
   void shutdownWhileClosedDoesNothing() {
     var db = controller();
 
@@ -1157,7 +1301,7 @@ class DatabaseControllerTest {
       db.createDatabase(userFile());
       ui.pumpUntil(() -> isOpen(db));
       var expected = new Settings(userFile(), false);
-      ui.pumpUntil(() -> new SettingsStore(settingsFile()).load().settings().equals(expected));
+      ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
 
       assertThat(db.settings()).isEqualTo(expected);
       assertThat(dialogs.warnings).isEmpty();

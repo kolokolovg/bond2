@@ -53,18 +53,39 @@ final class StatePublisher implements Flow.Publisher<DbState> {
   @Override
   public void subscribe(Flow.Subscriber<? super DbState> subscriber) {
     var subscription = new Subscription(subscriber);
+    boolean duplicate;
     boolean finished;
     synchronized (lock) {
-      subscription.enqueue(current);
+      duplicate = subscribed(subscriber);
       finished = closed;
-      if (!finished) {
-        subscriptions.add(subscription);
+      if (!duplicate) {
+        subscription.enqueue(current);
+        if (!finished) {
+          subscriptions.add(subscription);
+        }
       }
+    }
+    if (duplicate) {
+      // Контракт Flow: повторная подписка того же подписчика получает onError без новой подписки;
+      // исходная подписка продолжает доставку
+      subscriber.onError(
+          new IllegalStateException("Подписчик уже подписан: повторная подписка отклонена"));
+      return;
     }
     subscriber.onSubscribe(subscription);
     if (finished) {
       subscription.complete();
     }
+  }
+
+  /** Уже есть регистрация именно этого подписчика; отмена подписки снимает признак. */
+  private boolean subscribed(Flow.Subscriber<? super DbState> subscriber) {
+    for (Subscription existing : subscriptions) {
+      if (existing.subscriber == subscriber) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private void remove(Subscription subscription) {

@@ -88,6 +88,12 @@ final class DatabaseController {
   /** Запущенная миграция; {@code null}, если её не было. */
   private @Nullable CompletableFuture<OpenResult> migration;
 
+  /**
+   * Открытие или создание идёт: повторный запрос до доставки результата игнорируется. {@code
+   * volatile}: запись и сброс происходят в потоке интерфейса, но исполнитель в тестах отличается.
+   */
+  private volatile boolean busy;
+
   /** Выход начат: повторный запрос игнорируется. */
   private boolean exiting;
 
@@ -99,7 +105,9 @@ final class DatabaseController {
   private volatile boolean stopped;
 
   /**
-   * @param store хранилище настроек; настройки читаются при создании контроллера
+   * @param store хранилище настроек; используется для фоновой записи обновлённых настроек
+   * @param loaded результат чтения настроек, выполненного до создания контроллера вне потока
+   *     интерфейса
    * @param defaultDatabaseFile файл БД, если в настройках путь не задан
    * @param service сервис жизненного цикла БД; контроллер подписывается на его состояние
    * @param dialogs диалоги пользователя
@@ -108,6 +116,7 @@ final class DatabaseController {
    */
   DatabaseController(
       SettingsStore store,
+      SettingsStore.LoadResult loaded,
       Path defaultDatabaseFile,
       DatabaseService service,
       Dialogs dialogs,
@@ -115,6 +124,7 @@ final class DatabaseController {
       Executor uiExecutor) {
     this(
         store,
+        loaded,
         defaultDatabaseFile,
         service,
         dialogs,
@@ -136,6 +146,7 @@ final class DatabaseController {
    */
   DatabaseController(
       SettingsStore store,
+      SettingsStore.LoadResult loaded,
       Path defaultDatabaseFile,
       DatabaseService service,
       Dialogs dialogs,
@@ -149,7 +160,6 @@ final class DatabaseController {
     this.exit = exit;
     this.uiExecutor = uiExecutor;
     this.settingsExecutor = settingsExecutor;
-    SettingsStore.LoadResult loaded = store.load();
     this.settings = loaded.settings();
     this.recovered = loaded.recovered();
     this.badCopy = loaded.badCopy();
@@ -190,12 +200,12 @@ final class DatabaseController {
 
   /** Открытие; {@code autoCreate} разрешает создать БД по пути по умолчанию, если файла нет. */
   private void open(boolean autoCreate) {
-    if (!state.get().allowsOpen()) {
+    if (busy || !state.get().allowsOpen()) {
       return;
     }
     Path configured = settings.databasePath();
     Path file = configured != null ? configured : defaultDatabaseFile;
-    deliver(service.open(file, autoCreate && configured == null), this::onOpenResult);
+    deliverOperation(service.open(file, autoCreate && configured == null), this::onOpenResult);
   }
 
   /**
@@ -203,10 +213,10 @@ final class DatabaseController {
    * изменяется. Путь записывается в настройки; флаг автооткрытия не меняется.
    */
   void createDatabase(Path file) {
-    if (!state.get().allowsCreate()) {
+    if (busy || !state.get().allowsCreate()) {
       return;
     }
-    deliver(service.create(file), result -> onCreateResult(file, result));
+    deliverOperation(service.create(file), result -> onCreateResult(file, result));
   }
 
   /** «Файл → Закрыть базу»: закрывает БД на потоке сервиса, окно остаётся отзывчивым. */
@@ -342,6 +352,13 @@ final class DatabaseController {
    * Вызывается при завершении приложения в обход меню: останавливает сервис и ждёт не дольше {@link
    * #STOP_TIMEOUT}. Ожидающая решения миграция считается отклонённой, идущая доводится до конца не
    * дольше {@link #MIGRATION_TIMEOUT}. Результаты, пришедшие позже, игнорируются.
+   *
+   * <p>Ожидание здесь блокирует поток JavaFX сознательно. К моменту вызова окно уже скрыто JavaFX,
+   * поэтому никакая обратная связь пользователю невозможна. Неблокирующий вариант — вернуться из
+   * метода до закрытия БД — позволил бы процессу завершиться с незакрытой базой, что хуже короткой
+   * задержки: без явного закрытия не выполняется контрольная точка журнала WAL и не проверяется
+   * целостность файла. Ожидание ограничено: обычно не дольше {@link #STOP_TIMEOUT} (5 секунд), а
+   * при идущей миграции — до её окончания и остановки сервиса, суммарно до ~65 секунд.
    */
   void shutdown() {
     if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
@@ -491,6 +508,31 @@ final class DatabaseController {
     if (result instanceof OpenResult.Failed failure) {
       dialogs.error(failure.message());
     }
+  }
+
+  /**
+   * Ставит операцию открытия или создания и помечает её идущей ({@code busy}): повторный запрос до
+   * доставки результата игнорируется даже если состояние в интерфейсе ещё не обновилось. Признак
+   * сбрасывается в потоке JavaFX, когда цепочка доставки доходит до конца: и при результате, и при
+   * сбое операции или обработчика.
+   */
+  @SuppressWarnings("FutureReturnValueIgnored")
+  private <T> void deliverOperation(CompletableFuture<T> future, Consumer<T> handler) {
+    busy = true;
+    CompletableFuture<Void> delivered =
+        future
+            .thenAcceptAsync(handler, uiExecutor)
+            .handleAsync(
+                (ignored, error) -> {
+                  busy = false;
+                  return (Void) null;
+                },
+                uiExecutor);
+    delivered.exceptionally(
+        error -> {
+          LOG.log(System.Logger.Level.ERROR, "Сбой операции с БД", error);
+          return null;
+        });
   }
 
   /** Передаёт результат сервиса обработчику в потоке JavaFX; сбой обработчика попадает в журнал. */

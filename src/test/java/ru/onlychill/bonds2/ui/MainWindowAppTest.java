@@ -9,8 +9,13 @@ import static ru.onlychill.bonds2.ui.FxToolkit.runOnFxThread;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 import javafx.application.Platform;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.scene.Group;
@@ -24,6 +29,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
+import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
 class MainWindowAppTest {
@@ -171,6 +177,90 @@ class MainWindowAppTest {
   }
 
   @Test
+  void slowSettingsLoadDoesNotBlockFxThreadAndWindowAppearsAfterIt() throws InterruptedException {
+    var loadEntered = new CountDownLatch(1);
+    var releaseLoad = new CountDownLatch(1);
+    var windows = new CopyOnWriteArrayList<Stage>();
+    var showThreads = new CopyOnWriteArrayList<Thread>();
+    // «Медленный диск»: чтение началось, но не завершается, пока ворота не открыты
+    Supplier<SettingsStore.LoadResult> slowLoad =
+        () -> {
+          loadEntered.countDown();
+          await(releaseLoad);
+          return new SettingsStore.LoadResult(new Settings(FILE, true), null, false);
+        };
+    Executor loader =
+        task -> {
+          var thread = new Thread(task, MainWindowApp.SETTINGS_LOAD_THREAD_NAME + "-test");
+          thread.setDaemon(true);
+          thread.start();
+        };
+
+    runOnFxThread(
+        () ->
+            MainWindowApp.loadSettingsThenShow(
+                slowLoad,
+                loader,
+                loaded -> {
+                  showThreads.add(Thread.currentThread());
+                  var stage = new Stage();
+                  stage.setTitle("Bonds");
+                  stage.setScene(new Scene(new Group()));
+                  stage.show();
+                  windows.add(stage);
+                }));
+
+    // Чтение идёт на фоновом потоке: поток интерфейса отвечает, и окно ещё не показано
+    assertThat(loadEntered.await(10, TimeUnit.SECONDS)).isTrue();
+    runOnFxThread(
+        () -> {
+          assertThat(windows).isEmpty();
+          assertThat(showThreads).isEmpty();
+        });
+
+    // Окно появляется только после завершения чтения, продолжение — в потоке JavaFX
+    releaseLoad.countDown();
+    assertThat(holds(() -> !windows.isEmpty() && windows.get(0).isShowing())).isTrue();
+    assertThat(showThreads.get(0)).isNotEqualTo(Thread.currentThread());
+
+    runOnFxThread(
+        () -> {
+          for (Stage stage : windows) {
+            stage.close();
+          }
+        });
+  }
+
+  /** Ждёт открытия ворот; прерывание и тайм-аут превращаются в сбой теста. */
+  private static void await(CountDownLatch gate) {
+    try {
+      if (!gate.await(30, TimeUnit.SECONDS)) {
+        throw new IllegalStateException("Чтение настроек не завершилось вовремя");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Test
+  void newDatabaseNameWithoutExtensionGetsDbAppended() {
+    assertThat(MainWindowApp.withDbExtension(dir.resolve("база")).getFileName().toString())
+        .isEqualTo("база.db");
+
+    // Имя с расширением не меняется: чувствительность к регистру не требуется
+    assertThat(MainWindowApp.withDbExtension(dir.resolve("база.db")))
+        .isEqualTo(dir.resolve("база.db"));
+    assertThat(MainWindowApp.withDbExtension(dir.resolve("база.DB")))
+        .isEqualTo(dir.resolve("база.DB"));
+    assertThat(MainWindowApp.withDbExtension(dir.resolve("архив.sqlite")))
+        .isEqualTo(dir.resolve("архив.sqlite"));
+    // Скрытый файл без расширения тоже получает .db
+    assertThat(MainWindowApp.withDbExtension(dir.resolve(".bonds")))
+        .isEqualTo(dir.resolve(".bonds.db"));
+  }
+
+  @Test
   void failedStopOnExitLeavesWindowOpenAndProcessesRepeatedExit() {
     var stageBox = new Stage[1];
     runOnFxThread(
@@ -184,9 +274,11 @@ class MainWindowAppTest {
 
     var failedOnce = new AtomicBoolean();
     var exits = new AtomicInteger();
+    var store = new SettingsStore(dir.resolve("cfg/settings.properties"));
     var db =
         new DatabaseController(
-            new SettingsStore(dir.resolve("cfg/settings.properties")),
+            store,
+            store.load(),
             dir.resolve("default/bonds2.db"),
             new DatabaseService(),
             new FxDialogs(stageBox[0]),
