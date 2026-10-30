@@ -1,5 +1,8 @@
 import net.ltgt.gradle.errorprone.CheckSeverity
 import net.ltgt.gradle.errorprone.errorprone
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 
 plugins {
     application
@@ -94,12 +97,18 @@ tasks.jacocoTestReport {
     }
 }
 
+// Политика гейта покрытия (JaCoCo): покрытие измеряется юнит- и headless-тестами,
+// контроллер UI при этом тестируем, поэтому из гейта исключается только не покрываемый
+// автотестами клей запуска — класс Main и окно приложения.
+val jacocoExcludedGlue =
+    listOf("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/ui/MainWindowApp.class")
+
 tasks.jacocoTestCoverageVerification {
     // GUI-обвязка (запуск JavaFX, показ окна) не покрывается автоматическими тестами
     classDirectories.setFrom(
         files(
             classDirectories.files.map {
-                fileTree(it) { exclude("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/ui/MainWindowApp.class") }
+                fileTree(it) { exclude(jacocoExcludedGlue) }
             },
         ),
     )
@@ -107,7 +116,7 @@ tasks.jacocoTestCoverageVerification {
         rule {
             limit {
                 counter = "LINE"
-                minimum = providers.gradleProperty("coverage.minLine").map { it.toBigDecimal() }.get()
+                minimum = providers.gradleProperty("coverage.minLine").getOrElse("0.80").toBigDecimal()
             }
         }
     }
@@ -117,16 +126,24 @@ tasks.check {
     dependsOn(tasks.jacocoTestCoverageVerification)
 }
 
+// Политика гейта мутаций (pitest): UI-слой не мутируем — его тесты тянут JavaFX-ожидания
+// по 5–20 с, мутационная фаза становится wait-bound (CPU простаивает); логика сервисов
+// покрыта юнит-тестами. Расхождение с перечнем гейта покрытия (JaCoCo, см. константу
+// jacocoExcludedGlue) — осознанное: контроллер UI остаётся в гейте покрытия.
+val uiPackage = setOf("ru.onlychill.bonds2.ui.*")
+val pitestExcludedGlue = setOf("ru.onlychill.bonds2.Main") + uiPackage
+
 pitest {
-    pitestVersion = "1.30.1"
-    junit5PluginVersion = "1.2.3"
+    pitestVersion =
+        libs.versions.pitest.tool
+            .get()
+    junit5PluginVersion =
+        libs.versions.pitest.junit5.plugin
+            .get()
     targetClasses = setOf("ru.onlychill.bonds2.*")
-    // UI-слой не мутируем: его тесты тянут JavaFX-ожидания по 5-20 с, мутационная фаза
-    // становится wait-bound (CPU простаивает). Логика сервисов покрыта юнит-тестами.
-    excludedClasses =
-        setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.ui.*")
-    excludedTestClasses = setOf("ru.onlychill.bonds2.ui.*")
-    mutationThreshold = providers.gradleProperty("mutation.threshold").map { it.toInt() }
+    excludedClasses = pitestExcludedGlue
+    excludedTestClasses = uiPackage
+    mutationThreshold = providers.gradleProperty("mutation.threshold").getOrElse("70").toInt()
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false
     threads = 8
@@ -134,7 +151,9 @@ pitest {
 }
 
 spotbugs {
-    toolVersion = "4.10.5"
+    toolVersion =
+        libs.versions.spotbugs.tool
+            .get()
     effort = com.github.spotbugs.snom.Effort.MAX
     reportLevel = com.github.spotbugs.snom.Confidence.MEDIUM
     ignoreFailures = false
@@ -155,8 +174,10 @@ spotless {
 // --- Формальная верификация (JML + OpenJML) ---
 // OpenJML поставляется со своим JDK 21; проект целиком использует тот же JDK 21,
 // поэтому ограничений на синтаксис верифицируемого кода сверх Java 21 нет.
-val openjmlVersion = providers.gradleProperty("openjml.version").get()
+// Версия — в каталоге версий (libs.versions.toml); -Popenjml.version переопределяет.
+val openjmlVersion = providers.gradleProperty("openjml.version").orElse(libs.versions.openjml).get()
 val openjmlHome = layout.projectDirectory.dir("tools/openjml-$openjmlVersion")
+val openjmlScript = if (System.getProperty("os.name").lowercase().contains("win")) "openjml.bat" else "openjml"
 
 val downloadOpenjml =
     tasks.register("downloadOpenjml") {
@@ -164,6 +185,7 @@ val downloadOpenjml =
         description = "Скачивает зафиксированную версию OpenJML в tools/."
         val version = openjmlVersion
         val home = openjmlHome
+        val script = openjmlScript
         val osName = System.getProperty("os.name").lowercase()
         val arch = System.getProperty("os.arch").lowercase()
         val isArm = arch == "aarch64" || arch == "arm64"
@@ -173,23 +195,78 @@ val downloadOpenjml =
                 osName.contains("mac") -> if (isArm) "macos-arm64" else "macos-x86_64"
                 else -> if (isArm) "ubuntu-arm64" else "ubuntu-24.04"
             }
-        outputs.dir(home)
-        onlyIf { !home.asFile.exists() }
+        // Готовность — наличие исполняемого скрипта OpenJML в целевом пути, а не существование
+        // каталога: пустой или битый каталог не должен навсегда отключать задачу.
+        // outputs.dir сознательно не объявлен: Gradle создал бы пустой целевой каталог ещё до
+        // выполнения, а отвергнутая загрузка не должна касаться tools/ вовсе.
+        onlyIf { !home.file(script).asFile.isFile }
         doLast {
-            val v = version
             val target = home.asFile
+            val staging =
+                layout.buildDirectory
+                    .dir("openjml-staging")
+                    .get()
+                    .asFile
             val zip =
                 layout.buildDirectory
-                    .file("openjml-$v.zip")
+                    .file("openjml-$version.zip")
                     .get()
                     .asFile
             zip.parentFile.mkdirs()
-            val url = "https://github.com/OpenJML/OpenJML/releases/download/$v/openjml-$distribution-$v.zip"
+            val defaultUrl = "https://github.com/OpenJML/OpenJML/releases/download/$version/openjml-$distribution-$version.zip"
+            val url = providers.gradleProperty("openjml.url").getOrElse(defaultUrl)
             logger.lifecycle("Скачивание $url")
             uri(url).toURL().openStream().use { input -> zip.outputStream().use { input.copyTo(it) } }
-            copy {
-                from(zipTree(zip))
-                into(target)
+            // Необязательная контрольная сумма (openjml.sha256): проверяется до распаковки;
+            // несовпадение не трогает ни tools/, ни staging прошлой попытки.
+            providers.gradleProperty("openjml.sha256").orNull?.let { expected ->
+                val md = MessageDigest.getInstance("SHA-256")
+                zip.inputStream().use { input ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        md.update(buffer, 0, read)
+                    }
+                }
+                val actual = md.digest().joinToString("") { "%02x".format(it) }
+                if (!actual.equals(expected, ignoreCase = true)) {
+                    throw GradleException(
+                        "Контрольная сумма архива OpenJML не совпала: свойство $expected, файл $actual. " +
+                            "Распаковка не выполнялась, tools/ не изменён.",
+                    )
+                }
+            }
+            try {
+                staging.deleteRecursively() // мусор распаковки прерванной прошлой попытки
+                copy {
+                    from(zipTree(zip))
+                    into(staging)
+                }
+            } catch (e: Exception) {
+                staging.deleteRecursively()
+                throw GradleException(
+                    "Архив OpenJML не распаковывается — вероятно, повреждён (${e.message}). tools/ не изменён.",
+                    e,
+                )
+            }
+            if (!File(staging, script).isFile) {
+                staging.deleteRecursively()
+                throw GradleException(
+                    "В архиве OpenJML нет исполняемого файла \"$script\": распределение не соответствует ожиданиям. tools/ не изменён.",
+                )
+            }
+            // Битые остатки прошлой попытки заменяются целиком; установка на место —
+            // атомарным перемещением в пределах файловой системы проекта.
+            if (target.exists()) target.deleteRecursively()
+            target.parentFile.mkdirs() // свежий клон: каталога tools/ может ещё не быть
+            try {
+                Files.move(staging.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            } catch (e: Exception) {
+                throw GradleException(
+                    "Не удалось атомарно установить OpenJML в $target (staging остался в $staging): ${e.message}",
+                    e,
+                )
             }
             zip.delete()
         }
@@ -203,10 +280,9 @@ val openjmlProve =
         val verifiedSources = fileTree("src/verified/java") { include("**/*.java") }
         inputs.files(verifiedSources)
         inputs.property("openjmlVersion", openjmlVersion)
-        val script = if (System.getProperty("os.name").lowercase().contains("win")) "openjml.bat" else "openjml"
         val home = openjmlHome
         doFirst {
-            executable = home.file(script).asFile.absolutePath
+            executable = home.file(openjmlScript).asFile.absolutePath
             args(listOf("--esc") + verifiedSources.files.map { it.absolutePath })
         }
     }

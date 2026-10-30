@@ -8,6 +8,19 @@ jacoco = "0.8.16"
 javafx = "21.0.9"
 sqlite-jdbc = "3.54.1.0"
 flyway = "13.11.1"
+# OpenJML: версия дистрибутива формальной верификации; точка правды здесь,
+# -Popenjml.version переопределяет её (см. build.gradle.kts).
+openjml = "21.0.29"
+# Мутационная фаза: связка pitest ↔ pitest-junit5-plugin ↔ JUnit.
+# 1.2.3 — максимум pitest-junit5-plugin на Maven Central; объявленной поддержки
+# JUnit Platform 6 ещё нет (pitest/pitest-junit5-plugin#113). С 1.2.0 плагин не
+# шэдит платформу JUnit, launcher приходит из classpath проекта (JUnit 6.x),
+# связка проверена зелёным прогоном pitest. При выходе версии с поддержкой
+# Platform 6 — поднять здесь (проверив прогон pitest).
+pitest-tool = "1.30.1"
+pitest-junit5-plugin = "1.2.3"
+# SpotBugs: версия анализатора (версия gradle-плагина — в [plugins]).
+spotbugs-tool = "4.10.5"
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }

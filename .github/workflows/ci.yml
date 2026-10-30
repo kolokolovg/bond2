@@ -19,7 +19,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: tools
-          key: openjml-${{ hashFiles('gradle.properties') }}
+          key: openjml-${{ hashFiles('gradle.properties', 'gradle/libs.versions.toml') }}
       - name: Check, mutation testing, formal verification
         run: ./gradlew check pitest openjmlProve -Pheadless=true --no-daemon
       - name: Upload reports
