@@ -73,7 +73,8 @@ public final class DatabaseService {
 
   /**
    * Вызывающий перестал ждать остановку: любой запоздавший результат операции не публикуется, а
-   * полученная БД закрывается тихо. Единственный постановщик — таймаут исходной {@code
+   * полученная БД закрывается тихо; остановка в конце публикует «закрыта», если последним
+   * состоянием осталось промежуточное. Единственный постановщик — таймаут исходной {@code
    * shutdownAsync}; повторные остановки его не трогают.
    */
   private volatile boolean abandoned;
@@ -208,9 +209,12 @@ public final class DatabaseService {
       database = null;
       if (opened != null) {
         closeQuietly(opened);
-        if (!abandoned) {
-          publish(DbState.CLOSED);
-        }
+      }
+      // Самолечение: последним опубликованным состоянием остаётся «закрыта» независимо от {@code
+      // abandoned}: даже если узкое окно гонки успело опубликовать промежуточное состояние, и
+      // state(), и подписчики приходят к согласованному финалу без публикации-дубликата
+      if (!(state instanceof DbState.Closed)) {
+        publish(DbState.CLOSED);
       }
       publisher.close();
       executor.shutdown();
@@ -229,6 +233,10 @@ public final class DatabaseService {
    * успеет выполнить её до {@code runShutdown}, либо отклонена. Замок неконкурентен всю жизнь
    * процесса, кроме момента остановки; постановок из потока жизненного цикла нет, взаимоблокировки
    * не возникает.
+   *
+   * <p>Сбой операции, включая непроверяемые ошибки среды выполнения, не оставляет промежуточного
+   * состояния: публикуется «закрыта» с причиной «внутренняя ошибка» (если операция не покинута), а
+   * ошибка передаётся вызывающему — фатальные ошибки виртуальной машины не поглощаются.
    */
   private <T> CompletableFuture<T> submit(Supplier<T> work, Function<String, T> rejection) {
     var result = new CompletableFuture<T>();
@@ -242,7 +250,13 @@ public final class DatabaseService {
               try {
                 result.complete(work.get());
               } catch (RuntimeException | Error e) {
-                result.completeExceptionally(e);
+                try {
+                  if (!abandoned) {
+                    failed(OpenFailures.unexpected(e));
+                  }
+                } finally {
+                  result.completeExceptionally(e);
+                }
               }
             });
       } catch (RejectedExecutionException e) {
@@ -323,8 +337,10 @@ public final class DatabaseService {
    * Выполняет попытку и публикует её итог. Любой сбой среды выполнения превращается в «внутреннюю
    * ошибку» с публикацией «закрыта»: поток жизненного цикла не завершается. Фатальные ошибки
    * виртуальной машины пробрасываются без поглощения. Если вызывающий перестал ждать остановку
-   * ({@code abandoned}), никакой результат не публикуется — ни «нужна миграция», ни ошибка:
-   * полученная БД закрывается тихо, вызывающий получает отклонение остановленного сервиса.
+   * ({@code abandoned}), никакой результат не публикуется — ни «открыта», ни «нужна миграция», ни
+   * ошибка: полученная БД закрывается тихо, вызывающий получает отклонение остановленного сервиса.
+   * Флаг перепроверяется непосредственно перед каждой публикацией: срок остановки мог истечь, пока
+   * попытка завершалась.
    */
   private OpenResult finish(Path file, Supplier<Attempt> operation) {
     Attempt attempt;
@@ -339,29 +355,49 @@ public final class DatabaseService {
       }
       return failed(OpenFailures.unexpected(e));
     }
-    Database opened = attempt.database();
     if (abandoned) {
-      // Остановка уже не ждёт: результат не публикуется, БД закрывается тихо
-      if (opened != null) {
-        closeQuietly(opened);
-      }
-      return new OpenResult.Rejected(MESSAGE_STOPPED);
+      return lateRejected(attempt);
     }
     switch (attempt.result()) {
       case OpenResult.Opened result -> {
+        Database opened = attempt.database();
         if (opened == null) {
           throw new IllegalStateException("Открытая БД не передана");
+        }
+        if (abandoned) {
+          return lateRejected(attempt);
         }
         database = opened;
         publish(new DbState.Open(file));
         return result;
       }
-      case OpenResult.NeedsMigration result -> publish(new DbState.AwaitingMigration(file));
-      case OpenResult.Failed result ->
-          publish(new DbState.Closed(result.reason(), result.message()));
+      case OpenResult.NeedsMigration result -> {
+        if (abandoned) {
+          return lateRejected(attempt);
+        }
+        publish(new DbState.AwaitingMigration(file));
+      }
+      case OpenResult.Failed result -> {
+        if (abandoned) {
+          return lateRejected(attempt);
+        }
+        publish(new DbState.Closed(result.reason(), result.message()));
+      }
       case OpenResult.Rejected result -> throw new IllegalStateException(result.message());
     }
     return attempt.result();
+  }
+
+  /**
+   * Запоздавший итог покинутой операции: он не публикуется, полученная БД закрывается тихо,
+   * вызывающему возвращается отклонение остановленного сервиса.
+   */
+  private OpenResult lateRejected(Attempt attempt) {
+    Database opened = attempt.database();
+    if (opened != null) {
+      closeQuietly(opened);
+    }
+    return new OpenResult.Rejected(MESSAGE_STOPPED);
   }
 
   private OpenResult.Failed failed(OpenResult.Failed failure) {

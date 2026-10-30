@@ -4,16 +4,27 @@ package ru.onlychill.bonds2.ui;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static ru.onlychill.bonds2.dbservice.Eventually.holds;
+import static ru.onlychill.bonds2.ui.FxToolkit.runOnFxThread;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import javafx.application.Platform;
 import javafx.beans.property.SimpleObjectProperty;
+import javafx.scene.Group;
+import javafx.scene.Scene;
 import javafx.scene.control.Menu;
 import javafx.scene.control.MenuBar;
 import javafx.scene.control.MenuItem;
+import javafx.stage.Stage;
+import javafx.stage.Window;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
+import ru.onlychill.bonds2.settings.SettingsStore;
 
 class MainWindowAppTest {
 
@@ -30,6 +41,9 @@ class MainWindowAppTest {
   @BeforeAll
   static void startToolkit() throws InterruptedException {
     FxToolkit.start();
+    // Тесты закрывают окна: без этой строки Monocle в headless-режиме завершает тулкит,
+    // когда закрыто последнее окно, и следующие runLater не выполняются
+    Platform.setImplicitExit(false);
   }
 
   @Test
@@ -154,5 +168,73 @@ class MainWindowAppTest {
 
     assertThat(lock).isNull();
     assertThat(reports).singleElement().asString().startsWith("Не удалось запустить приложение");
+  }
+
+  @Test
+  void failedStopOnExitLeavesWindowOpenAndProcessesRepeatedExit() {
+    var stageBox = new Stage[1];
+    runOnFxThread(
+        () -> {
+          var stage = new Stage();
+          stage.setTitle("Bonds");
+          stage.setScene(new Scene(new Group()));
+          stage.show();
+          stageBox[0] = stage;
+        });
+
+    var failedOnce = new AtomicBoolean();
+    var exits = new AtomicInteger();
+    var db =
+        new DatabaseController(
+            new SettingsStore(dir.resolve("cfg/settings.properties")),
+            dir.resolve("default/bonds2.db"),
+            new DatabaseService(),
+            new FxDialogs(stageBox[0]),
+            () -> {
+              // Первый выход сбоит: моделируем отказ цепочки остановки (аудит №3)
+              if (failedOnce.compareAndSet(false, true)) {
+                throw new IllegalStateException("сбой остановки");
+              }
+              exits.incrementAndGet();
+            },
+            Platform::runLater);
+
+    var exitItem =
+        MainWindowApp.createMenuBar(
+                new MainWindowApp.MenuActions(
+                    () -> {}, () -> {}, () -> {}, () -> {}, db::requestExit),
+                db.stateProperty())
+            .getMenus()
+            .get(0)
+            .getItems()
+            .get(EXIT);
+
+    // Первый «Выход»: цепочка сбоит, процесс не завершается, окно остаётся, ошибка показана
+    runOnFxThread(exitItem::fire);
+    assertThat(holds(MainWindowAppTest::hasErrorAlert)).isTrue();
+    runOnFxThread(
+        () -> {
+          assertThat(stageBox[0].isShowing()).isTrue();
+          assertThat(exits.get()).isZero();
+        });
+
+    // Повторный «Выход» обрабатывается: цепочка запускается заново и завершает приложение
+    runOnFxThread(exitItem::fire);
+    assertThat(holds(() -> exits.get() == 1)).isTrue();
+
+    // Закрытие через close(): вызов hide() в headless-режиме подвешивает поток JavaFX
+    runOnFxThread(
+        () -> {
+          for (Window window : List.copyOf(Window.getWindows())) {
+            if (window instanceof Stage stage) {
+              stage.close();
+            }
+          }
+        });
+  }
+
+  private static boolean hasErrorAlert() {
+    return Window.getWindows().stream()
+        .anyMatch(window -> window instanceof Stage stage && "Ошибка".equals(stage.getTitle()));
   }
 }

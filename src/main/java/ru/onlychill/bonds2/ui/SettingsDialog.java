@@ -5,7 +5,9 @@ package ru.onlychill.bonds2.ui;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.Optional;
-import java.util.function.Consumer;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
+import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
@@ -29,8 +31,9 @@ import ru.onlychill.bonds2.settings.SettingsValidator;
  * Модальное окно настроек БД: путь к файлу с кнопкой «Обзор…», флажок автооткрытия, «Сохранить» и
  * «Отмена».
  *
- * <p>Проверку пути делает {@link SettingsValidator}, сохранение — переданный обработчик. Если
- * запись не удалась, окно остаётся открытым и показывает причину.
+ * <p>Проверку пути делает {@link SettingsValidator}, сохранение — переданный обработчик на фоновом
+ * потоке. Окно закрывается только после завершения записи; если запись не удалась, окно остаётся
+ * открытым и показывает причину.
  */
 final class SettingsDialog {
 
@@ -41,16 +44,20 @@ final class SettingsDialog {
   private final TextField pathField = new TextField();
   private final CheckBox autoOpenBox = new CheckBox("Открывать базу при запуске");
   private final Label errorLabel = new Label();
-  private final Consumer<Settings> saver;
+  private final Function<Settings, CompletableFuture<Void>> saver;
 
   /**
    * @param owner главное окно, над которым открывается диалог
    * @param current текущие настройки: из них заполняются поля
    * @param defaultFile путь по умолчанию: подсказка для пустого поля
-   * @param saver сохраняет настройки; при ошибке записи бросает {@link UncheckedIOException}
+   * @param saver записывает настройки в фоне и возвращает future, завершающийся после записи;
+   *     ошибка записи завершает future исключением
    */
   SettingsDialog(
-      @Nullable Window owner, Settings current, Path defaultFile, Consumer<Settings> saver) {
+      @Nullable Window owner,
+      Settings current,
+      Path defaultFile,
+      Function<Settings, CompletableFuture<Void>> saver) {
     this.saver = saver;
     this.stage = new Stage();
 
@@ -103,9 +110,20 @@ final class SettingsDialog {
     stage.showAndWait();
   }
 
+  /** Показывает окно без ожидания; используется тестами. */
+  void show() {
+    stage.show();
+  }
+
+  /** Открыто ли окно; используется тестами. */
+  boolean isShowing() {
+    return stage.isShowing();
+  }
+
   /**
-   * «Сохранить»: проверяет путь, передаёт настройки обработчику и закрывает окно. Ошибка проверки
-   * или записи показывается в окне, настройки при этом не меняются.
+   * «Сохранить»: проверяет путь и передаёт настройки обработчику; окно закрывается только после
+   * завершения записи. Ошибка проверки или записи показывается в окне, настройки при этом не
+   * меняются.
    */
   void save() {
     String text = pathField.getText();
@@ -115,13 +133,25 @@ final class SettingsDialog {
       return;
     }
     errorLabel.setText("");
+    CompletableFuture<Void> saving;
     try {
-      saver.accept(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
+      saving =
+          saver.apply(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
     } catch (UncheckedIOException e) {
       errorLabel.setText(ErrorMessages.of(e));
       return;
     }
-    stage.close();
+    // Запись идёт в фоне: закрытие и ошибка — по её завершении в потоке JavaFX
+    saving.whenComplete(
+        (value, error) ->
+            Platform.runLater(
+                () -> {
+                  if (error != null) {
+                    errorLabel.setText(ErrorMessages.of(error));
+                  } else {
+                    stage.close();
+                  }
+                }));
   }
 
   /** «Отмена» и закрытие окна: настройки не меняются. */

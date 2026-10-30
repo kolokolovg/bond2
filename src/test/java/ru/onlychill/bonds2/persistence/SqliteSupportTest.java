@@ -4,12 +4,14 @@ package ru.onlychill.bonds2.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.sqlite.SQLiteConfig;
@@ -86,6 +88,42 @@ class SqliteSupportTest {
     assertThat(SqliteSupport.maintenanceProperties().getProperty("journal_mode")).isNull();
     assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("journal_mode")).isNull();
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("journal_mode")).isNull();
+  }
+
+  @Test
+  void dataSourceOpensWorkingConnectionsToExistingFile() throws SQLException {
+    Path file = createDatabase();
+    DataSource dataSource = SqliteSupport.existingFileDataSource(file);
+
+    try (Connection c = dataSource.getConnection()) {
+      assertThat(queryLong(c, "SELECT count(*) FROM app_info")).isZero();
+    }
+    // Каждый вызов getConnection открывает новое соединение: второе тоже рабочее
+    try (Connection c = dataSource.getConnection()) {
+      assertThat(queryLong(c, "SELECT count(*) FROM app_info")).isZero();
+    }
+  }
+
+  @Test
+  void dataSourceUnwrapsOnlyItsOwnType() throws SQLException {
+    DataSource dataSource = SqliteSupport.existingFileDataSource(dir.resolve("unused.db"));
+
+    assertThat(dataSource.isWrapperFor(DataSource.class)).isTrue();
+    assertThat(dataSource.unwrap(DataSource.class)).isSameAs(dataSource);
+    assertThat(dataSource.isWrapperFor(String.class)).isFalse();
+    assertThatThrownBy(() -> dataSource.unwrap(String.class)).isInstanceOf(SQLException.class);
+  }
+
+  @Test
+  void dataSourceConnectionToMissingFileFailsWithoutCreatingIt() {
+    Path file = dir.resolve("missing.db");
+    DataSource dataSource = SqliteSupport.existingFileDataSource(file);
+
+    assertThatThrownBy(dataSource::getConnection).isInstanceOf(SQLException.class);
+
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
   }
 
   @Test

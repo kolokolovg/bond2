@@ -3,6 +3,7 @@
 package ru.onlychill.bonds2.dbservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -23,6 +24,9 @@ class StatePublisherTest {
     long initialRequest;
     boolean failOnNext;
 
+    /** Состояние, при доставке которого подписчик бросает фатальную ошибку среды. */
+    DbState fatalOnItem;
+
     Probe(long initialRequest) {
       this.initialRequest = initialRequest;
     }
@@ -39,6 +43,10 @@ class StatePublisherTest {
     @Override
     public void onNext(DbState item) {
       items.add(item);
+      if (item.equals(fatalOnItem)) {
+        // Например, не загрузилась нативная библиотека: ошибка среды, а не исключение
+        throw new UnsatisfiedLinkError("фатальный сбой подписчика");
+      }
       if (failOnNext) {
         throw new IllegalStateException("сбой подписчика");
       }
@@ -122,6 +130,29 @@ class StatePublisherTest {
 
     assertThat(bad.items).containsExactly(DbState.CLOSED);
     assertThat(good.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
+  }
+
+  @Test
+  void fatalSubscriberErrorIsNotSwallowedAndOthersKeepWorking() {
+    var publisher = new StatePublisher(DbState.CLOSED);
+    var bad = new Probe(Long.MAX_VALUE);
+    bad.fatalOnItem = OPEN;
+    var good = new Probe(Long.MAX_VALUE);
+    publisher.subscribe(bad);
+    publisher.subscribe(good);
+
+    // Ошибка среды не поглощается: передаётся вызывающему публикацию
+    assertThatThrownBy(() -> publisher.publish(OPEN)).isInstanceOf(UnsatisfiedLinkError.class);
+
+    // Подписка сбойного подписчика отменена: новые состояния ему не доставляются
+    // (сбойное состояние записано в список, но доставка завершилась ошибкой)
+    assertThat(bad.items).containsExactly(DbState.CLOSED, OPEN);
+
+    // Флаг доставки не залипает: следующая публикация доставляется, живой подписчик получает
+    // и не доставленное из-за сбоя состояние, и новое
+    publisher.publish(DbState.CLOSED);
+    assertThat(good.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
+    assertThat(bad.items).containsExactly(DbState.CLOSED, OPEN);
   }
 
   @Test

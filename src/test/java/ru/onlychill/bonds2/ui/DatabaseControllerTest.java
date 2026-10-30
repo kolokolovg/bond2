@@ -19,11 +19,20 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -123,6 +132,38 @@ class DatabaseControllerTest {
   private DatabaseController controllerWith(Path settings) {
     return new DatabaseController(
         new SettingsStore(settings), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
+  }
+
+  /** Контроллер с подменённым исполнителем записи настроек: тесты проверяют поток записи. */
+  private DatabaseController controllerWith(Path settings, Executor settingsExecutor) {
+    return new DatabaseController(
+        new SettingsStore(settings),
+        defaultFile(),
+        service,
+        dialogs,
+        exits::incrementAndGet,
+        ui,
+        settingsExecutor);
+  }
+
+  /** Однопоточный исполнитель записи настроек с именем потока, как в приложении. */
+  private static ExecutorService settingsExecutor() {
+    return Executors.newSingleThreadExecutor(
+        runnable -> {
+          var thread = new Thread(runnable, DatabaseController.SETTINGS_THREAD_NAME);
+          thread.setDaemon(true);
+          return thread;
+        });
+  }
+
+  /** Исполнитель, запоминающий поток каждой задачи перед её запуском. */
+  private static Executor recordingThreads(ExecutorService executor, List<Thread> threads) {
+    return task ->
+        executor.execute(
+            () -> {
+              threads.add(Thread.currentThread());
+              task.run();
+            });
   }
 
   private void saveSettings(Path databasePath, boolean autoOpen) {
@@ -426,6 +467,13 @@ class DatabaseControllerTest {
     ui.pumpUntil(() -> db.statusProperty().get().equals("Создание базы…"));
     storage.openGate.release();
     ui.pumpUntil(() -> isOpen(db));
+    // Путь записан в настройки в фоне: без него открытие пошло бы по пути по умолчанию
+    ui.pumpUntil(
+        () ->
+            new SettingsStore(settingsFile())
+                .load()
+                .settings()
+                .equals(new Settings(userFile(), false)));
     db.closeDatabase();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
 
@@ -470,6 +518,65 @@ class DatabaseControllerTest {
 
     assertThat(exits.get()).isEqualTo(1);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  @Test
+  void exitChainFailureShowsErrorKeepsAppAliveAndRepeatedExitStartsAgain() {
+    var failFirst = new AtomicBoolean(true);
+    var db =
+        new DatabaseController(
+            new SettingsStore(settingsFile()),
+            defaultFile(),
+            service,
+            dialogs,
+            () -> {
+              if (failFirst.compareAndSet(true, false)) {
+                throw new IllegalStateException("сбой остановки");
+              }
+              exits.incrementAndGet();
+            },
+            ui);
+
+    db.requestExit();
+    ui.settle();
+
+    // Диалог показан, приложение живо, выход не начат заново сам
+    assertThat(dialogs.errors).singleElement().asString().contains("сбой остановки");
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(exits.get()).isZero();
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
+
+    // Повторный «Выход» начинает цепочку заново: приложение завершается
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+    assertThat(dialogs.errors).hasSize(1);
+  }
+
+  @Test
+  void repeatedExitChainFailureResetsExitingAgain() {
+    var db =
+        new DatabaseController(
+            new SettingsStore(settingsFile()),
+            defaultFile(),
+            service,
+            dialogs,
+            () -> {
+              throw new IllegalStateException("сбой остановки");
+            },
+            ui);
+
+    db.requestExit();
+    ui.settle();
+    db.requestExit();
+    ui.settle();
+
+    // Второй сбой тоже восстановил флаг выхода: третий запрос снова запускает цепочку
+    assertThat(dialogs.errors).hasSize(2);
+    db.requestExit();
+    ui.settle();
+
+    assertThat(dialogs.errors).hasSize(3);
+    assertThat(exits.get()).isZero();
   }
 
   @Test
@@ -694,13 +801,14 @@ class DatabaseControllerTest {
 
     db.createDatabase(userFile());
     ui.pumpUntil(() -> isOpen(db));
-    ui.settle();
+    var expected = new Settings(userFile(), false);
+    // Путь записывается в настройки в фоне: ждём завершения записи
+    ui.pumpUntil(() -> new SettingsStore(settingsFile()).load().settings().equals(expected));
 
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
     assertThat(userFile()).isRegularFile();
-    assertThat(new SettingsStore(settingsFile()).load().settings())
-        .isEqualTo(new Settings(userFile(), false));
-    assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
+    assertThat(new SettingsStore(settingsFile()).load().settings()).isEqualTo(expected);
+    assertThat(db.settings()).isEqualTo(expected);
     assertThat(dialogs.errors).isEmpty();
   }
 
@@ -730,6 +838,62 @@ class DatabaseControllerTest {
     ui.pumpUntil(() -> !dialogs.errors.isEmpty());
 
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка создания");
+  }
+
+  // Сильная ссылка на logger контроллера: изменения уровня и хендлеров не теряются при сборке
+  // мусора
+  private static final Logger CONTROLLER_LOG = Logger.getLogger(DatabaseController.class.getName());
+
+  @Test
+  void createRejectedByStateRaceIsQuietAndLogged() {
+    newDatabaseAt(userFile());
+    var db = controller();
+    // Сервис открывает БД мимо интерфейса: сервис уже открыт, интерфейс ещё не прокачан
+    service.open(userFile(), false).join();
+
+    var capture = new LogCapture();
+    CONTROLLER_LOG.addHandler(capture);
+    CONTROLLER_LOG.setLevel(Level.FINE);
+    try {
+      db.createDatabase(dataDir().resolve("other.db"));
+      ui.settle();
+    } finally {
+      CONTROLLER_LOG.removeHandler(capture);
+      CONTROLLER_LOG.setLevel(null);
+    }
+
+    // Гонка состояния — не ошибка файла: диалога нет, отклонение зафиксировано в журнале
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(capture.messages).anySatisfy(m -> assertThat(m).contains("Создание отклонено"));
+    assertThat(dataDir().resolve("other.db")).doesNotExist();
+  }
+
+  @Test
+  void createRejectedDuringShutdownIsQuietAndStateStaysClosed() throws InterruptedException {
+    newDatabaseAt(userFile());
+    var db = controller();
+    // Открытие идёт мимо контроллера: интерфейс остаётся в состоянии «закрыта»
+    storage.openGate.hold();
+    service.open(userFile(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    service.shutdownAsync(DatabaseController.SHUTDOWN_TIMEOUT);
+
+    db.createDatabase(dataDir().resolve("other.db"));
+    ui.settle();
+
+    // Начатая остановка отклоняет создание тихо: диалогов нет, файл не создан
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dataDir().resolve("other.db")).doesNotExist();
+
+    // Остановка доходит до конца: состояние «закрыта» — пункты меню снова доступны
+    storage.openGate.release();
+    ui.pumpUntil(
+        () -> db.stateProperty().get() instanceof DbState.Closed closed && closed.reason() == null);
+    ui.settle();
+
+    assertThat(db.statusProperty().get()).isEqualTo(CLOSED_STATUS);
+    assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
@@ -850,7 +1014,9 @@ class DatabaseControllerTest {
 
     assertThat(Eventually(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
         .isTrue();
-    assertThat(db.stateProperty().get()).isInstanceOf(DbState.Opening.class);
+    // Самолечение остановки: интерфейс приходит к согласованному финалу «закрыта»,
+    // промежуточное «открывается» не публикуется и диалогов запоздавший итог не порождает
+    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
     assertThat(dialogs.errors).isEmpty();
     assertThat(dialogs.warnings).isEmpty();
   }
@@ -957,11 +1123,70 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void saveSettingsWritesOnSettingsThreadAndAppliesOnUiQueue() {
+    var executor = settingsExecutor();
+    var writeThreads = new CopyOnWriteArrayList<Thread>();
+    var db = controllerWith(settingsFile(), recordingThreads(executor, writeThreads));
+    try {
+      var saving = db.saveSettings(new Settings(userFile(), false));
+
+      // Применение — только через очередь потока интерфейса: без прокачки настройки старые
+      assertThat(db.settings()).isEqualTo(Settings.defaults());
+      ui.pumpUntil(saving::isDone);
+
+      // Запись выполнена вне потока интерфейса, на именованном потоке исполнителя
+      assertThat(saving).isCompleted();
+      assertThat(writeThreads).hasSize(1);
+      assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
+      assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
+      assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
+      assertThat(new SettingsStore(settingsFile()).load().settings())
+          .isEqualTo(new Settings(userFile(), false));
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void createdDatabasePathIsRememberedOffUiThread() {
+    saveSettings(null, false);
+    var executor = settingsExecutor();
+    var writeThreads = new CopyOnWriteArrayList<Thread>();
+    var db = controllerWith(settingsFile(), recordingThreads(executor, writeThreads));
+    try {
+      db.createDatabase(userFile());
+      ui.pumpUntil(() -> isOpen(db));
+      var expected = new Settings(userFile(), false);
+      ui.pumpUntil(() -> new SettingsStore(settingsFile()).load().settings().equals(expected));
+
+      assertThat(db.settings()).isEqualTo(expected);
+      assertThat(dialogs.warnings).isEmpty();
+      assertThat(writeThreads).hasSize(1);
+      assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
+      assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void shutdownStopsSettingsExecutor() {
+    var executor = settingsExecutor();
+    var db = controllerWith(settingsFile(), executor);
+
+    db.shutdown();
+
+    assertThat(executor.isShutdown()).isTrue();
+  }
+
+  @Test
   void saveSettingsUpdatesMemoryAndFile() {
     var db = controller();
 
-    db.saveSettings(new Settings(userFile(), false));
+    var saving = db.saveSettings(new Settings(userFile(), false));
+    ui.pumpUntil(saving::isDone);
 
+    assertThat(saving).isCompleted();
     assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
     assertThat(new SettingsStore(settingsFile()).load().settings())
         .isEqualTo(new Settings(userFile(), false));
@@ -972,10 +1197,31 @@ class DatabaseControllerTest {
     Files.writeString(dir.resolve("blocker"), "файл на месте каталога настроек");
     var db = controllerWith(dir.resolve("blocker/settings.properties"));
 
-    assertThatThrownBy(() -> db.saveSettings(new Settings(userFile(), false)))
-        .isInstanceOf(UncheckedIOException.class);
+    var saving = db.saveSettings(new Settings(userFile(), false));
+    ui.pumpUntil(saving::isDone);
 
+    assertThat(saving).isCompletedExceptionally();
+    assertThatThrownBy(saving::join)
+        .isInstanceOf(CompletionException.class)
+        .hasCauseInstanceOf(UncheckedIOException.class);
     assertThat(db.settings()).isEqualTo(Settings.defaults());
+  }
+
+  /** Сборщик записей журнала контроллера: проверка тихого отклонения создания БД. */
+  private static final class LogCapture extends Handler {
+
+    final List<String> messages = new ArrayList<>();
+
+    @Override
+    public void publish(LogRecord record) {
+      messages.add(record.getMessage());
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
   }
 
   static final class RecordingDialogs implements Dialogs {

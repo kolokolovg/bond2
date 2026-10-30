@@ -2,12 +2,15 @@
 
 package ru.onlychill.bonds2.ui;
 
-import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import javafx.beans.property.ReadOnlyObjectProperty;
@@ -55,12 +58,18 @@ final class DatabaseController {
 
   private static final System.Logger LOG = System.getLogger(DatabaseController.class.getName());
 
+  /** Имя потока, на котором выполняется запись настроек. */
+  static final String SETTINGS_THREAD_NAME = "bonds2-settings";
+
   private final SettingsStore store;
   private final Path defaultDatabaseFile;
   private final DatabaseService service;
   private final Dialogs dialogs;
   private final Runnable exit;
   private final Executor uiExecutor;
+
+  /** Фоновая запись настроек: один поток-демон, запись не задерживает поток интерфейса. */
+  private final Executor settingsExecutor;
 
   private final ReadOnlyObjectWrapper<DbState> state = new ReadOnlyObjectWrapper<>(DbState.CLOSED);
   private final ReadOnlyStringWrapper status = new ReadOnlyStringWrapper(StatusText.CLOSED);
@@ -104,12 +113,42 @@ final class DatabaseController {
       Dialogs dialogs,
       Runnable exit,
       Executor uiExecutor) {
+    this(
+        store,
+        defaultDatabaseFile,
+        service,
+        dialogs,
+        exit,
+        uiExecutor,
+        Executors.newSingleThreadExecutor(
+            runnable -> {
+              var thread = new Thread(runnable, SETTINGS_THREAD_NAME);
+              // Демон: незавершённая запись настроек не удерживает процесс при выходе
+              thread.setDaemon(true);
+              return thread;
+            }));
+  }
+
+  /**
+   * @param settingsExecutor выполняет запись настроек вне потока интерфейса; приложение использует
+   *     однопоточный исполнитель с потоком-демоном, тесты подменяют его, чтобы проверять поток
+   *     записи
+   */
+  DatabaseController(
+      SettingsStore store,
+      Path defaultDatabaseFile,
+      DatabaseService service,
+      Dialogs dialogs,
+      Runnable exit,
+      Executor uiExecutor,
+      Executor settingsExecutor) {
     this.store = store;
     this.defaultDatabaseFile = defaultDatabaseFile;
     this.service = service;
     this.dialogs = dialogs;
     this.exit = exit;
     this.uiExecutor = uiExecutor;
+    this.settingsExecutor = settingsExecutor;
     SettingsStore.LoadResult loaded = store.load();
     this.settings = loaded.settings();
     this.recovered = loaded.recovered();
@@ -179,12 +218,29 @@ final class DatabaseController {
   }
 
   /**
-   * Сохраняет настройки и запоминает их. При ошибке записи бросает {@link UncheckedIOException},
-   * прежние настройки остаются в силе.
+   * Записывает настройки на фоновом исполнителе и применяет их по завершении в потоке JavaFX.
+   * Ошибка записи завершает future исключением, прежние настройки остаются в силе.
+   *
+   * @return завершается после записи и применения настроек; вызывающая сторона (окно настроек)
+   *     закрывается по его завершении
    */
-  void saveSettings(Settings updated) {
-    store.save(updated);
-    settings = updated;
+  CompletableFuture<Void> saveSettings(Settings updated) {
+    var saved = new CompletableFuture<Void>();
+    try {
+      settingsExecutor.execute(
+          () -> {
+            try {
+              store.save(updated);
+              saved.complete(null);
+            } catch (RuntimeException e) {
+              saved.completeExceptionally(e);
+            }
+          });
+    } catch (RejectedExecutionException e) {
+      saved.completeExceptionally(e);
+    }
+    // Применение настроек — только после записи и в потоке JavaFX
+    return saved.thenRunAsync(() -> settings = updated, uiExecutor);
   }
 
   /**
@@ -192,7 +248,8 @@ final class DatabaseController {
    * повторный запрос игнорируется. Ожидаемая миграция считается отклонённой, её диалог закрывается.
    * Если результат «нужна миграция» приходит после запроса, диалог не показывается. Остановка
    * сервиса идёт в фоне (открытие и создание ждут не дольше {@link #SHUTDOWN_TIMEOUT}), приложение
-   * завершается по её итогу.
+   * завершается по её итогу. Сбой цепочки оставляет приложение работать: повторный «Выход» начинает
+   * цепочку заново.
    */
   void requestExit() {
     DbState current = state.get();
@@ -222,16 +279,38 @@ final class DatabaseController {
     deliverExitResult(stopping);
   }
 
-  /** Передаёт итог остановки в поток JavaFX; сбой попадает в журнал. */
+  /**
+   * Передаёт итог остановки в поток JavaFX. Сбой цепочки выхода — сама остановка или её обработка —
+   * восстанавливает интерфейс: флаг выхода сброшен, ошибка показана, приложение продолжает работу.
+   */
   @SuppressWarnings("FutureReturnValueIgnored")
   private void deliverExitResult(CompletableFuture<ShutdownResult> stopping) {
     stopping
         .thenAcceptAsync(this::onExitResult, uiExecutor)
-        .exceptionally(
+        .exceptionallyAsync(
             error -> {
-              LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД", error);
+              onExitFailure(error);
               return null;
-            });
+            },
+            uiExecutor);
+  }
+
+  /**
+   * Сбой цепочки выхода в потоке JavaFX: приложение остаётся живым, повторный «Выход» начинает
+   * цепочку заново.
+   */
+  private void onExitFailure(Throwable error) {
+    exiting = false;
+    LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД", error);
+    dialogs.error(ErrorMessages.of(failureOf(error)));
+  }
+
+  /** Первый значимый сбой: обёртка {@link CompletionException} снята до причины. */
+  private static Throwable failureOf(Throwable error) {
+    if (error instanceof CompletionException completion && completion.getCause() != null) {
+      return completion.getCause();
+    }
+    return error;
   }
 
   /**
@@ -266,6 +345,7 @@ final class DatabaseController {
    */
   void shutdown() {
     if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
+      stopSettingsWriting();
       return;
     }
     cancelMigrationDialog();
@@ -285,6 +365,14 @@ final class DatabaseController {
         .thenCompose(ignored -> service.shutdownAsync(MIGRATION_TIMEOUT))
         .join();
     stopped = true;
+    stopSettingsWriting();
+  }
+
+  /** Останавливает фоновую запись настроек; незавершённая запись доходит до конца на демоне. */
+  private void stopSettingsWriting() {
+    if (settingsExecutor instanceof ExecutorService executorService) {
+      executorService.shutdown();
+    }
   }
 
   /** Синхронная остановка сервиса; поздние результаты игнорируются, если отказа не было. */
@@ -318,8 +406,24 @@ final class DatabaseController {
     } else if (result instanceof OpenResult.Failed failure) {
       dialogs.error(failure.message());
     } else if (result instanceof OpenResult.Rejected rejected) {
-      dialogs.error(rejected.message());
+      if (isStateOrStoppingRejection(rejected.message())) {
+        // Гонка состояния или начатая остановка — не ошибка файла: тихо, как при открытии
+        LOG.log(System.Logger.Level.DEBUG, "Создание отклонено: " + rejected.message());
+      } else {
+        // Отказ из-за существующего файла: пользователь выбирает другое имя
+        dialogs.error(rejected.message());
+      }
     }
+  }
+
+  /**
+   * Отклонение создания из-за изменившегося состояния или начатой остановки: показывается тихо, без
+   * диалога. Прочие отклонения (например, файл уже существует) пользователь должен увидеть. Тексты
+   * отказов по состоянию и остановке заданы в {@code DatabaseService}.
+   */
+  private static boolean isStateOrStoppingRejection(String message) {
+    return message.contains("недопустима в текущем состоянии")
+        || message.contains("Сервис БД остановлен");
   }
 
   private void onCloseResult(CloseResult result) {
@@ -333,14 +437,18 @@ final class DatabaseController {
     }
   }
 
-  /** Записывает путь новой БД в настройки; при ошибке записи БД остаётся открытой. */
+  /** Записывает путь новой БД в настройки в фоне; при ошибке записи БД остаётся открытой. */
+  @SuppressWarnings("FutureReturnValueIgnored")
   private void rememberDatabasePath(Path file) {
-    try {
-      saveSettings(new Settings(file, settings.autoOpen()));
-    } catch (UncheckedIOException e) {
-      dialogs.warn(
-          "База создана и открыта, но путь не записан в настройки. " + ErrorMessages.of(e));
-    }
+    saveSettings(new Settings(file, settings.autoOpen()))
+        .exceptionallyAsync(
+            error -> {
+              dialogs.warn(
+                  "База создана и открыта, но путь не записан в настройки. "
+                      + ErrorMessages.of(failureOf(error)));
+              return null;
+            },
+            uiExecutor);
   }
 
   /**

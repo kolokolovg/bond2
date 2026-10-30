@@ -97,7 +97,7 @@ public final class Database implements AutoCloseable {
     createEmptyFile(absolute);
     String url = SqliteSupport.url(absolute);
     try {
-      SchemaInspector.flyway(url, locations).migrate();
+      SchemaInspector.flywayCreating(url, locations).migrate();
     } catch (RuntimeException e) {
       // Файл создан этим вызовом, поэтому удаляем его: повторная попытка должна быть возможна
       SqliteSupport.deleteWithSidecarsQuietly(absolute, e);
@@ -178,7 +178,7 @@ public final class Database implements AutoCloseable {
     }
     String url = SqliteSupport.url(absolute);
     try {
-      SchemaInspector.flyway(url, locations).migrate();
+      SchemaInspector.flywayExisting(absolute, locations).migrate();
     } catch (RuntimeException e) {
       // Файл существовал до вызова, поэтому его не удаляем, а возвращаем к пустому состоянию
       BackupManager.resetToEmpty(absolute, e);
@@ -199,7 +199,9 @@ public final class Database implements AutoCloseable {
    * @throws PersistenceException если миграция не нужна, схема новее приложения, файл пуст или не
    *     является БД приложения; файл не изменён
    * @throws MigrationException если копию создать или проверить не удалось (миграция не выполнена,
-   *     копия удаляется) либо миграция завершилась ошибкой (файл восстановлен из копии)
+   *     копия удаляется), миграция завершилась ошибкой (файл восстановлен из копии) либо основной
+   *     файл удалён до применения миграций (откат не запускается, копия сохраняется для ручного
+   *     восстановления)
    */
   public static Path migrateWithBackup(Path file) {
     // Имя копии использует локальное время пользователя: часовой пояс указан явно

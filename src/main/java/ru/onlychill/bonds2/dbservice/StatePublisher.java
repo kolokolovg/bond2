@@ -120,7 +120,12 @@ final class StatePublisher implements Flow.Publisher<DbState> {
       remove(this);
     }
 
-    /** Доставляет накопленное по одному подписчику строго последовательно. */
+    /**
+     * Доставляет накопленное по одному подписчику строго последовательно. Сбой подписчика ({@code
+     * RuntimeException}) отменяет его подписку и не прекращает публикацию; ошибка среды ({@code
+     * Error}) тоже отменяет подписку, но передаётся вызывающему — фатальные ошибки не поглощаются.
+     * Флаг доставки сбрасывается в любом случае, поэтому публикация не «залипает».
+     */
     void drain() {
       synchronized (this) {
         if (draining) {
@@ -128,32 +133,39 @@ final class StatePublisher implements Flow.Publisher<DbState> {
         }
         draining = true;
       }
-      while (true) {
-        DbState item;
-        synchronized (this) {
-          if (cancelled || completed) {
-            draining = false;
-            return;
+      try {
+        while (true) {
+          DbState item;
+          synchronized (this) {
+            if (cancelled || completed) {
+              return;
+            }
+            if (demand > 0 && !queue.isEmpty()) {
+              item = queue.remove();
+              demand--;
+            } else if (completing && queue.isEmpty()) {
+              completed = true;
+              item = null;
+            } else {
+              return;
+            }
           }
-          if (demand > 0 && !queue.isEmpty()) {
-            item = queue.remove();
-            demand--;
-          } else if (completing && queue.isEmpty()) {
-            completed = true;
-            item = null;
-          } else {
-            draining = false;
-            return;
+          try {
+            if (item == null) {
+              subscriber.onComplete();
+            } else {
+              subscriber.onNext(item);
+            }
+          } catch (RuntimeException e) {
+            cancel();
+          } catch (Error e) {
+            cancel();
+            throw e;
           }
         }
-        try {
-          if (item == null) {
-            subscriber.onComplete();
-          } else {
-            subscriber.onNext(item);
-          }
-        } catch (RuntimeException e) {
-          cancel();
+      } finally {
+        synchronized (this) {
+          draining = false;
         }
       }
     }

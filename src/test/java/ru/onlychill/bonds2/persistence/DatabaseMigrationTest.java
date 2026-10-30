@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -139,6 +140,61 @@ class DatabaseMigrationTest {
     // Пустой файл не появляется ни на месте БД, ни на месте копии
     assertThat(file).doesNotExist();
     assertThat(backupsOf(file)).isEmpty();
+  }
+
+  @Test
+  void historyReadOfRemovedFileFailsWithoutCreatingIt() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
+    // История миграций читается отдельным соединением Flyway. Файл удалён после чтения схемы,
+    // поэтому чтение истории обязано дать ошибку, а не создать пустую базу «нужна миграция»
+    Files.delete(file);
+
+    assertThatThrownBy(() -> Database.inspect(file, NEW_OK))
+        .isInstanceOf(PersistenceException.class);
+    // Гарантия уровня соединения: чтение истории по отсутствующему файлу не создаёт файл
+    assertThatThrownBy(() -> SchemaInspector.flywayExisting(file, NEW_OK).info())
+        .isInstanceOf(FlywayException.class);
+
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
+  }
+
+  @Test
+  void migrationOfRemovedFileFailsWithoutCreatingEmptyFile() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Окно: файл удалён после проверки резервной копии, до применения миграций. Соединение Flyway
+    // «только существующий файл» не создаёт пустой файл на месте удалённого
+    Files.delete(file);
+
+    assertThatThrownBy(() -> SchemaInspector.flywayExisting(file, NEW_OK).migrate())
+        .isInstanceOf(FlywayException.class);
+
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
+  }
+
+  @Test
+  void restoreIsNotStartedForRemovedFileAndBackupPathIsReported() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "current");
+    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
+    // Окно из спеки: файл удалён после успешной проверки копии, до применения миграций. Шов —
+    // реакция на неудачную миграцию: основной файл к этому моменту отсутствует
+    Files.delete(file);
+
+    var cause = new IllegalStateException("миграция");
+    MigrationException failure = BackupManager.migrationFailure(file, backup, cause);
+
+    assertThat(failure)
+        .hasMessageContaining("Файл БД не найден, миграция не выполнена")
+        .hasMessageContaining(BACKUP_NAME);
+    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(NoSuchFileException.class);
+    // Откат не запускался: на месте БД ничего не появилось, копия осталась с данными
+    assertThat(file).doesNotExist();
+    assertThat(valueOf(backup, OLD)).isEqualTo("saved");
+    assertThat(namesInDir()).containsExactly(BACKUP_NAME);
   }
 
   @Test

@@ -3,7 +3,7 @@
 package ru.onlychill.bonds2.settings;
 
 import java.io.IOException;
-import java.io.Reader;
+import java.io.PushbackReader;
 import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -54,6 +54,9 @@ public final class SettingsStore {
 
   private static final DateTimeFormatter BAD_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
+  /** Метка порядка байтов UTF-8, с которой Windows-редакторы сохраняют текстовые файлы. */
+  private static final char UTF8_BOM = '\uFEFF';
+
   /** Префикс и суффикс временного файла записи: {@code settings-<случайное>.tmp}. */
   private static final String TEMP_PREFIX = "settings-";
 
@@ -85,12 +88,14 @@ public final class SettingsStore {
   /**
    * Читает настройки из файла.
    *
-   * <p>Сначала удаляются временные файлы записи, оставшиеся от прерванного сохранения. Испорченный
-   * файл (нечитаем, битая Unicode-последовательность, относительный или некорректный путь, флаг не
-   * {@code true}/{@code false}) копируется в {@code settings.properties.bad-<yyyyMMdd-HHmmss>} и
-   * заменяется значениями по умолчанию. Файл нулевой длины тоже считается испорченным, но копия для
-   * него не создаётся: в нём нет данных, которые стоило бы сохранить. Отсутствие файла и отдельных
-   * ключей повреждением не считается. Сбой копирования или записи пишется в лог.
+   * <p>Сначала удаляются временные файлы записи, оставшиеся от прерванного сохранения. Ведущая
+   * метка порядка байтов (U+FEFF), которой Windows-редакторы помечают текстовые файлы, срезается и
+   * повреждением не считается. Испорченный файл (нечитаем, битая Unicode-последовательность,
+   * относительный или некорректный путь, флаг не {@code true}/{@code false}) копируется в {@code
+   * settings.properties.bad-<yyyyMMdd-HHmmss>} и заменяется значениями по умолчанию. Файл нулевой
+   * длины тоже считается испорченным, но копия для него не создаётся: в нём нет данных, которые
+   * стоило бы сохранить. Отсутствие файла и отдельных ключей повреждением не считается. Сбой
+   * копирования или записи пишется в лог.
    *
    * @return настройки из файла либо {@link Settings#defaults()} с признаком сброса и путём к копии
    */
@@ -103,7 +108,12 @@ public final class SettingsStore {
       return resetEmpty();
     }
     var props = new Properties();
-    try (Reader in = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+    try (var in = new PushbackReader(Files.newBufferedReader(file, StandardCharsets.UTF_8))) {
+      // Срезается только ведущая метка: у первого символа файла
+      int first = in.read();
+      if (first != -1 && first != UTF8_BOM) {
+        in.unread(first);
+      }
       props.load(in);
     } catch (IOException | IllegalArgumentException e) {
       // IllegalArgumentException: некорректная Unicode-escape-последовательность в файле

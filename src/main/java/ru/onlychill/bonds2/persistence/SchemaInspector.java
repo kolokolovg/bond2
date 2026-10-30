@@ -19,7 +19,8 @@ import ru.onlychill.bonds2.persistence.Database.State;
 /**
  * Определение состояния файла БД относительно миграций приложения. Файл не меняется: проверка
  * читает {@code sqlite_master}, заголовок SQLite и историю миграций Flyway. Здесь же настраивается
- * Flyway.
+ * Flyway: для существующего файла соединения не имеют права создать файл, для {@code
+ * Database.create} — имеют.
  */
 final class SchemaInspector {
 
@@ -28,8 +29,25 @@ final class SchemaInspector {
 
   private SchemaInspector() {}
 
-  /** Flyway для БД по адресу {@code url} и набору миграций {@code locations}. */
-  static Flyway flyway(String url, String... locations) {
+  /**
+   * Flyway для существующего файла БД: соединения открываются через DataSource «только существующий
+   * файл», поэтому удалённый к моменту открытия файл даёт ошибку, а пустой файл на его месте не
+   * появляется. Используется при чтении схемы, применении миграций и инициализации.
+   */
+  static Flyway flywayExisting(Path file, String... locations) {
+    return Flyway.configure()
+        .dataSource(SqliteSupport.existingFileDataSource(file))
+        .locations(locations)
+        // Неприменённые и более новые миграции не ошибка валидации: их состояние определяет inspect
+        .ignoreMigrationPatterns("*:pending", "*:future")
+        .load();
+  }
+
+  /**
+   * Flyway по JDBC-адресу: соединения имеют право создать файл, если его нет. Только для {@link
+   * Database#create(Path)}, где создание файла БД — само назначение операции.
+   */
+  static Flyway flywayCreating(String url, String... locations) {
     return Flyway.configure()
         .dataSource(url, null, null)
         .locations(locations)
@@ -54,7 +72,7 @@ final class SchemaInspector {
     if (!contents.hasHistory()) {
       return contents.blank() ? State.EMPTY : State.FOREIGN;
     }
-    Flyway flyway = flyway(SqliteSupport.url(absolute), locations);
+    Flyway flyway = flywayExisting(absolute, locations);
     try {
       MigrationInfo[] migrations = flyway.info().all();
       if (Arrays.stream(migrations).anyMatch(SchemaInspector::isNewer)) {

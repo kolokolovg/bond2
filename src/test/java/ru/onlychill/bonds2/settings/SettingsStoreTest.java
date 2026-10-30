@@ -107,6 +107,69 @@ class SettingsStoreTest {
   }
 
   @Test
+  void fileWithBomAndValidKeysIsReadWithoutRecovery() throws IOException {
+    // BOM добавляют Windows-редакторы: PowerShell 5.1, старый Блокнот
+    Path db = dir.resolve("Документы/база.db");
+    writeSettingsFile("\uFEFFdatabase.path=" + db + "\ndatabase.autoOpen=false\n");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(result.settings()).isEqualTo(new Settings(db, false));
+    assertThat(result.recovered()).isFalse();
+    assertThat(result.badCopy()).isNull();
+    // Файл пользователя остался как был: сброс к значениям по умолчанию не выполнялся
+    assertThat(Files.readString(settingsFile(), StandardCharsets.UTF_8)).startsWith("\uFEFF");
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+  }
+
+  @Test
+  void fileWithBomAndGarbageIsStillCorrupted() throws IOException {
+    String content = "\uFEFFdatabase.autoOpen=maybe\n";
+    writeSettingsFile(content);
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(result.settings()).isEqualTo(Settings.defaults());
+    assertThat(result.recovered()).isTrue();
+    Path backup = dir.resolve("bonds2/settings.properties.bad-20260102-030405");
+    assertThat(result.badCopy()).isEqualTo(backup);
+    assertThat(Files.readString(backup, StandardCharsets.UTF_8)).isEqualTo(content);
+  }
+
+  @Test
+  void fileWithoutBomIsReadAsBefore() throws IOException {
+    var custom = new Settings(dir.resolve("база.db"), true);
+    writeSettingsFile("database.path=" + custom.databasePath() + "\ndatabase.autoOpen=true\n");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(result).isEqualTo(new SettingsStore.LoadResult(custom, null, false));
+  }
+
+  @Test
+  void bomNotInFirstPositionIsNotStripped() throws IOException {
+    // Метка стоит не первым символом файла, поэтому не срезается: ключ остаётся нераспознанным
+    writeSettingsFile("# комментарий\n\uFEFFdatabase.autoOpen=false\n");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(result).isEqualTo(new SettingsStore.LoadResult(Settings.defaults(), null, false));
+    assertThat(Files.readString(settingsFile(), StandardCharsets.UTF_8)).contains("\uFEFF");
+  }
+
+  @Test
+  void bomOnlyFileIsReadAsEmptyAndNotCorruption() throws IOException {
+    writeSettingsFile("\uFEFF");
+
+    var result = storeAt(FIXED).load();
+
+    // После среза метки остаётся пустое содержимое: повреждением это не считается
+    assertThat(result).isEqualTo(new SettingsStore.LoadResult(Settings.defaults(), null, false));
+    assertThat(Files.readString(settingsFile(), StandardCharsets.UTF_8)).isEqualTo("\uFEFF");
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+  }
+
+  @Test
   void unreadableFileGivesDefaults() throws IOException {
     // Каталог на месте файла: прочитать его как файл нельзя
     Files.createDirectories(settingsFile());

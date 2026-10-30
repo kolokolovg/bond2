@@ -23,6 +23,7 @@ import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -383,6 +384,9 @@ class DatabaseServiceTest {
     assertThatThrownBy(() -> future.get(30, TimeUnit.SECONDS))
         .isInstanceOf(ExecutionException.class)
         .hasCauseInstanceOf(OutOfMemoryError.class);
+    // Фатальная ошибка передана вызывающему, промежуточное состояние не осталось
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+    assertThat(((DbState.Closed) service.state()).reason()).isEqualTo("внутренняя ошибка");
   }
 
   @Test
@@ -420,6 +424,57 @@ class DatabaseServiceTest {
     assertThatThrownBy(() -> future.get(30, TimeUnit.SECONDS))
         .isInstanceOf(ExecutionException.class)
         .hasCauseInstanceOf(OutOfMemoryError.class);
+  }
+
+  @Test
+  void subscriberErrorDoesNotLeaveIntermediateStateAndServiceKeepsWorking() {
+    newDatabaseAt(file());
+    var states = record();
+    // Сбойный подписчик бросает ошибку среды при доставке промежуточного состояния:
+    // первое delivery — текущее состояние, второе — «открывается»
+    var delivered = new AtomicInteger();
+    service
+        .states()
+        .subscribe(
+            new Flow.Subscriber<>() {
+              @Override
+              public void onSubscribe(Flow.Subscription subscription) {
+                subscription.request(Long.MAX_VALUE);
+              }
+
+              @Override
+              public void onNext(DbState item) {
+                if (delivered.incrementAndGet() > 1) {
+                  throw new UnsatisfiedLinkError("сбой подписчика");
+                }
+              }
+
+              @Override
+              public void onError(Throwable error) {}
+
+              @Override
+              public void onComplete() {}
+            });
+
+    var open = service.open(file(), false);
+
+    assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCauseInstanceOf(UnsatisfiedLinkError.class);
+
+    // Промежуточное состояние не осталось: опубликовано «закрыта» с причиной «внутренняя ошибка»
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+    var closed = (DbState.Closed) service.state();
+    assertThat(closed.reason()).isEqualTo("внутренняя ошибка");
+    assertThat(closed.message()).contains("сбой подписчика");
+    assertThat(states)
+        .containsExactly(
+            DbState.CLOSED,
+            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Closed(closed.reason(), closed.message()));
+
+    // Сервис продолжает принимать операции
+    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
   }
 
   @Test
@@ -633,12 +688,62 @@ class DatabaseServiceTest {
     storage.openGate.release();
 
     assertThat(Eventually.holds(open::isDone)).isTrue();
+    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
     assertThat(
             Eventually.holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
         .isTrue();
+    // Результат операции не публикуется, но остановка завершается согласованно: «закрыта»
+    assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
+    assertThat(states)
+        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
+  void resultCompletingAtShutdownTimeoutIsNotPublishedAndStateHealsToClosed()
+      throws InterruptedException {
+    // Сценарий «Результат операции совпал с истечением срока»: детерминированный интерливинг —
+    // операция удержана воротами, остановка с минимальным сроком истекает, затем операция
+    // отпускается
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var states = record();
+
+    assertThat(get(service.shutdownAsync(Duration.ofMillis(50))))
+        .isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+
+    // Результат запоздавшей операции не публикуется: вызывающему возвращается отклонение
     assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
-    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
-    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+    // Полученная БД закрывается тихо
+    assertThat(
+            Eventually.holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
+        .isTrue();
+    // Самолечение остановки: итоговое состояние — «закрыта», и у подписчиков тоже
+    assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
+    assertThat(states)
+        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+  }
+
+  @Test
+  void shutdownDoesNotDuplicateClosedStateWhenItIsAlreadyClosed() {
+    var states = record();
+    // Открытие отсутствующего файла публикует «закрыта» с причиной: последнее состояние закрыто
+    var failure = (OpenResult.Failed) get(service.open(file(), false));
+    assertThat(service.state()).isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
+
+    assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+
+    // Самолечение не добавляет дубликат «закрыта»: подписчики видят ровно то, что опубликовано
+    assertThat(states)
+        .containsExactly(
+            DbState.CLOSED,
+            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Closed(failure.reason(), failure.message()));
   }
 
   @Test
@@ -748,9 +853,13 @@ class DatabaseServiceTest {
 
     assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
     // «Ожидает решения о миграции» не публикуется, БД не открывается
-    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
-    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
     assertThat(storage.opened).isEmpty();
+    // Состояния согласованы после остановки: самолечение публикует «закрыта»
+    assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
+    assertThat(states)
+        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
   }
 
   @Test
@@ -768,9 +877,13 @@ class DatabaseServiceTest {
 
     assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
     // Состояние по ошибке не публикуется, БД не открывается
-    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
-    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
     assertThat(storage.opened).isEmpty();
+    // Состояния согласованы после остановки: самолечение публикует «закрыта»
+    assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
+    assertThat(states)
+        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
   }
 
   @Test
@@ -787,9 +900,12 @@ class DatabaseServiceTest {
     storage.openGate.release();
 
     assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
-    // Состояние «внутренняя ошибка» не публикуется: сервис уже остановлен
-    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
-    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+    // Состояние «внутренняя ошибка» от операции не публикуется: сервис уже остановлен
+    assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
+    assertThat(states)
+        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
   }
 
   @Test

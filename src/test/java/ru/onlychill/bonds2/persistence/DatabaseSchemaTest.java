@@ -14,12 +14,15 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.exec;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.executeSql;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
+import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Duration;
+import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -258,6 +261,24 @@ class DatabaseSchemaTest {
   }
 
   @Test
+  void inspectOfRemovedApplicationDatabaseFailsWithoutCreatingIt() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
+    // Файл удалён после проверки его наличия и чтения схемы: повторное распознавание даёт
+    // ошибку, файл по этому пути не появляется
+    Files.delete(file);
+
+    assertThatThrownBy(() -> Database.inspect(file, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("не найден");
+
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
+    assertThat(dirContent()).isEmpty();
+  }
+
+  @Test
   void inspectRejectsFileThatIsNotDatabaseAndDoesNotChangeIt() throws Exception {
     Path file = dir.resolve("bad.db");
     Files.writeString(file, "not a sqlite database, just garbage text content here");
@@ -415,6 +436,31 @@ class DatabaseSchemaTest {
 
     assertThatThrownBy(() -> Database.initialize(file)).isInstanceOf(PersistenceException.class);
     assertThat(file).doesNotExist();
+  }
+
+  @Test
+  void initializeOfEmptyFileRemovedAfterRecognitionFailsWithoutCreatingIt() throws Exception {
+    Path file = Files.createFile(dir.resolve("empty.db"));
+    assertThat(Database.inspect(file)).isEqualTo(Database.State.EMPTY);
+    // Файл удалён после распознавания его состояния, до инициализации схемы: инициализация
+    // завершается ошибкой и не создаёт новый файл по этому пути
+    Files.delete(file);
+
+    assertThatThrownBy(() -> Database.initialize(file, TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("не найден");
+
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
+    assertThat(dirContent()).isEmpty();
+  }
+
+  /** Имена всех записей temp-каталога теста: после сбоев каталог должен остаться пустым. */
+  private List<String> dirContent() throws IOException {
+    try (Stream<Path> files = Files.list(dir)) {
+      return files.map(p -> String.valueOf(p.getFileName())).toList();
+    }
   }
 
   /** Число успешно применённых миграций по истории Flyway. */

@@ -43,8 +43,10 @@ final class BackupManager {
   /**
    * Миграция существующей БД с резервной копией; см. {@link Database#migrateWithBackup(Path)}.
    * Копия создаётся рядом командой {@code VACUUM INTO} и проверяется {@code PRAGMA
-   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией. После
-   * любой попытки миграции, успешной или неудачной, копии ограничиваются лимитом.
+   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией; если к
+   * этому моменту основной файл удалён, откат не запускается — ошибка несёт путь к копии для
+   * ручного восстановления. После любой попытки миграции, успешной или неудачной, копии
+   * ограничиваются лимитом.
    *
    * @param absolute абсолютный путь к файлу БД
    * @return путь к резервной копии
@@ -57,9 +59,9 @@ final class BackupManager {
     Path backup = createBackup(absolute, clock);
     verifyBackup(backup);
     try {
-      SchemaInspector.flyway(SqliteSupport.url(absolute), locations).migrate();
+      SchemaInspector.flywayExisting(absolute, locations).migrate();
     } catch (RuntimeException e) {
-      throw restore(absolute, backup, e);
+      throw migrationFailure(absolute, backup, e);
     } finally {
       // Лимит копий действует после любой попытки, в том числе неудачной; новая копия остаётся
       pruneBackups(absolute, backup);
@@ -201,6 +203,24 @@ final class BackupManager {
   /** Каталог файла БД: абсолютный путь к файлу БД всегда содержит родительский каталог. */
   private static Path directoryOf(Path file) {
     return Objects.requireNonNull(file.toAbsolutePath().getParent(), "каталог файла БД");
+  }
+
+  /**
+   * Реакция на неудачную миграцию. Если основного файла больше нет, откат не запускается:
+   * восстанавливать нечего, перенос WAL по отсутствующему файлу всё равно завершается ошибкой, а
+   * замена файла вернула бы на его место копию вместо отсутствующей БД; ошибка несёт путь к
+   * сохранённой копии для ручного восстановления. Иначе файл возвращается к состоянию копии.
+   * Пакетный доступ нужен тестам.
+   */
+  static MigrationException migrationFailure(Path file, Path backup, RuntimeException cause) {
+    if (Files.notExists(file)) {
+      cause.addSuppressed(new NoSuchFileException(file.toString()));
+      return new MigrationException(
+          "Файл БД не найден, миграция не выполнена. Восстановите файл вручную из резервной копии: "
+              + backup,
+          cause);
+    }
+    return restore(file, backup, cause);
   }
 
   /**
