@@ -2,6 +2,9 @@
 
 package ru.onlychill.bonds2.dbservice;
 
+import static ru.onlychill.bonds2.dbservice.RejectionCause.STATE;
+import static ru.onlychill.bonds2.dbservice.RejectionCause.STOPPED;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -13,7 +16,7 @@ import java.util.concurrent.Flow;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 import java.util.function.Supplier;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.persistence.Database;
@@ -247,22 +250,24 @@ public final class DatabaseService {
   }
 
   /**
-   * Ставит работу в очередь потока жизненного цикла; после остановки отклоняет. Проверка {@code
-   * stopping} и постановка выполняются под общим с {@code shutdownAsync} замком, поэтому атомарны
-   * относительно начала остановки: задача либо встала в очередь раньше остановки и исполнитель FIFO
-   * успеет выполнить её до {@code runShutdown}, либо отклонена. Замок неконкурентен всю жизнь
-   * процесса, кроме момента остановки; постановок из потока жизненного цикла нет, взаимоблокировки
-   * не возникает.
+   * Ставит работу в очередь потока жизненного цикла; после остановки отклоняет. При отклонении
+   * {@code rejection} получает типизированную причину {@link RejectionCause#STOPPED} и текст для
+   * пользователя. Проверка {@code stopping} и постановка выполняются под общим с {@code
+   * shutdownAsync} замком, поэтому атомарны относительно начала остановки: задача либо встала в
+   * очередь раньше остановки и исполнитель FIFO успеет выполнить её до {@code runShutdown}, либо
+   * отклонена. Замок неконкурентен всю жизнь процесса, кроме момента остановки; постановок из
+   * потока жизненного цикла нет, взаимоблокировки не возникает.
    *
    * <p>Сбой операции, включая непроверяемые ошибки среды выполнения, не оставляет промежуточного
    * состояния: публикуется «закрыта» с причиной «внутренняя ошибка» (если операция не покинута), а
    * ошибка передаётся вызывающему — фатальные ошибки виртуальной машины не поглощаются.
    */
-  private <T> CompletableFuture<T> submit(Supplier<T> work, Function<String, T> rejection) {
+  private <T> CompletableFuture<T> submit(
+      Supplier<T> work, BiFunction<RejectionCause, String, T> rejection) {
     var result = new CompletableFuture<T>();
     synchronized (shutdownLock) {
       if (stopping) {
-        return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
+        return CompletableFuture.completedFuture(rejection.apply(STOPPED, MESSAGE_STOPPED));
       }
       try {
         executor.execute(
@@ -280,7 +285,7 @@ public final class DatabaseService {
               }
             });
       } catch (RejectedExecutionException e) {
-        return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
+        return CompletableFuture.completedFuture(rejection.apply(STOPPED, MESSAGE_STOPPED));
       }
     }
     return result;
@@ -293,7 +298,7 @@ public final class DatabaseService {
 
   private OpenResult doOpen(Path file, boolean createIfMissing) {
     if (!(state instanceof DbState.Closed)) {
-      return new OpenResult.Rejected(OpenFailures.notAllowed("открыть"));
+      return new OpenResult.Rejected(STATE, OpenFailures.notAllowed("открыть"));
     }
     publish(new DbState.Opening(DbState.Kind.OPEN, file));
     return finish(file, () -> attempt(file, createIfMissing));
@@ -301,7 +306,7 @@ public final class DatabaseService {
 
   private OpenResult doCreate(Path file) {
     if (!(state instanceof DbState.Closed)) {
-      return new OpenResult.Rejected(OpenFailures.notAllowed("создать"));
+      return new OpenResult.Rejected(STATE, OpenFailures.notAllowed("создать"));
     }
     if (Files.exists(file)) {
       return OpenFailures.fileExists(file);
@@ -312,7 +317,7 @@ public final class DatabaseService {
 
   private OpenResult doMigrate() {
     if (!(state instanceof DbState.AwaitingMigration awaiting)) {
-      return new OpenResult.Rejected(OpenFailures.notAllowed("мигрировать"));
+      return new OpenResult.Rejected(STATE, OpenFailures.notAllowed("мигрировать"));
     }
     Path file = awaiting.file();
     publish(new DbState.Migrating(file));
@@ -321,7 +326,7 @@ public final class DatabaseService {
 
   private CloseResult doDecline() {
     if (!(state instanceof DbState.AwaitingMigration)) {
-      return new CloseResult.Rejected(OpenFailures.notAllowed("отказаться от миграции"));
+      return new CloseResult.Rejected(STATE, OpenFailures.notAllowed("отказаться от миграции"));
     }
     publish(new DbState.Closed(OpenFailures.REASON_OUTDATED, null));
     return new CloseResult.Closed(null);
@@ -330,7 +335,7 @@ public final class DatabaseService {
   private CloseResult doClose() {
     Database opened = database;
     if (opened == null || !(state instanceof DbState.Open)) {
-      return new CloseResult.Rejected(OpenFailures.notAllowed("закрыть"));
+      return new CloseResult.Rejected(STATE, OpenFailures.notAllowed("закрыть"));
     }
     database = null;
     String warning = null;
@@ -374,7 +379,7 @@ public final class DatabaseService {
     } catch (RuntimeException | Error e) {
       LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при работе с БД: " + file, e);
       if (abandoned) {
-        return new OpenResult.Rejected(MESSAGE_STOPPED);
+        return new OpenResult.Rejected(STOPPED, MESSAGE_STOPPED);
       }
       return failed(OpenFailures.unexpected(e));
     }
@@ -432,7 +437,7 @@ public final class DatabaseService {
     if (opened != null) {
       closeQuietly(opened);
     }
-    return new OpenResult.Rejected(MESSAGE_STOPPED);
+    return new OpenResult.Rejected(STOPPED, MESSAGE_STOPPED);
   }
 
   private OpenResult.Failed failed(OpenResult.Failed failure) {

@@ -414,7 +414,12 @@ final class DatabaseController {
     }
   }
 
-  private void onCreateResult(Path file, OpenResult result) {
+  /**
+   * Итог создания в потоке интерфейса. Гонка состояния и начатая остановка — не ошибка файла:
+   * отклонения тихи, как при открытии; отказ из-за существующего файла пользователь видит. Точка
+   * доставки из тестов: тесты передают собранные результаты напрямую.
+   */
+  void onCreateResult(Path file, OpenResult result) {
     if (stopped) {
       return;
     }
@@ -423,24 +428,14 @@ final class DatabaseController {
     } else if (result instanceof OpenResult.Failed failure) {
       dialogs.error(failure.message());
     } else if (result instanceof OpenResult.Rejected rejected) {
-      if (isStateOrStoppingRejection(rejected.message())) {
+      switch (rejected.cause()) {
         // Гонка состояния или начатая остановка — не ошибка файла: тихо, как при открытии
-        LOG.log(System.Logger.Level.DEBUG, "Создание отклонено: " + rejected.message());
-      } else {
+        case STATE, STOPPED ->
+            LOG.log(System.Logger.Level.DEBUG, "Создание отклонено: " + rejected.message());
         // Отказ из-за существующего файла: пользователь выбирает другое имя
-        dialogs.error(rejected.message());
+        case FILE_EXISTS -> dialogs.error(rejected.message());
       }
     }
-  }
-
-  /**
-   * Отклонение создания из-за изменившегося состояния или начатой остановки: показывается тихо, без
-   * диалога. Прочие отклонения (например, файл уже существует) пользователь должен увидеть. Тексты
-   * отказов по состоянию и остановке заданы в {@code DatabaseService}.
-   */
-  private static boolean isStateOrStoppingRejection(String message) {
-    return message.contains("недопустима в текущем состоянии")
-        || message.contains("Сервис БД остановлен");
   }
 
   private void onCloseResult(CloseResult result) {

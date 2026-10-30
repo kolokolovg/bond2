@@ -24,7 +24,8 @@ public sealed interface OpenResult {
   /**
    * Операция недопустима в текущем состоянии или сервис остановлен: состояние и файл не менялись.
    *
-   * @param message объяснение для пользователя
+   * @param cause типизированная причина отклонения
+   * @param message текст для пользователя; может меняться независимо от причины
    */
-  record Rejected(String message) implements OpenResult {}
+  record Rejected(RejectionCause cause, String message) implements OpenResult {}
 }

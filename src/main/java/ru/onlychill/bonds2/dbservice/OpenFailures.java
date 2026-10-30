@@ -53,6 +53,7 @@ final class OpenFailures {
   /** Создание отклонено: файл уже существует и не изменяется. */
   static OpenResult.Rejected fileExists(Path file) {
     return new OpenResult.Rejected(
+        RejectionCause.FILE_EXISTS,
         "Файл уже существует: "
             + file
             + ". Выберите другое имя файла: существующий файл не изменён.");

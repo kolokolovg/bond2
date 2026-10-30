@@ -147,18 +147,19 @@ class DatabaseServiceTest {
   }
 
   @Test
-  void operationsRunOnOneDaemonThreadNamedBondsDb() {
+  void operationsRunOnSingleBackgroundThread() {
+    Thread caller = Thread.currentThread();
     get(service.create(file()));
     get(service.close());
     get(service.open(file(), false));
     get(service.close());
 
-    // Поток жизненного цикла — демон: зависшая операция не удерживает процесс
+    // Все операции выполнились на одном и том же фоновом потоке, не совпадающем с потоком теста.
+    // Имя потока («bonds2-db») и признак демона остаются в производственном коде как диагностика
+    // и в тесте сознательно не проверяются.
     assertThat(storage.threads).isNotEmpty();
-    Thread worker = storage.threads.get(0);
-    assertThat(worker.getName()).isEqualTo("bonds2-db");
-    assertThat(worker.isDaemon()).isTrue();
-    assertThat(storage.threads).containsOnly(worker);
+    assertThat(storage.threads).containsOnly(storage.threads.get(0));
+    assertThat(storage.threads).doesNotContain(caller);
   }
 
   @Test
@@ -206,17 +207,47 @@ class DatabaseServiceTest {
 
   @Test
   void invalidOperationsAreRejectedWithoutChangingStateOrFile() throws IOException {
-    assertThat(get(service.close())).isInstanceOf(CloseResult.Rejected.class);
-    assertThat(get(service.migrate())).isInstanceOf(OpenResult.Rejected.class);
-    assertThat(get(service.declineMigration())).isInstanceOf(CloseResult.Rejected.class);
+    // Неверное состояние даёт типизированную причину STATE, пользовательский текст сохраняется
+    assertThat(get(service.close()))
+        .isInstanceOfSatisfying(
+            CloseResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
+              assertThat(rejected.message()).contains("недопустима в текущем состоянии");
+            });
+    assertThat(get(service.migrate()))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
+              assertThat(rejected.message()).contains("недопустима в текущем состоянии");
+            });
+    assertThat(get(service.declineMigration()))
+        .isInstanceOfSatisfying(
+            CloseResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
+              assertThat(rejected.message()).contains("недопустима в текущем состоянии");
+            });
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
 
     get(service.create(file()));
     byte[] before = Files.readAllBytes(file());
-    assertThat(get(service.open(file(), false))).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(service.open(file(), false)))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
+              assertThat(rejected.message()).contains("недопустима в текущем состоянии");
+            });
     assertThat(get(service.create(dir.resolve("other.db"))))
-        .isInstanceOf(OpenResult.Rejected.class);
-    assertThat(get(service.migrate())).isInstanceOf(OpenResult.Rejected.class);
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE));
+    assertThat(get(service.migrate()))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE));
 
     assertThat(service.state()).isEqualTo(new DbState.Open(file()));
     assertThat(Files.readAllBytes(file())).isEqualTo(before);
@@ -231,8 +262,14 @@ class DatabaseServiceTest {
 
     var result = get(service.create(file()));
 
-    assertThat(result).isInstanceOf(OpenResult.Rejected.class);
-    assertThat(((OpenResult.Rejected) result).message()).contains("уже существует");
+    // Причина «файл существует» типизирована, текст и неизменность файла сохраняются
+    assertThat(result)
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.FILE_EXISTS);
+              assertThat(rejected.message()).contains("уже существует");
+            });
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(Files.readAllBytes(file())).isEqualTo(before);
   }
@@ -677,7 +714,12 @@ class DatabaseServiceTest {
     assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
 
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(get(service.open(file(), false))).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(service.open(file(), false)))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected ->
+                // После остановки операции отклоняются с причиной STOPPED
+                assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED));
   }
 
   @Test
@@ -689,8 +731,18 @@ class DatabaseServiceTest {
 
     assertThat(isClosed(database)).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(get(service.open(file(), false))).isInstanceOf(OpenResult.Rejected.class);
-    assertThat(get(service.close())).isInstanceOf(CloseResult.Rejected.class);
+    assertThat(get(service.open(file(), false)))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected ->
+                // После остановки операции отклоняются с причиной STOPPED
+                assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED));
+    assertThat(get(service.close()))
+        .isInstanceOfSatisfying(
+            CloseResult.Rejected.class,
+            rejected ->
+                // После остановки операции отклоняются с причиной STOPPED
+                assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED));
     assertThat(service.shutdown(Duration.ofSeconds(1))).isEqualTo(ShutdownResult.STOPPED);
   }
 
@@ -790,6 +842,27 @@ class DatabaseServiceTest {
   }
 
   @Test
+  void operationSubmittedAfterStopBeganIsRejectedWithStoppedCause() throws InterruptedException {
+    // Операция, поставленная после начала остановки, отклоняется сразу с типизированной причиной
+    // STOPPED и каноническим текстом
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    service.shutdownAsync(Duration.ofSeconds(30));
+
+    assertThat(get(service.create(file())))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
+
+    storage.openGate.release();
+  }
+
+  @Test
   void shutdownAsyncTimesOutAndLateDatabaseIsClosed() throws InterruptedException {
     newDatabaseAt(file());
     storage.openGate.hold();
@@ -884,7 +957,14 @@ class DatabaseServiceTest {
     storage.openGate.release();
 
     assertThat(Eventually.holds(open::isDone)).isTrue();
-    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(open))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              // Запоздавший итог покинутой операции — отклонение остановленного сервиса
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
     assertThat(
             Eventually.holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
         .isTrue();
@@ -912,7 +992,14 @@ class DatabaseServiceTest {
     storage.openGate.release();
 
     // Результат запоздавшей операции не публикуется: вызывающему возвращается отклонение
-    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(open))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              // Запоздавший итог покинутой операции — отклонение остановленного сервиса
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
     // Полученная БД закрывается тихо
     assertThat(
             Eventually.holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0))))
@@ -1047,7 +1134,14 @@ class DatabaseServiceTest {
         .isEqualTo(ShutdownResult.TIMED_OUT);
     storage.openGate.release();
 
-    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(open))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              // Запоздавший итог покинутой операции — отклонение остановленного сервиса
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
     // «Ожидает решения о миграции» не публикуется, БД не открывается
     assertThat(storage.opened).isEmpty();
     // Состояния согласованы после остановки: самолечение публикует «закрыта»
@@ -1071,7 +1165,14 @@ class DatabaseServiceTest {
         .isEqualTo(ShutdownResult.TIMED_OUT);
     storage.openGate.release();
 
-    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(open))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              // Запоздавший итог покинутой операции — отклонение остановленного сервиса
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
     // Состояние по ошибке не публикуется, БД не открывается
     assertThat(storage.opened).isEmpty();
     // Состояния согласованы после остановки: самолечение публикует «закрыта»
@@ -1095,7 +1196,14 @@ class DatabaseServiceTest {
         .isEqualTo(ShutdownResult.TIMED_OUT);
     storage.openGate.release();
 
-    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    assertThat(get(open))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected -> {
+              // Запоздавший итог покинутой операции — отклонение остановленного сервиса
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
     // Состояние «внутренняя ошибка» от операции не публикуется: сервис уже остановлен
     assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);

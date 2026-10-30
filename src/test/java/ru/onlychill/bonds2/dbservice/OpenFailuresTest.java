@@ -155,4 +155,16 @@ class OpenFailuresTest {
     assertThat(missing.reason()).isEqualTo("файл не найден");
     assertThat(OpenFailures.retryable(missing)).isFalse();
   }
+
+  @Test
+  void fileExistsCarriesTypedCauseAndUnchangedMessage() {
+    // Причина «файл существует» различима по типу; пользовательский текст остаётся прежним
+    var rejected = OpenFailures.fileExists(Path.of("data", "bonds.db"));
+
+    assertThat(rejected.cause()).isEqualTo(RejectionCause.FILE_EXISTS);
+    assertThat(rejected.message())
+        .contains("уже существует")
+        .contains("Выберите другое имя файла")
+        .contains("не изменён");
+  }
 }

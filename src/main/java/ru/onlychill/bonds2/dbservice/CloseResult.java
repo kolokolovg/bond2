@@ -25,7 +25,8 @@ public sealed interface CloseResult {
   /**
    * Операция недопустима в текущем состоянии или сервис остановлен: состояние не менялось.
    *
-   * @param message объяснение для пользователя
+   * @param cause типизированная причина отклонения
+   * @param message текст для пользователя; может меняться независимо от причины
    */
-  record Rejected(String message) implements CloseResult {}
+  record Rejected(RejectionCause cause, String message) implements CloseResult {}
 }

@@ -18,6 +18,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import javafx.application.Platform;
 import javafx.stage.WindowEvent;
 import org.junit.jupiter.api.BeforeAll;
@@ -347,13 +348,14 @@ class SettingsDialogTest {
     var writes =
         Executors.newSingleThreadExecutor(
             runnable -> {
-              var thread = new Thread(runnable, DatabaseController.SETTINGS_THREAD_NAME);
+              var thread = new Thread(runnable, "test-settings");
               thread.setDaemon(true);
               return thread;
             });
     var firstEntered = new CountDownLatch(1);
     var releaseFirst = new CountDownLatch(1);
     var writeThreads = new CopyOnWriteArrayList<Thread>();
+    var fxThread = new AtomicReference<Thread>();
     var store = new SettingsStore(dir.resolve("cfg/settings.properties"));
     Executor queued =
         task ->
@@ -377,6 +379,8 @@ class SettingsDialogTest {
     var dialogBox = new SettingsDialog[1];
     runOnFxThread(
         () -> {
+          // Поток интерфейса запоминается один раз: запись настроек обязана идти вне его
+          fxThread.set(Thread.currentThread());
           var dialog =
               new SettingsDialog(
                   null, Settings.defaults(), dir.resolve("default/bonds2.db"), db::saveSettings);
@@ -406,9 +410,9 @@ class SettingsDialogTest {
         .isTrue();
     runOnFxThread(() -> assertThat(dialogBox[0].errorMessage()).isEmpty());
 
-    // Ровно одна запись, и она прошла на потоке-демоне исполнителя
+    // Ровно одна запись, и она прошла вне потока интерфейса
     assertThat(writeThreads).hasSize(1);
-    assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
+    assertThat(writeThreads.get(0)).isNotEqualTo(fxThread.get());
     assertThat(store.load().settings()).isEqualTo(new Settings(dir.resolve("g.db"), true));
 
     writes.shutdownNow();

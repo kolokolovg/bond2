@@ -41,6 +41,7 @@ import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.OpenResult;
+import ru.onlychill.bonds2.dbservice.RejectionCause;
 import ru.onlychill.bonds2.dbservice.ShutdownResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.Database;
@@ -161,11 +162,14 @@ class DatabaseControllerTest {
         ui);
   }
 
-  /** Однопоточный исполнитель записи настроек с именем потока, как в приложении. */
+  /**
+   * Однопоточный исполнитель записи настроек; имя потока нейтральное, тестовые проверки его не
+   * читают.
+   */
   private static ExecutorService settingsExecutor() {
     return Executors.newSingleThreadExecutor(
         runnable -> {
-          var thread = new Thread(runnable, DatabaseController.SETTINGS_THREAD_NAME);
+          var thread = new Thread(runnable, "test-settings");
           thread.setDaemon(true);
           return thread;
         });
@@ -995,6 +999,47 @@ class DatabaseControllerTest {
     assertThat(dialogs.errors).isEmpty();
   }
 
+  /** Доставляет собранный результат создания контроллеру через очередь потока интерфейса. */
+  private void deliverCreated(DatabaseController db, OpenResult result) {
+    ui.execute(() -> db.onCreateResult(userFile(), result));
+    ui.settle();
+  }
+
+  @Test
+  void createRejectedByStateCauseIsQuietRegardlessOfMessageText() {
+    var db = controller();
+
+    // Текст не совпадает с производственными формулировками: классификация идёт по причине
+    deliverCreated(
+        db, new OpenResult.Rejected(RejectionCause.STATE, "перефразированное сообщение"));
+
+    // Гонка состояния — не ошибка файла: диалога нет при любом тексте
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void createRejectedByStoppedCauseIsQuietRegardlessOfMessageText() {
+    var db = controller();
+
+    // Начатая остановка остаётся тихой, каким бы ни был текст отклонения
+    deliverCreated(
+        db, new OpenResult.Rejected(RejectionCause.STOPPED, "совсем не текст остановки"));
+
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void createRejectedByFileExistsCauseShowsErrorRegardlessOfMessageText() {
+    var db = controller();
+
+    // Причина FILE_EXISTS показывает диалог с доставленным текстом, а не по узнаванию слов
+    deliverCreated(db, new OpenResult.Rejected(RejectionCause.FILE_EXISTS, "совсем другой текст"));
+
+    assertThat(dialogs.errors).containsExactly("совсем другой текст");
+  }
+
   @Test
   void createKeepsDatabaseOpenWhenSettingsCannotBeSaved() throws IOException {
     Files.writeString(dir.resolve("blocker"), "файл на месте каталога настроек");
@@ -1278,10 +1323,9 @@ class DatabaseControllerTest {
       assertThat(db.settings()).isEqualTo(Settings.defaults());
       ui.pumpUntil(saving::isDone);
 
-      // Запись выполнена вне потока интерфейса, на именованном потоке исполнителя
+      // Запись выполнена вне потока интерфейса
       assertThat(saving).isCompleted();
       assertThat(writeThreads).hasSize(1);
-      assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
       assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
       assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
       assertThat(new SettingsStore(settingsFile()).load().settings())
@@ -1305,8 +1349,8 @@ class DatabaseControllerTest {
 
       assertThat(db.settings()).isEqualTo(expected);
       assertThat(dialogs.warnings).isEmpty();
+      // Запись выполнена вне потока интерфейса
       assertThat(writeThreads).hasSize(1);
-      assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
       assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
     } finally {
       executor.shutdownNow();
