@@ -103,6 +103,18 @@ class DatabaseTest {
   }
 
   @Test
+  void transactionConnectionsUseFullSynchronousMode() {
+    var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
+
+    // 2 — FULL: фиксация дожидается записи на диск, поэтому не теряется при сбое питания
+    String writeSync = pragmaOf(db, "synchronous");
+    String readSync = db.inReadTransaction(c -> pragma(c, "synchronous"));
+    assertThat(writeSync).isEqualTo("2");
+    assertThat(readSync).isEqualTo("2");
+    db.close();
+  }
+
+  @Test
   void successfulTransactionIsVisibleAfterwards() {
     var db = withCounter(Database.DEFAULT_BUSY_TIMEOUT);
     db.inTransaction(

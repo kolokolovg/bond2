@@ -219,6 +219,22 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void emptySettingsFileWarnsAboutResetWithoutCopyPathAndDoesNotCreateDefaultDatabase()
+      throws IOException {
+    Files.createDirectories(dir.resolve("cfg"));
+    Files.createFile(settingsFile());
+    var db = controller();
+
+    db.openOnStartup();
+    settleAfterOperation(db);
+
+    assertThat(dialogs.warnings).hasSize(1);
+    assertThat(dialogs.warnings.get(0)).contains("настройки сброшены").doesNotContain("bad-");
+    assertThat(defaultFile()).doesNotExist();
+    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: файл не найден");
+  }
+
+  @Test
   void resetSettingsStillOpenExistingDefaultDatabase() throws IOException {
     newDatabaseAt(defaultFile());
     corruptSettings();
@@ -743,6 +759,21 @@ class DatabaseControllerTest {
 
     db.openDatabase();
     ui.pumpUntil(() -> isOpen(db));
+  }
+
+  @Test
+  void unexpectedCloseFailureIsReportedAsErrorAndDatabaseStaysClosed() {
+    var db = opened();
+    storage.closeFailure = new IllegalStateException("сбой закрытия");
+
+    db.closeDatabase();
+    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
+    ui.settle();
+
+    assertThat(db.stateProperty().get()).isInstanceOf(DbState.Closed.class);
+    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: внутренняя ошибка");
+    assertThat(dialogs.errors).singleElement().asString().contains("сбой закрытия");
+    assertThat(dialogs.warnings).isEmpty();
   }
 
   @Test

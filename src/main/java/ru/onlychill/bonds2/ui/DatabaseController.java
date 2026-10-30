@@ -82,8 +82,12 @@ final class DatabaseController {
   /** Выход начат: повторный запрос игнорируется. */
   private boolean exiting;
 
-  /** Приложение завершается: поздние результаты сервиса игнорируются. */
-  private boolean stopped;
+  /**
+   * Приложение завершается: поздние результаты сервиса игнорируются. Поле выставляет остановка, а
+   * читают обработчики результатов, которые могут выполняться в другом потоке, поэтому оно {@code
+   * volatile}.
+   */
+  private volatile boolean stopped;
 
   /**
    * @param store хранилище настроек; настройки читаются при создании контроллера
@@ -265,6 +269,10 @@ final class DatabaseController {
       return;
     }
     cancelMigrationDialog();
+    // Ожидание миграции в stop() (до MIGRATION_TIMEOUT) сохранено сознательно. Вызов идёт из потока
+    // JavaFX, и блокировка этого потока неприятна, но прервать миграцию хуже, чем подождать: откат
+    // при следующем запуске потерял бы гарантию «файл не тронут». Случай редкий: без меню stop()
+    // почти не вызывается.
     CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
     if (service.state() instanceof DbState.AwaitingMigration) {
       prepared = service.declineMigration();
@@ -320,6 +328,8 @@ final class DatabaseController {
     }
     if (result instanceof CloseResult.Closed closed && closed.warning() != null) {
       dialogs.warn(closed.warning());
+    } else if (result instanceof CloseResult.Failed failed) {
+      dialogs.error(failed.message());
     }
   }
 

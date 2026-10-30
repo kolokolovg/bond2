@@ -3,6 +3,7 @@
 package ru.onlychill.bonds2.persistence;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,7 +40,8 @@ final class BackupManager {
   /**
    * Миграция существующей БД с резервной копией; см. {@link Database#migrateWithBackup(Path)}.
    * Копия создаётся рядом командой {@code VACUUM INTO} и проверяется {@code PRAGMA
-   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией.
+   * integrity_check}. Если миграция завершилась ошибкой, файл атомарно заменяется копией. После
+   * любой попытки миграции, успешной или неудачной, копии ограничиваются лимитом.
    *
    * @param absolute абсолютный путь к файлу БД
    * @return путь к резервной копии
@@ -55,8 +57,10 @@ final class BackupManager {
       SchemaInspector.flyway(SqliteSupport.url(absolute), locations).migrate();
     } catch (RuntimeException e) {
       throw restore(absolute, backup, e);
+    } finally {
+      // Лимит копий действует после любой попытки, в том числе неудачной; новая копия остаётся
+      pruneBackups(absolute, backup);
     }
-    pruneBackups(absolute, backup);
     return backup;
   }
 
@@ -161,7 +165,8 @@ final class BackupManager {
               found.add(new Found(p, m.group(1), m.group(2) == null ? 0 : parseSuffix(m.group(2))));
             }
           });
-    } catch (IOException e) {
+    } catch (IOException | UncheckedIOException e) {
+      // Сбой просмотра не должен подменить ошибку миграции, которую prune выполняет в finally
       LOG.log(System.Logger.Level.WARNING, "Не удалось просмотреть резервные копии: " + dir, e);
       return;
     }

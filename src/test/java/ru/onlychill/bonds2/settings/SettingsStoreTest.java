@@ -4,12 +4,16 @@ package ru.onlychill.bonds2.settings;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -239,5 +243,126 @@ class SettingsStoreTest {
         .isInstanceOf(UncheckedIOException.class);
     assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
     assertThat(settingsFile().resolve("inner")).isDirectory();
+  }
+
+  @Test
+  void savedFileIsUtf8WithNonAsciiValues() throws IOException {
+    var custom = new Settings(dir.resolve("Каталог/база ё.db"), true);
+
+    new SettingsStore(settingsFile()).save(custom);
+
+    assertThat(Files.readString(settingsFile(), StandardCharsets.UTF_8)).contains("Каталог");
+    assertThat(loadFromSettingsFile()).isEqualTo(custom);
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+  }
+
+  @Test
+  void failedWriteKeepsPreviousFileAndLeavesNoTempFile() throws IOException {
+    var store = new SettingsStore(settingsFile());
+    store.save(new Settings(dir.resolve("first.db"), true));
+    byte[] before = Files.readAllBytes(settingsFile());
+    Path settingsDir = dir.resolve("bonds2");
+    assumeTrue(isPosix());
+    // Каталог только для чтения: временный файл записи создать нельзя
+    makeReadOnly(settingsDir);
+    try {
+      assumeFalse(Files.isWritable(settingsDir), "под администратором права не ограничиваются");
+      assertThatThrownBy(() -> store.save(new Settings(dir.resolve("second.db"), false)))
+          .isInstanceOf(UncheckedIOException.class);
+    } finally {
+      makeWritable(settingsDir);
+    }
+    assertThat(Files.readAllBytes(settingsFile())).isEqualTo(before);
+    assertThat(namesIn(settingsDir)).containsExactly("settings.properties");
+  }
+
+  @Test
+  void leftoverTempFileIsRemovedOnLoadAndSettingsAreStillRead() throws IOException {
+    writeSettingsFile("database.autoOpen=false\n");
+    Path orphan = Files.writeString(dir.resolve("bonds2/settings-x.tmp"), "обрывок записи");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(orphan).doesNotExist();
+    assertThat(result.settings()).isEqualTo(new Settings(null, false));
+    assertThat(result.recovered()).isFalse();
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+  }
+
+  @Test
+  void leftoverTempFileWithoutSettingsFileIsRemovedAndDefaultsGiven() throws IOException {
+    Files.createDirectories(dir.resolve("bonds2"));
+    Path orphan = Files.writeString(dir.resolve("bonds2/settings-y.tmp"), "обрывок записи");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(orphan).doesNotExist();
+    assertThat(result).isEqualTo(new SettingsStore.LoadResult(Settings.defaults(), null, false));
+    assertThat(namesIn(dir.resolve("bonds2"))).isEmpty();
+  }
+
+  @Test
+  void orphanTempFileThatCannotBeDeletedDoesNotStopReading() throws IOException {
+    writeSettingsFile("database.autoOpen=false\n");
+    Path settingsDir = dir.resolve("bonds2");
+    Path orphan = Files.writeString(settingsDir.resolve("settings-z.tmp"), "обрывок записи");
+    assumeTrue(isPosix());
+    makeReadOnly(settingsDir);
+    try {
+      assumeFalse(Files.isWritable(settingsDir), "под администратором права не ограничиваются");
+
+      var result = storeAt(FIXED).load();
+
+      assertThat(result.settings()).isEqualTo(new Settings(null, false));
+      assertThat(result.recovered()).isFalse();
+      assertThat(orphan).exists();
+    } finally {
+      makeWritable(settingsDir);
+    }
+  }
+
+  @Test
+  void emptyFileIsResetToDefaultsWithoutCopyAndReportedAsRecovered() throws IOException {
+    writeSettingsFile("");
+
+    var result = storeAt(FIXED).load();
+
+    assertThat(result).isEqualTo(new SettingsStore.LoadResult(Settings.defaults(), null, true));
+    assertThat(namesIn(dir.resolve("bonds2"))).containsExactly("settings.properties");
+    assertThat(Files.readAllLines(settingsFile(), StandardCharsets.UTF_8))
+        .contains("database.path=", "database.autoOpen=true");
+    // Файл уже содержит значения по умолчанию: повторная загрузка не считает его испорченным
+    assertThat(storeAt(FIXED).load().recovered()).isFalse();
+  }
+
+  @Test
+  void emptyFileIsStillReportedAsResetWhenItCannotBeRewritten() throws IOException {
+    writeSettingsFile("");
+    Path settingsDir = dir.resolve("bonds2");
+    assumeTrue(isPosix());
+    makeReadOnly(settingsDir);
+    try {
+      assumeFalse(Files.isWritable(settingsDir), "под администратором права не ограничиваются");
+
+      var result = storeAt(FIXED).load();
+
+      assertThat(result).isEqualTo(new SettingsStore.LoadResult(Settings.defaults(), null, true));
+    } finally {
+      makeWritable(settingsDir);
+    }
+    assertThat(settingsFile()).isEmptyFile();
+  }
+
+  private static boolean isPosix() {
+    return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
+  }
+
+  /** Каталог только для чтения и просмотра: создать или удалить в нём файл нельзя. */
+  private static void makeReadOnly(Path directory) throws IOException {
+    Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("r-xr-xr-x"));
+  }
+
+  private static void makeWritable(Path directory) throws IOException {
+    Files.setPosixFilePermissions(directory, PosixFilePermissions.fromString("rwxr-xr-x"));
   }
 }

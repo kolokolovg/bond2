@@ -39,12 +39,14 @@ final class SqliteSupport {
   /**
    * Настройки соединения транзакций. Файл открывается только существующим, поэтому удалённый или
    * перемещённый файл БД даёт ошибку открытия, а пустой файл на его месте не появляется.
+   * Синхронизация полная: зафиксированная транзакция переживает потерю питания и сбой операционной
+   * системы (при {@code NORMAL} в режиме WAL последние фиксации могут откатиться).
    */
   static Properties properties(Duration busyTimeout, SQLiteConfig.TransactionMode mode) {
     var config = new SQLiteConfig();
     existingFileOnly(config);
     config.setJournalMode(SQLiteConfig.JournalMode.WAL);
-    config.setSynchronous(SQLiteConfig.SynchronousMode.NORMAL);
+    config.setSynchronous(SQLiteConfig.SynchronousMode.FULL);
     config.enforceForeignKeys(true);
     config.setBusyTimeout((int) busyTimeout.toMillis());
     config.setTransactionMode(mode);

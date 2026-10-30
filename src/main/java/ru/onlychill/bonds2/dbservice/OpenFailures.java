@@ -76,9 +76,10 @@ final class OpenFailures {
   }
 
   /**
-   * Исключение, не предусмотренное контрактом операции: поток жизненного цикла продолжает работу.
+   * Исключение или ошибка среды выполнения, не предусмотренные контрактом операции: поток
+   * жизненного цикла продолжает работу. Фатальные ошибки виртуальной машины сюда не передаются.
    */
-  static OpenResult.Failed unexpected(RuntimeException e) {
+  static OpenResult.Failed unexpected(Throwable e) {
     return new OpenResult.Failed(
         REASON_UNEXPECTED, "Непредвиденная ошибка: " + ErrorMessages.of(e));
   }

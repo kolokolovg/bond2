@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.sqlite.SQLiteConfig;
 
 class SqliteSupportTest {
 
@@ -51,6 +52,23 @@ class SqliteSupportTest {
       st.executeUpdate("INSERT INTO app_info VALUES ('late', 'write')");
     }
     return reader;
+  }
+
+  @Test
+  void transactionPropertiesRequestFullSynchronousMode() {
+    var props =
+        SqliteSupport.properties(Duration.ofMillis(100), SQLiteConfig.TransactionMode.IMMEDIATE);
+
+    assertThat(props.getProperty("synchronous")).isEqualTo("FULL");
+  }
+
+  @Test
+  void serviceConnectionsDoNotSetSynchronousMode() {
+    // Служебные соединения (проверка схемы, копия, перенос WAL) данных не пишут и режим не задают
+    var timeout = Duration.ofMillis(100);
+    assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isNull();
+    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("synchronous")).isNull();
+    assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous")).isNull();
   }
 
   @Test

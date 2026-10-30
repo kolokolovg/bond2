@@ -46,6 +46,9 @@ public final class DatabaseService {
     Database initialize(Path file);
 
     void migrateWithBackup(Path file);
+
+    /** Закрывает БД и переносит журнал WAL в основной файл. */
+    void close(Database database);
   }
 
   /** Итог попытки открыть: публичный результат и открытая БД, если она есть. */
@@ -284,27 +287,37 @@ public final class DatabaseService {
     database = null;
     String warning = null;
     try {
-      opened.close();
+      storage.close(opened);
+    } catch (VirtualMachineError e) {
+      throw e;
     } catch (PersistenceException e) {
       warning =
           "Не удалось полностью закрыть БД: "
               + ErrorMessages.of(e)
               + " Зафиксированные данные не потеряны: они остаются в журнале WAL и будут применены"
               + " при следующем открытии.";
+    } catch (RuntimeException | Error e) {
+      LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при закрытии БД", e);
+      OpenResult.Failed failure = failed(OpenFailures.unexpected(e));
+      return new CloseResult.Failed(failure.message());
     }
     publish(DbState.CLOSED);
     return new CloseResult.Closed(warning);
   }
 
   /**
-   * Выполняет попытку и публикует её итог. Исключение превращается в «внутреннюю ошибку»: поток
-   * жизненного цикла не завершается.
+   * Выполняет попытку и публикует её итог. Любой сбой среды выполнения превращается в «внутреннюю
+   * ошибку» с публикацией «закрыта»: поток жизненного цикла не завершается. Фатальные ошибки
+   * виртуальной машины пробрасываются без поглощения.
    */
   private OpenResult finish(Path file, Supplier<Attempt> operation) {
     Attempt attempt;
     try {
       attempt = operation.get();
-    } catch (RuntimeException e) {
+    } catch (VirtualMachineError e) {
+      throw e;
+    } catch (RuntimeException | Error e) {
+      LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при работе с БД: " + file, e);
       return failed(OpenFailures.unexpected(e));
     }
     Database opened = attempt.database();
@@ -330,7 +343,7 @@ public final class DatabaseService {
     return attempt.result();
   }
 
-  private OpenResult failed(OpenResult.Failed failure) {
+  private OpenResult.Failed failed(OpenResult.Failed failure) {
     publish(new DbState.Closed(failure.reason(), failure.message()));
     return failure;
   }
@@ -379,11 +392,16 @@ public final class DatabaseService {
     return new Attempt(new OpenResult.Opened(file), opened);
   }
 
-  private static void closeQuietly(Database opened) {
+  /** Закрывает БД без результата: сбой пишется в журнал, остановка продолжается. */
+  private void closeQuietly(Database opened) {
     try {
-      opened.close();
+      storage.close(opened);
+    } catch (VirtualMachineError e) {
+      throw e;
     } catch (PersistenceException e) {
       LOG.log(System.Logger.Level.WARNING, "Не удалось закрыть БД", e);
+    } catch (RuntimeException | Error e) {
+      LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при закрытии БД", e);
     }
   }
 }

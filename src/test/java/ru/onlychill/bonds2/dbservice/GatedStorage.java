@@ -65,8 +65,11 @@ public final class GatedStorage implements DatabaseService.Storage {
   /** Потоки, в которых выполнялись операции с файлами БД. */
   public final List<Thread> threads = new CopyOnWriteArrayList<>();
 
-  /** Если задано, открытие бросает это исключение. */
-  public volatile @Nullable RuntimeException openFailure;
+  /** Если задано, открытие бросает это исключение или ошибку среды выполнения. */
+  public volatile @Nullable Throwable openFailure;
+
+  /** Если задано, закрытие бросает это исключение или ошибку после настоящего закрытия БД. */
+  public volatile @Nullable Throwable closeFailure;
 
   @Override
   public Database.State inspect(Path file) {
@@ -77,11 +80,15 @@ public final class GatedStorage implements DatabaseService.Storage {
   @Override
   public Database open(Path file) {
     enter(openGate);
-    RuntimeException failure = openFailure;
-    if (failure != null) {
-      throw failure;
-    }
+    throwIfSet(openFailure);
     return track(Database.open(file));
+  }
+
+  @Override
+  public void close(Database database) {
+    // Настоящее закрытие первым: сбой подменяется уже после него, файл БД остаётся согласованным
+    database.close();
+    throwIfSet(closeFailure);
   }
 
   @Override
@@ -106,6 +113,16 @@ public final class GatedStorage implements DatabaseService.Storage {
   private void enter(Gate gate) {
     threads.add(Thread.currentThread());
     gate.pass();
+  }
+
+  /** Бросает заданный сбой: исключение среды выполнения или ошибка; без сбоя ничего не делает. */
+  private static void throwIfSet(@Nullable Throwable failure) {
+    if (failure instanceof RuntimeException runtime) {
+      throw runtime;
+    }
+    if (failure instanceof Error error) {
+      throw error;
+    }
   }
 
   private Database track(Database database) {

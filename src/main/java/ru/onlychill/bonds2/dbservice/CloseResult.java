@@ -15,6 +15,14 @@ public sealed interface CloseResult {
   record Closed(@Nullable String warning) implements CloseResult {}
 
   /**
+   * Закрыть не удалось из-за непредвиденной ошибки: состояние «закрыта», причина «внутренняя
+   * ошибка», сервис продолжает работать.
+   *
+   * @param message подробности для пользователя
+   */
+  record Failed(String message) implements CloseResult {}
+
+  /**
    * Операция недопустима в текущем состоянии или сервис остановлен: состояние не менялось.
    *
    * @param message объяснение для пользователя

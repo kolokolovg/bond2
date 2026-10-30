@@ -284,21 +284,45 @@ class DatabaseMigrationTest {
   }
 
   @Test
-  void failedMigrationDeletesNoBackups() throws Exception {
+  void failedMigrationKeepsOnlyThreeNewestBackupsIncludingNewOne() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
     for (String name :
         List.of(
             "app.db.bak-20200101-000000",
             "app.db.bak-20210101-000000",
             "app.db.bak-20220101-000000",
-            "app.db.bak-20230101-000000")) {
+            "app.db.bak-20230101-000000",
+            "app.db.bak-20240101-000000")) {
       Files.writeString(dir.resolve(name), name);
     }
 
     assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
         .isInstanceOf(MigrationException.class);
 
-    assertThat(backupNames()).hasSize(5).contains("app.db.bak-20200101-000000", BACKUP_NAME);
+    // Лимит действует и после неудачи: остаются только что созданная и две самые новые старые
+    assertThat(backupNames())
+        .containsExactlyInAnyOrder(
+            BACKUP_NAME, "app.db.bak-20240101-000000", "app.db.bak-20230101-000000");
+  }
+
+  @Test
+  void failedMigrationKeepsNewBackupWhenOlderBackupsHaveLaterStamps() throws Exception {
+    // Часы перевели назад: все прежние копии новее метки новой копии (20261029-101530)
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    for (String name :
+        List.of(
+            "app.db.bak-20261101-000000",
+            "app.db.bak-20261102-000000",
+            "app.db.bak-20261103-000000")) {
+      Files.writeString(dir.resolve(name), name);
+    }
+
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
+        .isInstanceOf(MigrationException.class);
+
+    assertThat(backupNames())
+        .containsExactlyInAnyOrder(
+            BACKUP_NAME, "app.db.bak-20261103-000000", "app.db.bak-20261102-000000");
   }
 
   @Test

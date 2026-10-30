@@ -32,4 +32,9 @@ final class FileStorage implements DatabaseService.Storage {
   public void migrateWithBackup(Path file) {
     Database.migrateWithBackup(file);
   }
+
+  @Override
+  public void close(Database database) {
+    database.close();
+  }
 }

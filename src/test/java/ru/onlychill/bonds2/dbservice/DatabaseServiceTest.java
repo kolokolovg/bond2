@@ -3,6 +3,7 @@
 package ru.onlychill.bonds2.dbservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
@@ -340,6 +341,80 @@ class DatabaseServiceTest {
   }
 
   @Test
+  void linkageErrorDuringOpenClosesServiceAndNextOpenIsAccepted() {
+    newDatabaseAt(file());
+    var states = record();
+    // Например, не загрузилась встроенная библиотека SQLite: это ошибка среды, а не исключение
+    storage.openFailure = new UnsatisfiedLinkError("библиотека SQLite не загружена");
+
+    var result = get(service.open(file(), false));
+
+    assertThat(result).isInstanceOf(OpenResult.Failed.class);
+    var failure = (OpenResult.Failed) result;
+    assertThat(failure.reason()).isEqualTo("внутренняя ошибка");
+    assertThat(failure.message()).contains("библиотека SQLite не загружена");
+    // Состояние не застревает в «открывается»: публикуется «закрыта» с причиной
+    assertThat(states)
+        .containsExactly(
+            DbState.CLOSED,
+            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Closed(failure.reason(), failure.message()));
+
+    storage.openFailure = null;
+    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(service.state()).isEqualTo(new DbState.Open(file()));
+  }
+
+  @Test
+  void virtualMachineErrorIsNotSwallowedByOpen() {
+    newDatabaseAt(file());
+    storage.openFailure = new OutOfMemoryError("тест: нехватка памяти");
+
+    var future = service.open(file(), false);
+
+    assertThatThrownBy(() -> future.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCauseInstanceOf(OutOfMemoryError.class);
+  }
+
+  @Test
+  void unexpectedErrorDuringCloseClosesServiceAndReturnsFailure() {
+    newDatabaseAt(file());
+    get(service.open(file(), false));
+    var states = record();
+    storage.closeFailure = new UnsatisfiedLinkError("сбой закрытия");
+
+    var result = get(service.close());
+
+    assertThat(result).isInstanceOf(CloseResult.Failed.class);
+    var message = ((CloseResult.Failed) result).message();
+    assertThat(message).contains("сбой закрытия");
+    assertThat(service.state()).isEqualTo(new DbState.Closed("внутренняя ошибка", message));
+    assertThat(states)
+        .containsExactly(
+            new DbState.Open(file()), new DbState.Closed("внутренняя ошибка", message));
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+
+    // Сервис остаётся работоспособным: после сбоя БД снова открывается и закрывается
+    storage.closeFailure = null;
+    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
+  }
+
+  @Test
+  void virtualMachineErrorIsNotSwallowedByClose() {
+    newDatabaseAt(file());
+    get(service.open(file(), false));
+    storage.closeFailure = new OutOfMemoryError("тест: нехватка памяти");
+
+    var future = service.close();
+
+    assertThatThrownBy(() -> future.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCauseInstanceOf(OutOfMemoryError.class);
+  }
+
+  @Test
   void closeFailureIsReportedAsWarningAndDatabaseIsClosed() throws SQLException {
     newDatabaseAt(file());
     get(service.open(file(), false));
@@ -368,6 +443,17 @@ class DatabaseServiceTest {
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(states).containsExactly(new DbState.Open(file()), DbState.CLOSED);
     assertThat(file()).doesNotExist();
+  }
+
+  @Test
+  void shutdownCompletesEvenIfClosingDatabaseFailsWithError() {
+    get(service.create(file()));
+    storage.closeFailure = new UnsatisfiedLinkError("сбой закрытия при остановке");
+
+    assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(get(service.open(file(), false))).isInstanceOf(OpenResult.Rejected.class);
   }
 
   @Test
