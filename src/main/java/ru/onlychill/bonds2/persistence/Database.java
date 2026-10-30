@@ -12,6 +12,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.sqlite.SQLiteConfig;
 
@@ -19,6 +20,13 @@ import org.sqlite.SQLiteConfig;
  * Локальная БД SQLite: создание, проверка схемы и миграции с резервной копией, атомарные
  * транзакции, безопасные при параллельном использовании из нескольких потоков (WAL, {@code
  * busy_timeout}, {@code BEGIN IMMEDIATE} для записи).
+ *
+ * <p>Открытый экземпляр владеет файлом БД: служебные операции {@link #create(Path, Duration)},
+ * {@link #initialize(Path)} и {@link #migrateWithBackup(Path)} отказывают, не касаясь файла и его
+ * резервных копий, пока тот же файл открыт живым экземпляром приложения. Владение начинается при
+ * создании экземпляра (все фабрики проходят через конструктор) и освобождается {@link #close()}, в
+ * том числе при ошибке закрытия. Открытие нескольких экземпляров одного файла через {@link
+ * #open(Path)} реестром не ограничивается.
  *
  * <p>Жизненный цикл: {@link #create(Path)}, {@link #initialize(Path)} для пустого файла или {@link
  * #open(Path)}, затем транзакции, затем {@link #close()}. Проверку схемы выполняет {@code
@@ -56,9 +64,19 @@ public final class Database implements AutoCloseable {
   /** Набор миграций приложения. */
   private static final String MIGRATIONS = "classpath:db/migration";
 
+  /**
+   * Открытые экземпляры по нормализованному абсолютному пути файла БД — реестр владения файлом.
+   * Запись создаёт конструктор, снимает {@link #close()}; через реестр служебные операции
+   * отказывают работать с файлом, которым владеет открытый экземпляр.
+   */
+  private static final ConcurrentHashMap<Path, Database> OPEN_INSTANCES = new ConcurrentHashMap<>();
+
   private final String url;
   private final Properties writeProperties;
   private final Properties readProperties;
+
+  /** Ключ экземпляра в {@link #OPEN_INSTANCES}: нормализованный абсолютный путь файла БД. */
+  private final Path registryKey;
 
   /** Фабрика соединений транзакций; тесты подменяют её для проверки сбоев соединения. */
   private final ConnectionFactory connections;
@@ -78,19 +96,24 @@ public final class Database implements AutoCloseable {
     Connection connect(String url, Properties props) throws SQLException;
   }
 
-  private Database(String url, Duration busyTimeout) {
-    this(url, busyTimeout, SqliteSupport::connect);
+  /** Конструктор фабрик приложения: соединения транзакций открывает {@code SqliteSupport}. */
+  Database(Path file, Duration busyTimeout) {
+    this(file, busyTimeout, SqliteSupport::connect);
   }
 
   /** Тестовый конструктор: соединения транзакций открывает переданная фабрика. */
-  Database(String url, Duration busyTimeout, ConnectionFactory connections) {
-    this.url = url;
+  Database(Path file, Duration busyTimeout, ConnectionFactory connections) {
+    Path registryKey = keyOf(file);
+    this.url = SqliteSupport.url(registryKey);
+    this.registryKey = registryKey;
     this.busyTimeout = busyTimeout;
     this.connections = connections;
     this.writeProperties =
         SqliteSupport.properties(busyTimeout, SQLiteConfig.TransactionMode.IMMEDIATE);
     this.readProperties =
         SqliteSupport.properties(busyTimeout, SQLiteConfig.TransactionMode.DEFERRED);
+    // Владение файлом фиксируется в конструкторе: через него проходят все фабрики экземпляра
+    OPEN_INSTANCES.put(registryKey, this);
   }
 
   /** Создаёт новую БД с актуальной схемой; см. {@link #create(Path, Duration)}. */
@@ -102,8 +125,8 @@ public final class Database implements AutoCloseable {
    * Создаёт новую БД по пути и применяет все миграции. Недостающие каталоги создаются. Если файл
    * уже существует, создание завершается ошибкой и файл не изменяется.
    *
-   * @throws PersistenceException если файл уже существует или миграции не применились (тогда
-   *     созданный файл удаляется)
+   * @throws PersistenceException если файл уже открыт этим экземпляром приложения, файл уже
+   *     существует или миграции не применились (тогда созданный файл удаляется)
    */
   public static Database create(Path file, Duration busyTimeout) {
     return create(file, busyTimeout, MIGRATIONS);
@@ -111,6 +134,7 @@ public final class Database implements AutoCloseable {
 
   /** Создание БД из набора миграций {@code locations}. */
   static Database create(Path file, Duration busyTimeout, String... locations) {
+    ensureNotOpened(file);
     Path absolute = file.toAbsolutePath();
     createEmptyFile(absolute);
     String url = SqliteSupport.url(absolute);
@@ -121,7 +145,7 @@ public final class Database implements AutoCloseable {
       SqliteSupport.deleteWithSidecarsQuietly(absolute, e);
       throw new PersistenceException("Не удалось создать БД: " + absolute, e);
     }
-    return new Database(url, busyTimeout);
+    return new Database(absolute, busyTimeout);
   }
 
   /**
@@ -163,7 +187,7 @@ public final class Database implements AutoCloseable {
   static Database open(Path file, Duration busyTimeout, String... locations) {
     Path absolute = file.toAbsolutePath();
     return switch (SchemaInspector.inspect(absolute, locations)) {
-      case UP_TO_DATE -> new Database(SqliteSupport.url(absolute), busyTimeout);
+      case UP_TO_DATE -> new Database(absolute, busyTimeout);
       case NEEDS_MIGRATION ->
           throw new PersistenceException("Схема БД устарела, требуется миграция: " + absolute);
       case TOO_NEW -> throw new PersistenceException("Схема БД новее приложения: " + absolute);
@@ -180,8 +204,8 @@ public final class Database implements AutoCloseable {
    * схемы. Файл не создаётся и не удаляется. Если миграции завершились ошибкой, файл возвращается к
    * пустому состоянию, поэтому повторная попытка возможна.
    *
-   * @throws PersistenceException если файла нет, он не пуст (в том числе БД приложения или чужая
-   *     база) либо миграции не применились
+   * @throws PersistenceException если файла нет, файл уже открыт этим экземпляром приложения, он не
+   *     пуст (в том числе БД приложения или чужая база) либо миграции не применились
    */
   public static Database initialize(Path file) {
     return initialize(file, DEFAULT_BUSY_TIMEOUT, MIGRATIONS);
@@ -189,12 +213,12 @@ public final class Database implements AutoCloseable {
 
   /** Инициализация по набору миграций {@code locations}. */
   static Database initialize(Path file, Duration busyTimeout, String... locations) {
+    ensureNotOpened(file);
     Path absolute = file.toAbsolutePath();
     if (SchemaInspector.inspect(absolute, locations) != State.EMPTY) {
       throw new PersistenceException(
           "Инициализация возможна только для пустого файла БД: " + absolute);
     }
-    String url = SqliteSupport.url(absolute);
     try {
       SchemaInspector.flywayExisting(absolute, locations).migrate();
     } catch (RuntimeException e) {
@@ -202,7 +226,7 @@ public final class Database implements AutoCloseable {
       BackupManager.resetToEmpty(absolute, e);
       throw new PersistenceException("Не удалось инициализировать БД: " + absolute, e);
     }
-    return new Database(url, busyTimeout);
+    return new Database(absolute, busyTimeout);
   }
 
   /**
@@ -214,8 +238,8 @@ public final class Database implements AutoCloseable {
    * файл атомарно заменяется копией.
    *
    * @return путь к резервной копии
-   * @throws PersistenceException если миграция не нужна, схема новее приложения, файл пуст или не
-   *     является БД приложения; файл не изменён
+   * @throws PersistenceException если файл уже открыт этим экземпляром приложения, миграция не
+   *     нужна, схема новее приложения, файл пуст или не является БД приложения; файл не изменён
    * @throws MigrationException если копию создать или проверить не удалось (миграция не выполнена,
    *     копия удаляется), миграция завершилась ошибкой (файл восстановлен из копии) либо основной
    *     файл удалён до применения миграций (откат не запускается, копия сохраняется для ручного
@@ -228,6 +252,7 @@ public final class Database implements AutoCloseable {
 
   /** Миграция по набору {@code locations}; время в имени копии берётся из {@code clock}. */
   static Path migrateWithBackup(Path file, Clock clock, String... locations) {
+    ensureNotOpened(file);
     return BackupManager.migrateWithBackup(file.toAbsolutePath(), clock, locations);
   }
 
@@ -253,6 +278,7 @@ public final class Database implements AutoCloseable {
    * Закрывает БД: ждёт завершения активных транзакций, переносит WAL в основной файл и запрещает
    * новые транзакции. Повторный вызов ничего не делает. Файл БД не создаётся: если его удалили или
    * переместили после открытия, закрытие завершается ошибкой, а БД всё равно считается закрытой.
+   * При любом исходе закрытия, включая ошибку переноса WAL, экземпляр освобождает владение файлом.
    *
    * @throws IllegalStateException если вызван из транзакции этой БД (иначе возник бы тупик)
    * @throws PersistenceException если WAL не удалось перенести в основной файл, в том числе если
@@ -265,12 +291,15 @@ public final class Database implements AutoCloseable {
     }
     lock.writeLock().lock();
     try {
-      if (!closed) {
-        try {
+      try {
+        if (!closed) {
           SqliteSupport.checkpoint(url, busyTimeout);
-        } finally {
-          closed = true;
         }
+      } finally {
+        closed = true;
+        // Владение снимается на всех исходах, включая сбой переноса WAL; двухаргументный remove
+        // не заденет запись другого экземпляра, открытого по тому же файлу
+        OPEN_INSTANCES.remove(registryKey, this);
       }
     } catch (SQLException e) {
       throw new PersistenceException("Не удалось перенести WAL в файл БД при закрытии", e);
@@ -326,6 +355,22 @@ public final class Database implements AutoCloseable {
       c.close();
     } catch (SQLException e) {
       cause.addSuppressed(e);
+    }
+  }
+
+  /** Ключ реестра открытых экземпляров: нормализованный абсолютный путь файла БД. */
+  private static Path keyOf(Path file) {
+    return file.toAbsolutePath().normalize();
+  }
+
+  /**
+   * Отказ до любых файловых операций, если файл уже открыт живым экземпляром приложения: служебные
+   * операции не выполняются над файлом, которым владеет открытый экземпляр БД.
+   */
+  private static void ensureNotOpened(Path file) {
+    Path key = keyOf(file);
+    if (OPEN_INSTANCES.containsKey(key)) {
+      throw new PersistenceException("Файл уже открыт этим экземпляром приложения: " + key);
     }
   }
 

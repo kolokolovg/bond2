@@ -561,6 +561,61 @@ class DatabaseMigrationTest {
   }
 
   @Test
+  void migrationRefusesFileOpenedByInstanceAndRunsAfterClose() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    var db = Database.open(file, Database.DEFAULT_BUSY_TIMEOUT, OLD);
+    byte[] before = Files.readAllBytes(file);
+
+    // Открытый экземпляр владеет файлом: миграция отказывает до любых файловых операций
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("уже открыт")
+        .hasMessageContaining(file.toAbsolutePath().normalize().toString());
+    assertThat(Files.readAllBytes(file)).isEqualTo(before);
+    assertThat(backupsOf(file)).isEmpty();
+
+    // После закрытия экземпляра владение освобождено: миграция проходит по общим правилам
+    db.close();
+    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
+  }
+
+  @Test
+  void initializationRefusesFileOwnedByInstanceAndRunsAfterClose() throws Exception {
+    // Владение пустым файлом без соединения: пакетный конструктор не подключается к файлу
+    Path file = Files.createFile(dir.resolve("empty.db"));
+    var db = new Database(file, Database.DEFAULT_BUSY_TIMEOUT);
+
+    assertThatThrownBy(() -> Database.initialize(file, Database.DEFAULT_BUSY_TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("уже открыт")
+        .hasMessageContaining(file.toAbsolutePath().normalize().toString());
+    assertThat(file).isEmptyFile();
+
+    // После закрытия экземпляра инициализация проходит
+    db.close();
+    try (var initialized = Database.initialize(file, Database.DEFAULT_BUSY_TIMEOUT, NEW_OK)) {
+      assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    }
+  }
+
+  @Test
+  void creationRefusesOpenedFileBeforeCheckingItsExistence() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    var db = Database.open(file, Database.DEFAULT_BUSY_TIMEOUT, OLD);
+
+    // Проверка реестра стоит до проверки существования файла: отказ не про «уже существует»
+    assertThatThrownBy(() -> Database.create(file, Database.DEFAULT_BUSY_TIMEOUT, NEW_OK))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("уже открыт")
+        .hasMessageNotContaining("уже существует");
+
+    db.close();
+  }
+
+  @Test
   void rollbackRestoresBackupContentAndRemovesStaleSidecars() throws Exception {
     Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "broken");

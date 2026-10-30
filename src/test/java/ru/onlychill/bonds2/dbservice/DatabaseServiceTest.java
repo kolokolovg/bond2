@@ -29,6 +29,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import ru.onlychill.bonds2.persistence.Database;
+import ru.onlychill.bonds2.persistence.PersistenceException;
 
 class DatabaseServiceTest {
 
@@ -70,8 +71,12 @@ class DatabaseServiceTest {
   }
 
   private List<DbState> record() {
+    return record(service);
+  }
+
+  private List<DbState> record(DatabaseService target) {
     var states = new CopyOnWriteArrayList<DbState>();
-    service
+    target
         .states()
         .subscribe(
             new Flow.Subscriber<>() {
@@ -92,6 +97,36 @@ class DatabaseServiceTest {
               public void onComplete() {}
             });
     return states;
+  }
+
+  /** БД действительно закрыта: новая транзакция по держателю отклоняется с точной причиной. */
+  private static void assertReallyClosed(Database database) {
+    assertThatThrownBy(() -> database.inTransaction(connection -> null))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessage("БД закрыта");
+  }
+
+  /** Подписчик, бросающий заданную ошибку среды только при доставке состояния «открыта». */
+  private static Flow.Subscriber<DbState> failingOnOpenState(Error error) {
+    return new Flow.Subscriber<>() {
+      @Override
+      public void onSubscribe(Flow.Subscription subscription) {
+        subscription.request(Long.MAX_VALUE);
+      }
+
+      @Override
+      public void onNext(DbState item) {
+        if (item instanceof DbState.Open) {
+          throw error;
+        }
+      }
+
+      @Override
+      public void onError(Throwable throwable) {}
+
+      @Override
+      public void onComplete() {}
+    };
   }
 
   @Test
@@ -427,6 +462,53 @@ class DatabaseServiceTest {
   }
 
   @Test
+  void internalCloseErrorRetriesQuietlyAndDatabaseIsReallyClosed() {
+    var failingStorage = new FailingCloseStorage();
+    failingStorage.failFirstClose = true;
+    var failingService = new DatabaseService(failingStorage);
+    assertThat(get(failingService.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    var states = record(failingService);
+    Database opened = failingStorage.opened.get(0);
+
+    var result = get(failingService.close());
+
+    // Вызывающему возвращена ошибка, состояние — «закрыта» с причиной «внутренняя ошибка»
+    assertThat(result).isInstanceOf(CloseResult.Failed.class);
+    var message = ((CloseResult.Failed) result).message();
+    assertThat(message).contains("сбой закрытия без пометки закрытой");
+    assertThat(failingService.state()).isEqualTo(new DbState.Closed("внутренняя ошибка", message));
+    assertThat(states)
+        .containsExactly(
+            new DbState.Open(file()), new DbState.Closed("внутренняя ошибка", message));
+    // Тихий повтор закрыл БД по-настоящему: второй вызов close, транзакции больше не проходят
+    assertThat(failingStorage.closeAttempts).hasValue(2);
+    assertReallyClosed(opened);
+
+    failingStorage.failFirstClose = false;
+    assertThat(failingService.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+  }
+
+  @Test
+  void reopenAfterInternalCloseErrorSucceeds() {
+    var failingStorage = new FailingCloseStorage();
+    failingStorage.failFirstClose = true;
+    var failingService = new DatabaseService(failingStorage);
+    assertThat(get(failingService.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    Database opened = failingStorage.opened.get(0);
+    assertThat(get(failingService.close())).isInstanceOf(CloseResult.Failed.class);
+    assertReallyClosed(opened);
+
+    // Повторное открытие того же файла после сбойного закрытия выполняется успешно
+    failingStorage.failFirstClose = false;
+    assertThat(get(failingService.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(failingService.state()).isEqualTo(new DbState.Open(file()));
+    assertThat(get(failingService.close())).isEqualTo(new CloseResult.Closed(null));
+    assertThat(failingService.state()).isEqualTo(DbState.CLOSED);
+
+    assertThat(failingService.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+  }
+
+  @Test
   void subscriberErrorDoesNotLeaveIntermediateStateAndServiceKeepsWorking() {
     newDatabaseAt(file());
     var states = record();
@@ -475,6 +557,54 @@ class DatabaseServiceTest {
 
     // Сервис продолжает принимать операции
     assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+  }
+
+  @Test
+  void subscriberErrorOnOpenStateClosesDatabaseQuietlyAndServiceKeepsWorking() {
+    newDatabaseAt(file());
+    var states = record();
+    service
+        .states()
+        .subscribe(failingOnOpenState(new AssertionError("сбой подписчика на «открыта»")));
+
+    var open = service.open(file(), false);
+
+    // Ошибка доходит до вызывающего исключительно: будущее не завершается успехом
+    assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCauseInstanceOf(AssertionError.class);
+
+    // Полученная БД закрыта тихо, опубликовано «закрыта (внутренняя ошибка)»
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+    var closed = (DbState.Closed) service.state();
+    assertThat(closed.reason()).isEqualTo("внутренняя ошибка");
+    assertThat(closed.message()).contains("сбой подписчика");
+    assertThat(states)
+        .containsExactly(
+            DbState.CLOSED,
+            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Open(file()),
+            new DbState.Closed(closed.reason(), closed.message()));
+    assertReallyClosed(storage.opened.get(0));
+
+    // Последующие открытие и закрытие того же файла работают
+    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
+  }
+
+  @Test
+  void virtualMachineErrorFromSubscriberOnOpenIsPropagatedToCaller() {
+    newDatabaseAt(file());
+    service
+        .states()
+        .subscribe(failingOnOpenState(new StackOverflowError("тест: переполнение стека")));
+
+    var open = service.open(file(), false);
+
+    // Фатальная ошибка виртуальной машины не поглощается и доходит до вызывающего
+    assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCauseInstanceOf(StackOverflowError.class);
   }
 
   @Test
@@ -932,5 +1062,59 @@ class DatabaseServiceTest {
             new DbState.Open(file()),
             DbState.CLOSED);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  /**
+   * Хранилище поверх настоящих файлов БД: первый вызов {@code close} бросает сбой, не закрывая БД и
+   * не помечая её закрытой заранее; последующие вызовы закрывают по-настоящему.
+   */
+  private static final class FailingCloseStorage implements DatabaseService.Storage {
+
+    /** Открытые через это хранилище БД. */
+    final List<Database> opened = new CopyOnWriteArrayList<>();
+
+    /** Число вызовов {@code close}: тихий повтор сервиса проходит вторым вызовом. */
+    final AtomicInteger closeAttempts = new AtomicInteger();
+
+    /** Если задано, первый вызов {@code close} бросает сбой без закрытия БД. */
+    volatile boolean failFirstClose;
+
+    @Override
+    public Database.State inspect(Path file) {
+      return Database.inspect(file);
+    }
+
+    @Override
+    public Database open(Path file) {
+      return track(Database.open(file));
+    }
+
+    @Override
+    public Database create(Path file) {
+      return track(Database.create(file));
+    }
+
+    @Override
+    public Database initialize(Path file) {
+      return track(Database.initialize(file));
+    }
+
+    @Override
+    public void migrateWithBackup(Path file) {
+      Database.migrateWithBackup(file);
+    }
+
+    @Override
+    public void close(Database database) {
+      if (failFirstClose && closeAttempts.incrementAndGet() == 1) {
+        throw new IllegalStateException("сбой закрытия без пометки закрытой");
+      }
+      database.close();
+    }
+
+    private Database track(Database database) {
+      opened.add(database);
+      return database;
+    }
   }
 }

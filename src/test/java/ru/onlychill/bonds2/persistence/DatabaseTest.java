@@ -461,6 +461,25 @@ class DatabaseTest {
   }
 
   @Test
+  void registryReleasesFileEvenWhenCheckpointFails() throws SQLException {
+    var db = withCounter(Duration.ofMillis(100));
+
+    try (Connection reader = readerBehindWrite(db)) {
+      assertThatThrownBy(db::close)
+          .isInstanceOf(PersistenceException.class)
+          .hasMessageContaining("WAL")
+          .hasCauseInstanceOf(SQLException.class);
+    }
+
+    // Владение файлом снято и при сбое закрытия: служебная операция отвергает файл не реестром,
+    // а потому, что он не пуст
+    assertThatThrownBy(() -> Database.initialize(testFile()))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("Инициализация возможна только для пустого файла")
+        .hasMessageNotContaining("уже открыт");
+  }
+
+  @Test
   void closeGivesUpWalCheckpointAfterConfiguredBusyTimeout() throws SQLException {
     var db = withCounter(Duration.ofMillis(100));
 
@@ -511,7 +530,7 @@ class DatabaseTest {
     var real = new ArrayList<Connection>();
     var brokenClose =
         new Database(
-            SqliteSupport.url(testFile()),
+            testFile(),
             Database.DEFAULT_BUSY_TIMEOUT,
             (url, props) -> {
               Connection connection = SqliteSupport.connect(url, props);
@@ -547,7 +566,7 @@ class DatabaseTest {
     var real = new ArrayList<Connection>();
     var brokenCommitAndClose =
         new Database(
-            SqliteSupport.url(testFile()),
+            testFile(),
             Database.DEFAULT_BUSY_TIMEOUT,
             (url, props) -> {
               Connection connection = SqliteSupport.connect(url, props);

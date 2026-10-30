@@ -326,6 +326,9 @@ public final class DatabaseService {
               + " при следующем открытии.";
     } catch (RuntimeException | Error e) {
       LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при закрытии БД", e);
+      // Тихая повторная попытка закрыть эту же БД: соединение не остаётся висеть у драйвера;
+      // успех повтора не подменяет исходную ошибку, сбой повтора журналируется в closeQuietly
+      closeQuietly(opened);
       OpenResult.Failed failure = failed(OpenFailures.unexpected(e));
       return new CloseResult.Failed(failure.message());
     }
@@ -368,7 +371,19 @@ public final class DatabaseService {
           return lateRejected(attempt);
         }
         database = opened;
-        publish(new DbState.Open(file));
+        try {
+          publish(new DbState.Open(file));
+        } catch (Error e) {
+          // Ошибка подписчика не должна терять БД: освобождаем владельца и закрываем полученную
+          // БД тихо; исходная ошибка пробрасывается в страховку submit и не поглощается
+          database = null;
+          try {
+            closeQuietly(opened);
+          } catch (Error fatal) {
+            e.addSuppressed(fatal);
+          }
+          throw e;
+        }
         return result;
       }
       case OpenResult.NeedsMigration result -> {
