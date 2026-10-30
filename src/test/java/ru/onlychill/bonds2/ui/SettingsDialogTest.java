@@ -8,6 +8,7 @@ import static ru.onlychill.bonds2.ui.FxToolkit.runOnFxThread;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -18,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javafx.application.Platform;
+import javafx.stage.WindowEvent;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -181,6 +183,74 @@ class SettingsDialogTest {
   }
 
   @Test
+  void cancelDuringWriteIsIgnoredAndWindowStaysBlocked() {
+    var pending = new CompletableFuture<Void>();
+    var dialogBox = new SettingsDialog[1];
+    runOnFxThread(
+        () -> {
+          var dialog =
+              new SettingsDialog(
+                  null, Settings.defaults(), dir.resolve("default/bonds2.db"), settings -> pending);
+          dialog.pathField().setText(dir.resolve("h.db").toString());
+          dialog.show();
+          dialog.save();
+
+          // Отмена во время записи игнорируется: окно остаётся открытым
+          dialog.cancel();
+          assertThat(dialog.isShowing()).isTrue();
+
+          // На время записи управляющие элементы отключены
+          assertThat(dialog.saveButton().isDisabled()).isTrue();
+          assertThat(dialog.cancelButton().isDisabled()).isTrue();
+          assertThat(dialog.browseButton().isDisabled()).isTrue();
+          assertThat(dialog.pathField().isDisabled()).isTrue();
+          assertThat(dialog.autoOpenBox().isDisabled()).isTrue();
+
+          // Запрос закрытия окна (крестик) во время записи тоже игнорируется
+          var stage = dialog.stage();
+          stage.fireEvent(new WindowEvent(stage, WindowEvent.WINDOW_CLOSE_REQUEST));
+          assertThat(dialog.isShowing()).isTrue();
+
+          dialogBox[0] = dialog;
+        });
+
+    // Запись завершена: окно закрывается
+    pending.complete(null);
+    runOnFxThread(() -> assertThat(dialogBox[0].isShowing()).isFalse());
+    hideAllWindows();
+  }
+
+  @Test
+  void saveDuringWriteIsIgnoredAndSaverInvokedOnce() {
+    var pending = new CompletableFuture<Void>();
+    var calls = new CopyOnWriteArrayList<Settings>();
+    runOnFxThread(
+        () -> {
+          var dialog =
+              new SettingsDialog(
+                  null,
+                  Settings.defaults(),
+                  dir.resolve("default/bonds2.db"),
+                  settings -> {
+                    calls.add(settings);
+                    return pending;
+                  });
+          dialog.pathField().setText(dir.resolve("i.db").toString());
+          dialog.show();
+          dialog.save();
+
+          // Повторное сохранение во время записи игнорируется: и программно, и кнопкой
+          dialog.save();
+          dialog.saveButton().fire();
+
+          assertThat(calls).hasSize(1);
+        });
+
+    pending.complete(null);
+    hideAllWindows();
+  }
+
+  @Test
   void saveClosesWindowOnlyAfterWriteCompletes() {
     var pending = new CompletableFuture<Void>();
     var recorded = new ArrayList<Settings>();
@@ -217,12 +287,23 @@ class SettingsDialogTest {
   @Test
   void failedWriteCompletionKeepsWindowOpenAndShowsReason() {
     var failing = new CompletableFuture<Void>();
+    // После ошибки запись можно повторить: вторая будущность успешна
+    var futures =
+        new ArrayDeque<CompletableFuture<Void>>(
+            List.of(failing, CompletableFuture.completedFuture(null)));
+    var calls = new CopyOnWriteArrayList<Settings>();
     var dialogBox = new SettingsDialog[1];
     runOnFxThread(
         () -> {
           var dialog =
               new SettingsDialog(
-                  null, Settings.defaults(), dir.resolve("default/bonds2.db"), settings -> failing);
+                  null,
+                  Settings.defaults(),
+                  dir.resolve("default/bonds2.db"),
+                  settings -> {
+                    calls.add(settings);
+                    return futures.poll();
+                  });
           dialog.pathField().setText(dir.resolve("f.db").toString());
           dialog.show();
           dialog.save();
@@ -235,16 +316,34 @@ class SettingsDialogTest {
 
     runOnFxThread(
         () -> {
+          // Окно осталось открытым, причина показана
           assertThat(dialogBox[0].isShowing()).isTrue();
           assertThat(dialogBox[0].errorMessage())
               .contains("Не удалось сохранить настройки")
               .contains("Permission denied");
+          // Управляющие элементы снова активны
+          assertThat(dialogBox[0].saveButton().isDisabled()).isFalse();
+          assertThat(dialogBox[0].cancelButton().isDisabled()).isFalse();
+          assertThat(dialogBox[0].browseButton().isDisabled()).isFalse();
+          assertThat(dialogBox[0].pathField().isDisabled()).isFalse();
+          assertThat(dialogBox[0].autoOpenBox().isDisabled()).isFalse();
+
+          // Повторное сохранение после ошибки работает
+          dialogBox[0].save();
+          assertThat(calls).hasSize(2);
+        });
+
+    // Повторная запись успешна: окно закрыто, ошибок нет
+    runOnFxThread(
+        () -> {
+          assertThat(dialogBox[0].isShowing()).isFalse();
+          assertThat(dialogBox[0].errorMessage()).isEmpty();
         });
     hideAllWindows();
   }
 
   @Test
-  void twoQuickSavesAreSequentialOnOneSettingsThread() throws InterruptedException {
+  void saveDuringWriteIsIgnoredAndWriteRunsOnSettingsThread() throws InterruptedException {
     var writes =
         Executors.newSingleThreadExecutor(
             runnable -> {
@@ -254,7 +353,6 @@ class SettingsDialogTest {
             });
     var firstEntered = new CountDownLatch(1);
     var releaseFirst = new CountDownLatch(1);
-    var secondEntered = new CountDownLatch(1);
     var writeThreads = new CopyOnWriteArrayList<Thread>();
     var store = new SettingsStore(dir.resolve("cfg/settings.properties"));
     Executor queued =
@@ -262,12 +360,8 @@ class SettingsDialogTest {
             writes.execute(
                 () -> {
                   writeThreads.add(Thread.currentThread());
-                  if (firstEntered.getCount() > 0) {
-                    firstEntered.countDown();
-                    await(releaseFirst);
-                  } else {
-                    secondEntered.countDown();
-                  }
+                  firstEntered.countDown();
+                  await(releaseFirst);
                   task.run();
                 });
     var db =
@@ -288,17 +382,17 @@ class SettingsDialogTest {
           dialog.pathField().setText(dir.resolve("g.db").toString());
           dialog.show();
           dialogBox[0] = dialog;
-          // Два быстрых «Сохранить»: первая запись удержана внутри исполнителя
+          // Первая запись удержана внутри исполнителя, вторая игнорируется: окно заблокировано
           dialog.save();
           dialog.save();
+          assertThat(dialog.saveButton().isDisabled()).isTrue();
         });
 
     assertThat(firstEntered.await(10, TimeUnit.SECONDS)).isTrue();
-    // Первая запись удержана: вторая не начинается — записи не идут параллельно
-    assertThat(secondEntered.await(300, TimeUnit.MILLISECONDS)).isFalse();
+    // Первая запись удержана: вторая не началась — во время записи сохранение невозможно
+    assertThat(writeThreads).hasSize(1);
 
     releaseFirst.countDown();
-    assertThat(secondEntered.await(10, TimeUnit.SECONDS)).isTrue();
 
     // Окно закрыто по завершении записи, ошибки нет
     assertThat(
@@ -311,9 +405,8 @@ class SettingsDialogTest {
         .isTrue();
     runOnFxThread(() -> assertThat(dialogBox[0].errorMessage()).isEmpty());
 
-    // Обе записи прошли последовательно на одном потоке-демоне исполнителя
-    assertThat(writeThreads).hasSize(2);
-    assertThat(writeThreads.get(0)).isSameAs(writeThreads.get(1));
+    // Ровно одна запись, и она прошла на потоке-демоне исполнителя
+    assertThat(writeThreads).hasSize(1);
     assertThat(writeThreads.get(0).getName()).isEqualTo(DatabaseController.SETTINGS_THREAD_NAME);
     assertThat(store.load().settings()).isEqualTo(new Settings(dir.resolve("g.db"), true));
 

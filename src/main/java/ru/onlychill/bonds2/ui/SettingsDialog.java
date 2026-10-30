@@ -22,6 +22,7 @@ import javafx.stage.FileChooser;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
 import javafx.stage.Window;
+import javafx.stage.WindowEvent;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.dbservice.ErrorMessages;
 import ru.onlychill.bonds2.settings.Settings;
@@ -32,8 +33,10 @@ import ru.onlychill.bonds2.settings.SettingsValidator;
  * «Отмена».
  *
  * <p>Проверку пути делает {@link SettingsValidator}, сохранение — переданный обработчик на фоновом
- * потоке. Окно закрывается только после завершения записи; если запись не удалась, окно остаётся
- * открытым и показывает причину.
+ * потоке. Окно закрывается только после завершения записи, и всё время записи оно заблокировано:
+ * кнопки и поля отключены, закрытие через крестик и «Отмена» игнорируются, повторное сохранение
+ * невозможно. Если запись не удалась, окно остаётся открытым, элементы снова активны и показывается
+ * причина ошибки.
  */
 final class SettingsDialog {
 
@@ -44,7 +47,13 @@ final class SettingsDialog {
   private final TextField pathField = new TextField();
   private final CheckBox autoOpenBox = new CheckBox("Открывать базу при запуске");
   private final Label errorLabel = new Label();
+  private final Button browseButton = new Button("Обзор…");
+  private final Button saveButton = new Button("Сохранить");
+  private final Button cancelButton = new Button("Отмена");
   private final Function<Settings, CompletableFuture<Void>> saver;
+
+  /** Идёт фоновая запись: до её завершения окно заблокировано. */
+  private boolean saving;
 
   /**
    * @param owner главное окно, над которым открывается диалог
@@ -64,7 +73,6 @@ final class SettingsDialog {
     Path path = current.databasePath();
     pathField.setText(path == null ? "" : path.toString());
     HBox.setHgrow(pathField, Priority.ALWAYS);
-    var browseButton = new Button("Обзор…");
     browseButton.setOnAction(event -> browse());
     var pathRow = new HBox(8, pathField, browseButton);
 
@@ -84,10 +92,8 @@ final class SettingsDialog {
     errorLabel.setMaxWidth(WRAP_WIDTH);
     errorLabel.setStyle("-fx-text-fill: firebrick;");
 
-    var saveButton = new Button("Сохранить");
     saveButton.setDefaultButton(true);
     saveButton.setOnAction(event -> save());
-    var cancelButton = new Button("Отмена");
     cancelButton.setCancelButton(true);
     cancelButton.setOnAction(event -> cancel());
     var buttons = new HBox(8, saveButton, cancelButton);
@@ -123,9 +129,13 @@ final class SettingsDialog {
   /**
    * «Сохранить»: проверяет путь и передаёт настройки обработчику; окно закрывается только после
    * завершения записи. Ошибка проверки или записи показывается в окне, настройки при этом не
-   * меняются.
+   * меняются. Пока запись идёт, окно заблокировано: повторный вызов ничего не делает.
    */
   void save() {
+    // Повторный вызов во время записи игнорируется: кнопка отключена, а это страховка
+    if (saving) {
+      return;
+    }
     String text = pathField.getText();
     Optional<String> problem = SettingsValidator.validateDatabasePath(text);
     if (problem.isPresent()) {
@@ -133,19 +143,23 @@ final class SettingsDialog {
       return;
     }
     errorLabel.setText("");
-    CompletableFuture<Void> saving;
+    CompletableFuture<Void> write;
     try {
-      saving =
-          saver.apply(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
+      write = saver.apply(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
     } catch (UncheckedIOException e) {
       errorLabel.setText(ErrorMessages.of(e));
       return;
     }
-    // Запись идёт в фоне: закрытие и ошибка — по её завершении в потоке JavaFX
-    saving.whenComplete(
+    // Запись идёт в фоне: блокируем окно, чтобы её нельзя было прервать или запустить заново
+    setBusy(true);
+    stage.setOnCloseRequest(WindowEvent::consume);
+    write.whenComplete(
         (value, error) ->
             Platform.runLater(
                 () -> {
+                  // Сначала снимаем блокировку и перехват закрытия: окно снова активно
+                  stage.setOnCloseRequest(null);
+                  setBusy(false);
                   if (error != null) {
                     errorLabel.setText(ErrorMessages.of(error));
                   } else {
@@ -154,9 +168,25 @@ final class SettingsDialog {
                 }));
   }
 
-  /** «Отмена» и закрытие окна: настройки не меняются. */
+  /**
+   * «Отмена» и закрытие окна: настройки не меняются. Пока идёт запись, отменить нельзя: окно
+   * блокируется до завершения записи, поэтому вызов ничего не делает.
+   */
   void cancel() {
+    if (saving) {
+      return;
+    }
     stage.close();
+  }
+
+  /** Блокирует или разблокирует управляющие элементы окна на время записи. */
+  private void setBusy(boolean busy) {
+    saving = busy;
+    saveButton.setDisable(busy);
+    cancelButton.setDisable(busy);
+    browseButton.setDisable(busy);
+    pathField.setDisable(busy);
+    autoOpenBox.setDisable(busy);
   }
 
   /** Текст ошибки; пустой, если ошибки нет. */
@@ -170,6 +200,26 @@ final class SettingsDialog {
 
   CheckBox autoOpenBox() {
     return autoOpenBox;
+  }
+
+  /** Окно диалога; используется тестами для имитации запроса закрытия. */
+  Stage stage() {
+    return stage;
+  }
+
+  /** Кнопка «Сохранить»; используется тестами. */
+  Button saveButton() {
+    return saveButton;
+  }
+
+  /** Кнопка «Отмена»; используется тестами. */
+  Button cancelButton() {
+    return cancelButton;
+  }
+
+  /** Кнопка «Обзор…»; используется тестами. */
+  Button browseButton() {
+    return browseButton;
   }
 
   private void browse() {
