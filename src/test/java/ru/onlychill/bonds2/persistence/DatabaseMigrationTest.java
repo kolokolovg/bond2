@@ -16,6 +16,7 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,6 +25,7 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.stream.Stream;
@@ -99,6 +101,57 @@ class DatabaseMigrationTest {
     assertThatThrownBy(() -> BackupManager.verifyBackup(copy))
         .isInstanceOf(MigrationException.class)
         .hasMessageContaining("целостности");
+    assertThat(copy).doesNotExist();
+  }
+
+  @Test
+  void databaseRemovedBeforeBackupFailsMigrationWithoutEmptyFiles() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Шов — часы копии: файл БД удаляется после распознавания состояния, но до VACUUM INTO
+    Clock clock =
+        new Clock() {
+          @Override
+          public Instant instant() {
+            try {
+              Files.deleteIfExists(file);
+            } catch (IOException e) {
+              throw new UncheckedIOException(e);
+            }
+            return CLOCK.instant();
+          }
+
+          @Override
+          public ZoneId getZone() {
+            return CLOCK.getZone();
+          }
+
+          @Override
+          public Clock withZone(ZoneId zone) {
+            return this;
+          }
+        };
+
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, clock, NEW_OK))
+        .isInstanceOf(MigrationException.class)
+        .hasMessageContaining("резервную копию")
+        .hasCauseInstanceOf(SQLException.class);
+
+    // Пустой файл не появляется ни на месте БД, ни на месте копии
+    assertThat(file).doesNotExist();
+    assertThat(backupsOf(file)).isEmpty();
+  }
+
+  @Test
+  void backupRemovedBeforeVerificationFailsWithItsPathAndNoNewFileAppears() throws Exception {
+    Path copy = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "v");
+    // Копия исчезает между созданием и проверкой целостности
+    Files.delete(copy);
+
+    assertThatThrownBy(() -> BackupManager.verifyBackup(copy))
+        .isInstanceOf(MigrationException.class)
+        .hasMessageContaining(BACKUP_NAME);
+
+    // Новый файл на месте копии не появляется
     assertThat(copy).doesNotExist();
   }
 
@@ -396,9 +449,36 @@ class DatabaseMigrationTest {
   }
 
   @Test
+  void failedWalTransferKeepsSidecarsAndCommittedDataIsAvailableOnReopen() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
+    // Читатель держит снимок: перенос WAL невозможен, зафиксированные данные остаются только в WAL
+    try (Connection reader = DriverManager.getConnection("jdbc:sqlite:" + file)) {
+      reader.setAutoCommit(false);
+      queryLong(reader, "SELECT count(*) FROM app_info");
+      executeSql(file, "UPDATE app_info SET value = 'in-wal' WHERE key = 'k'");
+      assertThat(Files.readString(file, StandardCharsets.ISO_8859_1)).doesNotContain("in-wal");
+      Path wal = sibling(file, "-wal");
+
+      MigrationException failure =
+          BackupManager.restore(file, backup, new IllegalStateException("миграция"));
+
+      assertThat(failure).hasMessageContaining("вручную").hasMessageContaining(BACKUP_NAME);
+      // Сайдкары не удалены до успешного переноса: WAL цел, данные в нём
+      assertThat(wal).exists();
+      assertThat(Files.readString(wal, StandardCharsets.ISO_8859_1)).contains("in-wal");
+      assertThat(namesInDir()).contains("app.db", "app.db-wal", BACKUP_NAME);
+      assertThat(namesInDir()).noneMatch(name -> name.contains(".restore"));
+    }
+    // Данные из WAL доступны при повторном открытии
+    assertThat(valueOf(file, OLD)).isEqualTo("in-wal");
+  }
+
+  @Test
   void failedReplacementKeepsDatabaseNamesBackupAndLeavesNoTempFile() throws Exception {
     Path backup = Files.writeString(dir.resolve(BACKUP_NAME), "копия");
-    // Занятый каталогом путь БД: атомарно заменить его файлом нельзя ни на одной из систем
+    // Занятый каталогом путь БД — SQLite не может открыть каталог, сбой происходит на шаге
+    // переноса WAL, до замены файла
     Path file = Files.createDirectory(dir.resolve("app.db"));
     Files.writeString(file.resolve("keep.txt"), "не трогать");
     var cause = new IllegalStateException("миграция");
@@ -406,8 +486,8 @@ class DatabaseMigrationTest {
     MigrationException failure = BackupManager.restore(file, backup, cause);
 
     assertThat(failure).hasMessageContaining(backup.toString()).hasMessageContaining("вручную");
-    // Причина сбоя замены прикладывается к исходной ошибке миграции
-    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(IOException.class);
+    // Причина сбоя переноса WAL прикладывается к исходной ошибке миграции
+    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(SQLException.class);
     assertThat(file).isDirectory();
     assertThat(file.resolve("keep.txt")).hasContent("не трогать");
     assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);

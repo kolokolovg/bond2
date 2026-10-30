@@ -943,7 +943,8 @@ class DatabaseControllerTest {
     assertThat(stopping).isNotDone();
 
     storage.migrateGate.release();
-    assertThat(stopping).succeedsWithin(Duration.ofSeconds(30));
+    // Реальный drain при остановке во время миграции: бюджет ниже дедлайнов pitest-миньона
+    assertThat(stopping).succeedsWithin(Duration.ofSeconds(10));
     ui.settle();
 
     assertThat(Database.inspect(userFile())).isEqualTo(Database.State.UP_TO_DATE);

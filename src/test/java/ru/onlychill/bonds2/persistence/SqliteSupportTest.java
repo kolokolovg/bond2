@@ -35,6 +35,14 @@ class SqliteSupportTest {
     }
   }
 
+  private static String journalMode(Connection c) throws SQLException {
+    try (var st = c.createStatement();
+        var rs = st.executeQuery("PRAGMA journal_mode")) {
+      rs.next();
+      return rs.getString(1);
+    }
+  }
+
   /**
    * Читатель держит снимок до записи, сделанной другим соединением: WAL нельзя перенести в основной
    * файл. Соединение читателя закрывает вызывающий.
@@ -69,6 +77,45 @@ class SqliteSupportTest {
     assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isNull();
     assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("synchronous")).isNull();
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous")).isNull();
+  }
+
+  @Test
+  void serviceConnectionsDoNotSetJournalMode() {
+    // Режим журнала файла остаётся его собственным: соединение проверки или копии его не меняет
+    var timeout = Duration.ofMillis(100);
+    assertThat(SqliteSupport.maintenanceProperties().getProperty("journal_mode")).isNull();
+    assertThat(SqliteSupport.maintenanceProperties(timeout).getProperty("journal_mode")).isNull();
+    assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("journal_mode")).isNull();
+  }
+
+  @Test
+  void maintenanceConnectionToMissingFileFailsWithoutCreatingIt() {
+    Path file = dir.resolve("missing.db");
+    String url = SqliteSupport.url(file);
+
+    assertThatThrownBy(
+            () ->
+                SqliteSupport.connect(
+                    url, SqliteSupport.maintenanceProperties(Duration.ofMillis(100))))
+        .isInstanceOf(SQLException.class);
+    assertThat(file).doesNotExist();
+    assertThat(sibling(file, "-wal")).doesNotExist();
+    assertThat(sibling(file, "-journal")).doesNotExist();
+  }
+
+  @Test
+  void maintenanceConnectionKeepsWalModeOfExistingFile() throws SQLException {
+    Path file = createDatabase();
+
+    try (Connection c =
+        SqliteSupport.connect(SqliteSupport.url(file), SqliteSupport.maintenanceProperties())) {
+      assertThat(journalMode(c)).isEqualToIgnoringCase("wal");
+    }
+    // Режим журнала файла не изменился и после закрытия служебного соединения
+    try (Connection c =
+        SqliteSupport.connect(SqliteSupport.url(file), SqliteSupport.maintenanceProperties())) {
+      assertThat(journalMode(c)).isEqualToIgnoringCase("wal");
+    }
   }
 
   @Test

@@ -72,7 +72,8 @@ final class SqliteSupport {
 
   /**
    * Настройки служебных соединений (проверки, копия): не переводят файл в WAL и не меняют его,
-   * ожидание блокировки — по умолчанию.
+   * ожидание блокировки — по умолчанию. Файл открывается только существующим, поэтому удалённый или
+   * перемещённый файл БД даёт ошибку открытия, а пустой файл на его месте не появляется.
    */
   static Properties maintenanceProperties() {
     return maintenanceProperties(Database.DEFAULT_BUSY_TIMEOUT);
@@ -80,6 +81,7 @@ final class SqliteSupport {
 
   static Properties maintenanceProperties(Duration busyTimeout) {
     var config = new SQLiteConfig();
+    existingFileOnly(config);
     config.setBusyTimeout((int) busyTimeout.toMillis());
     return config.toProperties();
   }

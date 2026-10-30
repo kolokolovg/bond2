@@ -22,6 +22,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -50,8 +52,14 @@ class DatabaseServiceTest {
   }
 
   private static <T> T get(CompletableFuture<T> future) {
+    // Дефолтный бюджет меньше pitest-пола таймаута (~3 с): зависший на мутанте тест
+    // падает сам как обычный failure, не вынуждая pitest перезапускать миньона
+    return get(future, Duration.ofSeconds(2));
+  }
+
+  private static <T> T get(CompletableFuture<T> future, Duration budget) {
     try {
-      return future.get(30, TimeUnit.SECONDS);
+      return future.get(budget.toMillis(), TimeUnit.MILLISECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IllegalStateException(e);
@@ -420,7 +428,9 @@ class DatabaseServiceTest {
     get(service.open(file(), false));
     var results = new CopyOnWriteArrayList<CloseResult>();
 
-    TestDatabases.whileReaderLagsBehind(file(), () -> results.add(get(service.close())));
+    // Реальное ожидание busy-timeout SQLite при закрытии — щедрый явный бюджет
+    TestDatabases.whileReaderLagsBehind(
+        file(), () -> results.add(get(service.close(), Duration.ofSeconds(10))));
 
     assertThat(results).hasSize(1);
     assertThat(results.get(0)).isInstanceOf(CloseResult.Closed.class);
@@ -678,5 +688,133 @@ class DatabaseServiceTest {
     assertThat(result).isEqualTo(ShutdownResult.REFUSED);
     assertThat(get(open)).isEqualTo(new OpenResult.NeedsMigration(file()));
     assertThat(get(service.migrate())).isEqualTo(new OpenResult.Opened(file()));
+  }
+
+  @Test
+  void operationRacingShutdownNeverSucceedsAfterStopCompletes() throws Exception {
+    // Стресс: постановка операции и начало остановки конкурентны; ни одна операция не
+    // возвращает успех после завершения остановки STOPPED
+    for (int attempt = 0; attempt < 50; attempt++) {
+      GatedStorage racingStorage = new GatedStorage();
+      DatabaseService racing = new DatabaseService(racingStorage);
+      try {
+        var open = new AtomicReference<CompletableFuture<OpenResult>>();
+        var publishedBeforeStop = new AtomicBoolean();
+        var opener =
+            new Thread(
+                () -> {
+                  var future = racing.open(file(), false);
+                  open.set(future);
+                });
+        opener.start();
+        var shutdown = racing.shutdownAsync(Duration.ofSeconds(30));
+        // Момент публикации STOPPED: результат принятой операции обязан быть опубликован
+        // раньше. Порядок выполнения внешних слушателей ненадёжен — проверяем саму
+        // будущность операции. Ссылки ещё нет — операция не была принята до остановки.
+        shutdown.whenComplete(
+            (result, error) -> {
+              CompletableFuture<OpenResult> future = open.get();
+              publishedBeforeStop.set(future == null || future.isDone());
+            });
+        opener.join();
+
+        assertThat(get(shutdown)).isEqualTo(ShutdownResult.STOPPED);
+        var result = get(open.get());
+        // Успех (в том числе «файл не найден») допустим, только если результат операции
+        // опубликован до STOPPED; после STOPPED — исключительно отклонение
+        if (!(result instanceof OpenResult.Rejected)) {
+          assertThat(publishedBeforeStop.get())
+              .as("попытка %d: успех опубликован после STOPPED", attempt)
+              .isTrue();
+        }
+      } finally {
+        racing.shutdown(Duration.ofSeconds(30));
+      }
+    }
+  }
+
+  @Test
+  void lateNeedsMigrationAfterStopTimeoutIsNotPublishedAndOpensNothing()
+      throws SQLException, InterruptedException {
+    TestDatabases.outdatedAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var states = record();
+
+    assertThat(get(service.shutdownAsync(Duration.ofMillis(50))))
+        .isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+
+    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    // «Ожидает решения о миграции» не публикуется, БД не открывается
+    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(storage.opened).isEmpty();
+  }
+
+  @Test
+  void lateFailureAfterStopTimeoutIsNotPublishedAndOpensNothing()
+      throws SQLException, InterruptedException {
+    TestDatabases.tooNewAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var states = record();
+
+    assertThat(get(service.shutdownAsync(Duration.ofMillis(50))))
+        .isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+
+    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    // Состояние по ошибке не публикуется, БД не открывается
+    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(storage.opened).isEmpty();
+  }
+
+  @Test
+  void lateUnexpectedErrorAfterStopTimeoutIsNotPublished() throws Exception {
+    newDatabaseAt(file());
+    storage.openFailure = new IllegalStateException("сбой");
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var states = record();
+
+    assertThat(get(service.shutdownAsync(Duration.ofMillis(50))))
+        .isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+
+    assertThat(get(open)).isInstanceOf(OpenResult.Rejected.class);
+    // Состояние «внутренняя ошибка» не публикуется: сервис уже остановлен
+    assertThat(states).containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+  }
+
+  @Test
+  void repeatedShutdownWithShorterTimeoutDoesNotAbandonOperation()
+      throws SQLException, InterruptedException {
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var states = record();
+
+    var first = service.shutdownAsync(Duration.ofSeconds(30));
+    // Повторная остановка с меньшим сроком истекает раньше, но не помечает операцию покинутой
+    assertThat(service.shutdown(Duration.ofMillis(50))).isEqualTo(ShutdownResult.TIMED_OUT);
+
+    storage.openGate.release();
+
+    // Операция завершается штатно в пределах срока первой остановки, состояние публикуется
+    assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(first)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(states)
+        .containsExactly(
+            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Open(file()),
+            DbState.CLOSED);
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 }

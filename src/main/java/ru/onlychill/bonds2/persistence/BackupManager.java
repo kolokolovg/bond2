@@ -4,10 +4,13 @@ package ru.onlychill.bonds2.persistence;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.LocalDateTime;
@@ -118,10 +121,17 @@ final class BackupManager {
   }
 
   /**
-   * Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. Пакетный доступ нужен
-   * тестам: копию, которую создал {@code VACUUM INTO}, проверочный отказ напрямую не получить.
+   * Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. Отсутствующий файл копии
+   * — тоже ошибка: проверка начинается с наличия, чтобы исчезнувшая копия не «проходила» проверку
+   * по заново созданному пустому файлу. Пакетный доступ нужен тестам: копию, которую создал {@code
+   * VACUUM INTO}, проверочный отказ напрямую не получить.
    */
   static void verifyBackup(Path backup) {
+    if (Files.notExists(backup)) {
+      throw new MigrationException(
+          "Резервная копия не найдена, миграция не выполнена: " + backup,
+          new NoSuchFileException(backup.toString()));
+    }
     String result;
     try {
       result = SqliteSupport.integrityCheck(SqliteSupport.url(backup));
@@ -196,19 +206,28 @@ final class BackupManager {
   /**
    * Возвращает файл БД к состоянию резервной копии после неудачной миграции. К этому моменту
    * соединения Flyway уже закрыты. Копия сначала переносится во временный файл рядом с БД (в том же
-   * каталоге, чтобы перемещение оставалось в пределах одной файловой системы). Затем удаляются
-   * служебные файлы WAL и журнала, и временный файл атомарно заменяет БД, поэтому частично
-   * записанная копия никогда не окажется на месте БД. При сбое временный файл удаляется, а ошибка
-   * несёт путь к копии для ручного восстановления. Пакетный доступ нужен тестам.
+   * каталоге, чтобы перемещение оставалось в пределах одной файловой системы) и сбрасывается на
+   * диск — потеря питания сразу после замены не оставит укороченный файл. Затем зафиксированные
+   * транзакции переносятся из WAL в основной файл ({@code wal_checkpoint(TRUNCATE)}), делая его
+   * самодостаточным, удаляются служебные файлы WAL и журнала, и временный файл атомарно заменяет
+   * БД; поэтому неудача замены не теряет зафиксированные транзакции, а частично записанная копия
+   * никогда не окажется на месте БД. Если основной файл удалён снаружи, перенос WAL завершается
+   * ошибкой и откат прерывается. При сбое временный файл удаляется, а ошибка несёт путь к копии для
+   * ручного восстановления. Пакетный доступ нужен тестам.
    */
   static MigrationException restore(Path file, Path backup, RuntimeException cause) {
     Path staged = null;
     try {
       staged = Files.createTempFile(directoryOf(file), file.getFileName() + ".", ".restore");
       Files.copy(backup, staged, StandardCopyOption.REPLACE_EXISTING);
+      // Канал закрывается до перемещения: на Windows перемещение открытого файла ненадёжно
+      try (FileChannel channel = FileChannel.open(staged, StandardOpenOption.WRITE)) {
+        channel.force(true);
+      }
+      SqliteSupport.checkpoint(SqliteSupport.url(file), Database.DEFAULT_BUSY_TIMEOUT);
       SqliteSupport.deleteSidecars(file);
       Files.move(staged, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException e) {
+    } catch (IOException | SQLException e) {
       cause.addSuppressed(e);
       if (staged != null) {
         SqliteSupport.deleteQuietly(staged, cause);

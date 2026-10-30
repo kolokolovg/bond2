@@ -71,7 +71,11 @@ public final class DatabaseService {
   /** Остановка начата: новые операции отклоняются. */
   private volatile boolean stopping;
 
-  /** Вызывающий перестал ждать остановку: запоздавшая БД закрывается без публикации. */
+  /**
+   * Вызывающий перестал ждать остановку: любой запоздавший результат операции не публикуется, а
+   * полученная БД закрывается тихо. Единственный постановщик — таймаут исходной {@code
+   * shutdownAsync}; повторные остановки его не трогают.
+   */
   private volatile boolean abandoned;
 
   /** Открытая БД; трогается только потоком жизненного цикла. */
@@ -131,7 +135,9 @@ public final class DatabaseService {
   /**
    * Останавливает сервис и ждёт не дольше {@code timeout}: обёртка над {@link
    * #shutdownAsync(Duration)}. Вызов блокирует вызывающего, поэтому из потока интерфейса его
-   * применять не следует.
+   * применять не следует. «Покинутость» операции определяет только исходная {@code shutdownAsync}
+   * по истечении собственного срока: повторная остановка с меньшим сроком лишь возвращает
+   * собственное наблюдение {@link ShutdownResult#TIMED_OUT}.
    */
   public ShutdownResult shutdown(Duration timeout) {
     CompletableFuture<ShutdownResult> done = shutdownAsync(timeout);
@@ -145,7 +151,6 @@ public final class DatabaseService {
       LOG.log(System.Logger.Level.WARNING, "Остановка сервиса БД завершилась ошибкой", e);
       return ShutdownResult.STOPPED;
     }
-    abandoned = true;
     return ShutdownResult.TIMED_OUT;
   }
 
@@ -217,23 +222,32 @@ public final class DatabaseService {
     }
   }
 
-  /** Ставит работу в очередь потока жизненного цикла; после остановки отклоняет. */
+  /**
+   * Ставит работу в очередь потока жизненного цикла; после остановки отклоняет. Проверка {@code
+   * stopping} и постановка выполняются под общим с {@code shutdownAsync} замком, поэтому атомарны
+   * относительно начала остановки: задача либо встала в очередь раньше остановки и исполнитель FIFO
+   * успеет выполнить её до {@code runShutdown}, либо отклонена. Замок неконкурентен всю жизнь
+   * процесса, кроме момента остановки; постановок из потока жизненного цикла нет, взаимоблокировки
+   * не возникает.
+   */
   private <T> CompletableFuture<T> submit(Supplier<T> work, Function<String, T> rejection) {
-    if (stopping) {
-      return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
-    }
     var result = new CompletableFuture<T>();
-    try {
-      executor.execute(
-          () -> {
-            try {
-              result.complete(work.get());
-            } catch (RuntimeException | Error e) {
-              result.completeExceptionally(e);
-            }
-          });
-    } catch (RejectedExecutionException e) {
-      return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
+    synchronized (shutdownLock) {
+      if (stopping) {
+        return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
+      }
+      try {
+        executor.execute(
+            () -> {
+              try {
+                result.complete(work.get());
+              } catch (RuntimeException | Error e) {
+                result.completeExceptionally(e);
+              }
+            });
+      } catch (RejectedExecutionException e) {
+        return CompletableFuture.completedFuture(rejection.apply(MESSAGE_STOPPED));
+      }
     }
     return result;
   }
@@ -308,7 +322,9 @@ public final class DatabaseService {
   /**
    * Выполняет попытку и публикует её итог. Любой сбой среды выполнения превращается в «внутреннюю
    * ошибку» с публикацией «закрыта»: поток жизненного цикла не завершается. Фатальные ошибки
-   * виртуальной машины пробрасываются без поглощения.
+   * виртуальной машины пробрасываются без поглощения. Если вызывающий перестал ждать остановку
+   * ({@code abandoned}), никакой результат не публикуется — ни «нужна миграция», ни ошибка:
+   * полученная БД закрывается тихо, вызывающий получает отклонение остановленного сервиса.
    */
   private OpenResult finish(Path file, Supplier<Attempt> operation) {
     Attempt attempt;
@@ -318,18 +334,23 @@ public final class DatabaseService {
       throw e;
     } catch (RuntimeException | Error e) {
       LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при работе с БД: " + file, e);
+      if (abandoned) {
+        return new OpenResult.Rejected(MESSAGE_STOPPED);
+      }
       return failed(OpenFailures.unexpected(e));
     }
     Database opened = attempt.database();
+    if (abandoned) {
+      // Остановка уже не ждёт: результат не публикуется, БД закрывается тихо
+      if (opened != null) {
+        closeQuietly(opened);
+      }
+      return new OpenResult.Rejected(MESSAGE_STOPPED);
+    }
     switch (attempt.result()) {
       case OpenResult.Opened result -> {
         if (opened == null) {
           throw new IllegalStateException("Открытая БД не передана");
-        }
-        if (abandoned) {
-          // Остановка уже не ждёт: БД закрывается, состояние не публикуется
-          closeQuietly(opened);
-          return new OpenResult.Rejected(MESSAGE_STOPPED);
         }
         database = opened;
         publish(new DbState.Open(file));

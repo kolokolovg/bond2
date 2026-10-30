@@ -121,11 +121,15 @@ pitest {
     pitestVersion = "1.30.1"
     junit5PluginVersion = "1.2.3"
     targetClasses = setOf("ru.onlychill.bonds2.*")
-    excludedClasses = setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.ui.MainWindowApp")
+    // UI-слой не мутируем: его тесты тянут JavaFX-ожидания по 5-20 с, мутационная фаза
+    // становится wait-bound (CPU простаивает). Логика сервисов покрыта юнит-тестами.
+    excludedClasses =
+        setOf("ru.onlychill.bonds2.Main", "ru.onlychill.bonds2.ui.*")
+    excludedTestClasses = setOf("ru.onlychill.bonds2.ui.*")
     mutationThreshold = providers.gradleProperty("mutation.threshold").map { it.toInt() }
     outputFormats = setOf("HTML", "XML")
     timestampedReports = false
-    threads = 4
+    threads = 8
     jvmArgs = headlessJavaFxArgs
 }
 
