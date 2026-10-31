@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -141,8 +142,14 @@ public final class DatabaseService {
    * #shutdownAsync(Duration)}. Вызов блокирует вызывающего, поэтому из потока интерфейса его
    * применять не следует. «Покинутость» операции определяет только исходная {@code shutdownAsync}
    * по истечении собственного срока: повторная остановка с меньшим сроком лишь возвращает
-   * собственное наблюдение {@link ShutdownResult#TIMED_OUT}. Срок должен быть положительным:
-   * неположительный срок — ошибка программиста, вызов отвергается до любых действий.
+   * собственное наблюдение {@link ShutdownResult#TIMED_OUT}. Прерывание ожидания и истечение срока
+   * не подменяют наступивший факт: если асинхронная остановка уже завершилась, возвращается её
+   * фактический итог (включая {@code TIMED_OUT} по собственному сроку остановки — это тоже факт);
+   * незавершённая даёт честное {@code TIMED_OUT} «не дождались». Внутренний сбой остановки
+   * пробрасывается вызывающему вместо результата «остановлена»; повторный вызов после сбоя
+   * возвращает ту же ошибку без повторных попыток закрытия: поток жизненного цикла погиб, сервис
+   * неработоспособен. Срок должен быть положительным: неположительный срок — ошибка программиста,
+   * вызов отвергается до любых действий.
    *
    * @throws IllegalArgumentException если срок нулевой или отрицательный; состояние сервиса не
    *     меняется, остановка не начинается
@@ -154,13 +161,14 @@ public final class DatabaseService {
       return done.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
+      return factualOutcome(done);
     } catch (TimeoutException e) {
       LOG.log(System.Logger.Level.WARNING, "Операция с БД не завершилась при остановке", e);
+      return factualOutcome(done);
     } catch (ExecutionException e) {
-      LOG.log(System.Logger.Level.WARNING, "Остановка сервиса БД завершилась ошибкой", e);
-      return ShutdownResult.STOPPED;
+      // Сбой самой остановки — не «остановлена»: честный сбой пробрасывается вызывающему
+      throw shutdownFailure(e.getCause());
     }
-    return ShutdownResult.TIMED_OUT;
   }
 
   /**
@@ -168,8 +176,11 @@ public final class DatabaseService {
    * {@code timeout}, затем закрывает БД. Во время миграции и ожидания решения о ней результат —
    * {@link ShutdownResult#REFUSED}. По истечении срока результат — {@link
    * ShutdownResult#TIMED_OUT}, а БД, открытая позже, закрывается без публикации состояния.
-   * Повторный вызов после начала остановки возвращает future с тем же результатом. Срок должен быть
-   * положительным: неположительный срок — ошибка программиста, вызов отвергается до любых действий.
+   * Повторный вызов после начала остановки возвращает future с тем же результатом, включая
+   * исключительное завершение: внутренний сбой остановки завершает future ошибкой, а не результатом
+   * «остановлена», и повторный вызов после сбоя возвращает ту же ошибку без повторных попыток
+   * закрытия. Срок должен быть положительным: неположительный срок — ошибка программиста, вызов
+   * отвергается до любых действий.
    *
    * @throws IllegalArgumentException если срок нулевой или отрицательный; состояние сервиса не
    *     меняется, остановка не начинается
@@ -218,6 +229,38 @@ public final class DatabaseService {
     }
   }
 
+  /**
+   * Фактический итог остановки после прерывания ожидания или истечения срока вызывающего:
+   * завершившаяся асинхронная остановка даёт свой результат (в том числе {@code TIMED_OUT} от
+   * {@code completeOnTimeout} — это тоже факт), сбой завершения пробрасывается вызывающему,
+   * незавершённая даёт честное {@code TIMED_OUT} «не дождались».
+   */
+  private static ShutdownResult factualOutcome(CompletableFuture<ShutdownResult> done) {
+    if (!done.isDone()) {
+      return ShutdownResult.TIMED_OUT;
+    }
+    try {
+      return done.join();
+    } catch (CompletionException e) {
+      throw shutdownFailure(e.getCause());
+    }
+  }
+
+  /**
+   * Пробрасывает причину сбоя остановки вызывающему без заворачивания: сбой {@code runShutdown} —
+   * непроверяемая ошибка среды, проверка типов лишь страхует контракт на случай неожиданного
+   * проверяемого исключения; отсутствие причины заменяется обёрткой с пояснением.
+   */
+  private static RuntimeException shutdownFailure(@Nullable Throwable cause) {
+    if (cause instanceof RuntimeException e) {
+      throw e;
+    }
+    if (cause instanceof Error e) {
+      throw e;
+    }
+    throw new IllegalStateException("Неожиданный сбой остановки сервиса БД", cause);
+  }
+
   private void runShutdown(CompletableFuture<ShutdownResult> done) {
     try {
       if (!abandoned && mustNotStop(state)) {
@@ -244,7 +287,11 @@ public final class DatabaseService {
       done.complete(ShutdownResult.STOPPED);
     } catch (RuntimeException | Error e) {
       LOG.log(System.Logger.Level.WARNING, "Остановка сервиса БД завершилась ошибкой", e);
-      done.complete(ShutdownResult.STOPPED);
+      // Итог «остановлена» маскировал бы сбой: асинхронная остановка завершается ошибкой. Гонка с
+      // {@code completeOnTimeout} безвредна: первый завершивший побеждает, второй завершитель —
+      // no-op, оба исхода честные. Проброс по-прежнему убивает поток жизненного цикла: сервис
+      // остаётся остановленным ({@code stopping}), новые операции отклоняются
+      done.completeExceptionally(e);
       throw e;
     }
   }

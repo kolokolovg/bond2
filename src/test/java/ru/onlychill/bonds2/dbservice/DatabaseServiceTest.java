@@ -132,6 +132,29 @@ class DatabaseServiceTest {
     };
   }
 
+  /** Подписчик, бросающий заданную ошибку среды только при доставке состояния «закрыта». */
+  private static Flow.Subscriber<DbState> failingOnClosedState(Error error) {
+    return new Flow.Subscriber<>() {
+      @Override
+      public void onSubscribe(Flow.Subscription subscription) {
+        subscription.request(Long.MAX_VALUE);
+      }
+
+      @Override
+      public void onNext(DbState item) {
+        if (item instanceof DbState.Closed) {
+          throw error;
+        }
+      }
+
+      @Override
+      public void onError(Throwable throwable) {}
+
+      @Override
+      public void onComplete() {}
+    };
+  }
+
   @Test
   void lifecycleRunsWithoutUserInterface() {
     var opened = get(service.create(file()));
@@ -1237,6 +1260,154 @@ class DatabaseServiceTest {
     assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 
+  @Test
+  void interruptedBeforeCompletionReturnsTimedOut() throws Exception {
+    // Сценарий «Прерывание ожидания до завершения остановки»: остановка ещё не завершилась,
+    // поэтому прерванное ожидание даёт честное «не дождались», а не выдуманный итог
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+
+    var outcome = new AtomicReference<ShutdownResult>();
+    var failure = new AtomicReference<Throwable>();
+    var waiter =
+        new Thread(
+            () -> {
+              try {
+                outcome.set(service.shutdown(Duration.ofSeconds(30)));
+              } catch (Throwable thrown) {
+                failure.set(thrown);
+              }
+            });
+    waiter.start();
+    // Прерывание гарантированно попадает в ожидание результата: остановка стоит за операцией
+    assertThat(Eventually.holds(() -> waiter.getState() == Thread.State.TIMED_WAITING)).isTrue();
+    waiter.interrupt();
+    waiter.join();
+
+    assertThat(failure).hasNullValue();
+    assertThat(outcome).hasValue(ShutdownResult.TIMED_OUT);
+    // Флаг прерывания восстановлен, как и прежде
+    assertThat(waiter.isInterrupted()).isTrue();
+
+    // Прерывание ожидания не покидает операцию: она завершается штатно, остановка завершается
+    storage.openGate.release();
+    assertThat(Eventually.holds(open::isDone)).isTrue();
+    assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
+  }
+
+  @Test
+  void interruptionAfterCompletionReturnsActualResult() throws Exception {
+    // Сценарий «Прерывание ожидания после завершения остановки»: прерывание не отменяет
+    // наступивший факт — ожидание возвращает результат завершившейся остановки «остановлена»,
+    // а не подменяет его наблюдением «не дождались»
+    newDatabaseAt(file());
+    storage.openGate.hold();
+    var open = service.open(file(), false);
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    var stopping = service.shutdownAsync(Duration.ofSeconds(30));
+    storage.openGate.release();
+    assertThat(get(stopping)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
+
+    var outcome = new AtomicReference<ShutdownResult>();
+    var stillInterrupted = new AtomicBoolean();
+    var waiter =
+        new Thread(
+            () -> {
+              outcome.set(service.shutdown(Duration.ofSeconds(30)));
+              stillInterrupted.set(Thread.currentThread().isInterrupted());
+            });
+    // Флаг выставлен до старта: асинхронная остановка уже завершилась, прерывание не может
+    // прервать ожидание, но и не подменяет его результат
+    waiter.interrupt();
+    waiter.start();
+    waiter.join();
+
+    assertThat(outcome).hasValue(ShutdownResult.STOPPED);
+    assertThat(stillInterrupted).isTrue();
+  }
+
+  @Test
+  void shutdownFailureCompletesAsyncExceptionallyAndSyncShutdownRethrowsCause() {
+    // Сценарий «Сбой самой остановки»: ошибка подписчика при финальной публикации доходит до
+    // остановки: асинхронная остановка завершается ошибкой, а не «остановлена», синхронная
+    // пробрасывает тот же сбой вызывающему
+    var failingStorage = new FailingCloseStorage();
+    var failing = new DatabaseService(failingStorage);
+    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    var failure = new AssertionError("сбой подписчика при остановке");
+    failing.states().subscribe(failingOnClosedState(failure));
+
+    var stopping = failing.shutdownAsync(Duration.ofSeconds(30));
+
+    assertThatThrownBy(() -> stopping.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCause(failure);
+    // Ожидание уже подтвердил факт: асинхронная остановка завершается ошибкой, а не «остановлена»
+    assertThat(stopping).isCompletedExceptionally();
+    assertThatThrownBy(() -> failing.shutdown(Duration.ofSeconds(30))).isSameAs(failure);
+
+    // БД закрыта до сбоя публикации, состояние приведено к согласованному «закрыта»
+    assertThat(isClosed(failingStorage.opened.get(0))).isTrue();
+    assertThat(failing.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
+  void repeatedShutdownAfterFailureReturnsSameErrorWithoutReclosingDatabase() {
+    // Сценарий «Повторная остановка после сбоя»: повторный вызов возвращает ту же ошибку без
+    // повторных попыток закрытия БД: поток жизненного цикла погиб, сервис неработоспособен
+    var countingStorage = new CountingCloseStorage();
+    var failing = new DatabaseService(countingStorage);
+    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    var failure = new AssertionError("сбой подписчика при остановке");
+    failing.states().subscribe(failingOnClosedState(failure));
+
+    var first = failing.shutdownAsync(Duration.ofSeconds(30));
+    assertThatThrownBy(() -> first.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCause(failure);
+
+    // И асинхронная, и синхронная повторная остановка возвращает ту же ошибку
+    assertThatThrownBy(() -> get(failing.shutdownAsync(Duration.ofSeconds(30))))
+        .hasRootCause(failure);
+    assertThatThrownBy(() -> failing.shutdown(Duration.ofSeconds(30))).isSameAs(failure);
+
+    // Повторных попыток закрытия нет: хранилище получило ровно один вызов close
+    assertThat(countingStorage.closeCalls).hasValue(1);
+    assertThat(isClosed(countingStorage.opened.get(0))).isTrue();
+    assertThat(failing.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
+  void operationsAfterShutdownFailureAreRejectedAsStopped() {
+    // После сбоя остановки сервис неработоспособен: новые операции отклоняются с причиной STOPPED
+    var failingStorage = new FailingCloseStorage();
+    var failing = new DatabaseService(failingStorage);
+    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    var failure = new AssertionError("сбой подписчика при остановке");
+    failing.states().subscribe(failingOnClosedState(failure));
+
+    var stopping = failing.shutdownAsync(Duration.ofSeconds(30));
+    assertThatThrownBy(() -> stopping.get(30, TimeUnit.SECONDS))
+        .isInstanceOf(ExecutionException.class)
+        .hasCause(failure);
+
+    assertThat(get(failing.open(file(), false)))
+        .isInstanceOfSatisfying(
+            OpenResult.Rejected.class,
+            rejected ->
+                // После сбоя остановки операции отклоняются с причиной STOPPED
+                assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED));
+    assertThat(get(failing.close()))
+        .isInstanceOfSatisfying(
+            CloseResult.Rejected.class,
+            rejected ->
+                // После сбоя остановки операции отклоняются с причиной STOPPED
+                assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED));
+  }
+
   /**
    * Хранилище поверх настоящих файлов БД: первый вызов {@code close} бросает сбой, не закрывая БД и
    * не помечая её закрытой заранее; последующие вызовы закрывают по-настоящему.
@@ -1282,6 +1453,55 @@ class DatabaseServiceTest {
       if (failFirstClose && closeAttempts.incrementAndGet() == 1) {
         throw new IllegalStateException("сбой закрытия без пометки закрытой");
       }
+      database.close();
+    }
+
+    private Database track(Database database) {
+      opened.add(database);
+      return database;
+    }
+  }
+
+  /**
+   * Хранилище поверх настоящих файлов БД со счётчиком всех вызовов {@code close}: проверяет, что
+   * повторная остановка после сбоя не предпринимает повторных попыток закрытия.
+   */
+  private static final class CountingCloseStorage implements DatabaseService.Storage {
+
+    /** Открытые через это хранилище БД. */
+    final List<Database> opened = new CopyOnWriteArrayList<>();
+
+    /** Общее число вызовов {@code close}: учитывается каждый вызов. */
+    final AtomicInteger closeCalls = new AtomicInteger();
+
+    @Override
+    public Database.State inspect(Path file) {
+      return Database.inspect(file);
+    }
+
+    @Override
+    public Database open(Path file) {
+      return track(Database.open(file));
+    }
+
+    @Override
+    public Database create(Path file) {
+      return track(Database.create(file));
+    }
+
+    @Override
+    public Database initialize(Path file) {
+      return track(Database.initialize(file));
+    }
+
+    @Override
+    public void migrateWithBackup(Path file) {
+      Database.migrateWithBackup(file);
+    }
+
+    @Override
+    public void close(Database database) {
+      closeCalls.incrementAndGet();
       database.close();
     }
 

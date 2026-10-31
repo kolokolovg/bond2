@@ -24,6 +24,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Flow;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1312,6 +1313,65 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void shutdownFailureIsLoggedAndExternalTerminationContinues() {
+    // Сценарий «Сбой остановки при внешнем завершении»: подписчик бросает ошибку при финальной
+    // публикации «закрыта», поэтому синхронная остановка сервиса пробрасывает её вызывающему
+    var failingStorage = new GatedStorage();
+    var failing = new DatabaseService(failingStorage);
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
+    var store = new SettingsStore(settingsFile());
+    var executor = settingsExecutor();
+    var db =
+        new DatabaseController(
+            store,
+            store.load(),
+            defaultFile(),
+            failing,
+            dialogs,
+            exits::incrementAndGet,
+            ui,
+            executor);
+
+    db.openOnStartup();
+    ui.pumpUntil(() -> isOpen(db));
+    // Подписка после открытия: при подписке доставляется текущее состояние, и «закрыта» пришла бы
+    // сразу; сбой нужен только на финальной публикации остановки
+    var failure = new AssertionError("сбой остановки");
+    failing.states().subscribe(failingOnClosedState(failure));
+
+    var capture = new LogCapture();
+    CONTROLLER_LOG.addHandler(capture);
+    CONTROLLER_LOG.setLevel(Level.FINE);
+    try {
+      // Завершение продолжается: сбой остановки не пробрасывается вызывающему
+      assertThatCode(db::shutdown).doesNotThrowAnyException();
+    } finally {
+      CONTROLLER_LOG.removeHandler(capture);
+      CONTROLLER_LOG.setLevel(null);
+    }
+    ui.settle();
+
+    // Сбой остановки журналируется как ошибка с самой причиной, без заворачивания
+    assertThat(capture.records)
+        .anySatisfy(
+            record -> {
+              assertThat(record.getLevel()).isEqualTo(Level.SEVERE);
+              assertThat(record.getMessage())
+                  .contains("Сбой остановки сервиса БД при внешнем завершении");
+              assertThat(record.getThrown()).isSameAs(failure);
+            });
+    // Диалог в пути stop() невозможен: ошибок и предупреждений нет, выход не начат
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(exits.get()).isZero();
+    // Завершение продолжается: запись настроек остановлена, БД закрыта до сбоя публикации
+    assertThat(executor.isShutdown()).isTrue();
+    assertThat(failingStorage.opened).hasSize(1);
+    assertThat(isClosed(failingStorage.opened.get(0))).isTrue();
+  }
+
+  @Test
   void saveSettingsWritesOnSettingsThreadAndAppliesOnUiQueue() {
     var executor = settingsExecutor();
     var writeThreads = new CopyOnWriteArrayList<Thread>();
@@ -1395,13 +1455,41 @@ class DatabaseControllerTest {
     assertThat(db.settings()).isEqualTo(Settings.defaults());
   }
 
-  /** Сборщик записей журнала контроллера: проверка тихого отклонения создания БД. */
+  /** Подписчик, бросающий заданную ошибку только при доставке состояния «закрыта». */
+  private static Flow.Subscriber<DbState> failingOnClosedState(Error error) {
+    return new Flow.Subscriber<>() {
+      @Override
+      public void onSubscribe(Flow.Subscription subscription) {
+        subscription.request(Long.MAX_VALUE);
+      }
+
+      @Override
+      public void onNext(DbState item) {
+        if (item instanceof DbState.Closed) {
+          throw error;
+        }
+      }
+
+      @Override
+      public void onError(Throwable throwable) {}
+
+      @Override
+      public void onComplete() {}
+    };
+  }
+
+  /**
+   * Сборщик записей журнала контроллера: проверка тихого отклонения создания БД и журнала сбоя
+   * остановки при внешнем завершении.
+   */
   private static final class LogCapture extends Handler {
 
+    final List<LogRecord> records = new ArrayList<>();
     final List<String> messages = new ArrayList<>();
 
     @Override
     public void publish(LogRecord record) {
+      records.add(record);
       messages.add(record.getMessage());
     }
 

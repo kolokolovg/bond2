@@ -351,7 +351,10 @@ final class DatabaseController {
   /**
    * Вызывается при завершении приложения в обход меню: останавливает сервис и ждёт не дольше {@link
    * #STOP_TIMEOUT}. Ожидающая решения миграция считается отклонённой, идущая доводится до конца не
-   * дольше {@link #MIGRATION_TIMEOUT}. Результаты, пришедшие позже, игнорируются.
+   * дольше {@link #MIGRATION_TIMEOUT}. Результаты, пришедшие позже, игнорируются. Сбой самой
+   * остановки сервиса (синхронной или асинхронной в конце цепочки) журналируется и завершению не
+   * мешает: диалог в пути stop() и хука завершения JVM невозможен — тулкит гаснет, процесс обязан
+   * завершиться, — поэтому ошибка остаётся в журнале, а завершение продолжается.
    *
    * <p>Ожидание здесь блокирует поток JavaFX сознательно. К моменту вызова окно уже скрыто JavaFX,
    * поэтому никакая обратная связь пользователю невозможна. Неблокирующий вариант — вернуться из
@@ -361,28 +364,36 @@ final class DatabaseController {
    * при идущей миграции — до её окончания и остановки сервиса, суммарно до ~65 секунд.
    */
   void shutdown() {
-    if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
+    try {
+      if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
+        return;
+      }
+      cancelMigrationDialog();
+      // Ожидание миграции в stop() (до MIGRATION_TIMEOUT) сохранено сознательно. Вызов идёт из
+      // потока
+      // JavaFX, и блокировка этого потока неприятна, но прервать миграцию хуже, чем подождать:
+      // откат
+      // при следующем запуске потерял бы гарантию «файл не тронут». Случай редкий: без меню stop()
+      // почти не вызывается.
+      CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
+      if (service.state() instanceof DbState.AwaitingMigration) {
+        prepared = service.declineMigration();
+      } else if (migration != null) {
+        prepared = migration.copy();
+      }
+      prepared
+          .orTimeout(MIGRATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+          .handle((value, error) -> null)
+          .thenCompose(ignored -> service.shutdownAsync(MIGRATION_TIMEOUT))
+          .join();
+      stopped = true;
+    } catch (RuntimeException | Error e) {
+      // Диалог здесь невозможен: тулкит гаснет, процесс обязан завершиться. Сбой остановки
+      // журналируется, а завершение продолжается: остановка записи настроек идёт в finally
+      LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД при внешнем завершении", e);
+    } finally {
       stopSettingsWriting();
-      return;
     }
-    cancelMigrationDialog();
-    // Ожидание миграции в stop() (до MIGRATION_TIMEOUT) сохранено сознательно. Вызов идёт из потока
-    // JavaFX, и блокировка этого потока неприятна, но прервать миграцию хуже, чем подождать: откат
-    // при следующем запуске потерял бы гарантию «файл не тронут». Случай редкий: без меню stop()
-    // почти не вызывается.
-    CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
-    if (service.state() instanceof DbState.AwaitingMigration) {
-      prepared = service.declineMigration();
-    } else if (migration != null) {
-      prepared = migration.copy();
-    }
-    prepared
-        .orTimeout(MIGRATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-        .handle((value, error) -> null)
-        .thenCompose(ignored -> service.shutdownAsync(MIGRATION_TIMEOUT))
-        .join();
-    stopped = true;
-    stopSettingsWriting();
   }
 
   /** Останавливает фоновую запись настроек; незавершённая запись доходит до конца на демоне. */

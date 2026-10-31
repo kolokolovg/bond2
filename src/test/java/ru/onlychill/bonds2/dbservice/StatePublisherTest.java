@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.ResourceBundle;
 import java.util.concurrent.Flow;
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +24,7 @@ class StatePublisherTest {
     Flow.Subscription subscription;
     long initialRequest;
     boolean failOnNext;
+    boolean failOnComplete;
 
     /** Имя класса последней ошибки, переданной в {@code onError}. */
     String errorClass;
@@ -30,8 +32,20 @@ class StatePublisherTest {
     /** Состояние, при доставке которого подписчик бросает фатальную ошибку среды. */
     DbState fatalOnItem;
 
+    /** Бросить фатальную ошибку среды из {@code onComplete}. */
+    boolean fatalOnComplete;
+
+    /** Последнее исключение, выброшенное из {@code onNext} или {@code onComplete}. */
+    Throwable lastFailure;
+
     Probe(long initialRequest) {
       this.initialRequest = initialRequest;
+    }
+
+    /** Запоминает исключение для проверки журнала и возвращает его для броска. */
+    private <T extends Throwable> T thrown(T error) {
+      lastFailure = error;
+      return error;
     }
 
     @Override
@@ -48,10 +62,10 @@ class StatePublisherTest {
       items.add(item);
       if (item.equals(fatalOnItem)) {
         // Например, не загрузилась нативная библиотека: ошибка среды, а не исключение
-        throw new UnsatisfiedLinkError("фатальный сбой подписчика");
+        throw thrown(new UnsatisfiedLinkError("фатальный сбой подписчика"));
       }
       if (failOnNext) {
-        throw new IllegalStateException("сбой подписчика");
+        throw thrown(new IllegalStateException("сбой подписчика"));
       }
     }
 
@@ -64,6 +78,44 @@ class StatePublisherTest {
     @Override
     public void onComplete() {
       events.add("complete");
+      if (fatalOnComplete) {
+        // Ошибка среды при завершении не поглощается, но подписка отменяется и журналируется
+        throw thrown(new UnsatisfiedLinkError("фатальный сбой подписчика при завершении"));
+      }
+      if (failOnComplete) {
+        throw thrown(new IllegalStateException("сбой подписчика при завершении"));
+      }
+    }
+  }
+
+  /** Запись предупреждения журнала: сообщение и исключение. */
+  private record LoggedWarning(String message, Throwable thrown) {}
+
+  /** Логгер-рекордер: сохраняет предупреждения для проверок. */
+  private static final class RecordingLogger implements System.Logger {
+
+    final List<LoggedWarning> warnings = new ArrayList<>();
+
+    @Override
+    public String getName() {
+      return StatePublisherTest.class.getName();
+    }
+
+    @Override
+    public boolean isLoggable(Level level) {
+      return true;
+    }
+
+    @Override
+    public void log(Level level, ResourceBundle bundle, String message, Throwable thrown) {
+      if (level == Level.WARNING) {
+        warnings.add(new LoggedWarning(message, thrown));
+      }
+    }
+
+    @Override
+    public void log(Level level, ResourceBundle bundle, String format, Object... params) {
+      // Форматные записи издателем не используются
     }
   }
 
@@ -138,7 +190,8 @@ class StatePublisherTest {
 
   @Test
   void fatalSubscriberErrorIsNotSwallowedAndOthersKeepWorking() {
-    var publisher = new StatePublisher(DbState.CLOSED);
+    var log = new RecordingLogger();
+    var publisher = new StatePublisher(DbState.CLOSED, log);
     var bad = new Probe(Long.MAX_VALUE);
     bad.fatalOnItem = OPEN;
     var good = new Probe(Long.MAX_VALUE);
@@ -147,6 +200,11 @@ class StatePublisherTest {
 
     // Ошибка среды не поглощается: передаётся вызывающему публикацию
     assertThatThrownBy(() -> publisher.publish(OPEN)).isInstanceOf(UnsatisfiedLinkError.class);
+
+    // Перед пробросом ошибка среды журналируется с предупреждением
+    assertThat(log.warnings).hasSize(1);
+    assertThat(log.warnings.get(0).thrown).isSameAs(bad.lastFailure);
+    assertThat(log.warnings.get(0).message).isNotBlank();
 
     // Подписка сбойного подписчика отменена: новые состояния ему не доставляются
     // (сбойное состояние записано в список, но доставка завершилась ошибкой)
@@ -157,6 +215,72 @@ class StatePublisherTest {
     publisher.publish(DbState.CLOSED);
     assertThat(good.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
     assertThat(bad.items).containsExactly(DbState.CLOSED, OPEN);
+    assertThat(log.warnings).hasSize(1);
+  }
+
+  @Test
+  void subscriberFailureIsLoggedAsWarningAndOthersKeepReceivingAllStates() {
+    var log = new RecordingLogger();
+    var publisher = new StatePublisher(DbState.CLOSED, log);
+    var bad = new Probe(Long.MAX_VALUE);
+    bad.failOnNext = true;
+    var good = new Probe(Long.MAX_VALUE);
+    publisher.subscribe(bad);
+    publisher.subscribe(good);
+
+    publisher.publish(OPEN);
+    publisher.publish(DbState.CLOSED);
+
+    // Предупреждение с исключением доходит до внедрённого журнала
+    assertThat(log.warnings).hasSize(1);
+    assertThat(log.warnings.get(0).thrown).isSameAs(bad.lastFailure);
+    assertThat(log.warnings.get(0).message).isNotBlank();
+
+    // Подписка сбойного подписчика отменена: последующие публикации ему не доставляются
+    assertThat(bad.items).containsExactly(DbState.CLOSED);
+
+    // Остальные подписчики продолжают получать ВСЕ состояния, публикация не прекращается
+    assertThat(good.items).containsExactly(DbState.CLOSED, OPEN, DbState.CLOSED);
+    assertThat(log.warnings).hasSize(1);
+  }
+
+  @Test
+  void completionFailureIsLoggedAsWarningAndSubscriptionCancelled() {
+    var log = new RecordingLogger();
+    var publisher = new StatePublisher(DbState.CLOSED, log);
+    var probe = new Probe(0);
+    publisher.subscribe(probe);
+    publisher.close();
+
+    // Сбой при onComplete: спрос вручную дозревает доставку до завершения
+    probe.failOnComplete = true;
+    probe.subscription.request(1);
+
+    assertThat(probe.items).containsExactly(DbState.CLOSED);
+    assertThat(log.warnings).hasSize(1);
+    assertThat(log.warnings.get(0).thrown).isSameAs(probe.lastFailure);
+    assertThat(log.warnings.get(0).message).isNotBlank();
+
+    // Подписка отменена: повторный спрос ничего не доставляет и не журналируется
+    probe.subscription.request(1);
+    assertThat(log.warnings).hasSize(1);
+    assertThat(probe.events).containsExactly("subscribe", "complete");
+  }
+
+  @Test
+  void fatalCompletionErrorIsLoggedAndRethrown() {
+    var log = new RecordingLogger();
+    var publisher = new StatePublisher(DbState.CLOSED, log);
+    var probe = new Probe(0);
+    publisher.subscribe(probe);
+    publisher.close();
+
+    // Ошибка среды при onComplete журналируется и не поглощается
+    probe.fatalOnComplete = true;
+    assertThatThrownBy(() -> probe.subscription.request(1))
+        .isInstanceOf(UnsatisfiedLinkError.class);
+    assertThat(log.warnings).hasSize(1);
+    assertThat(log.warnings.get(0).thrown).isSameAs(probe.lastFailure);
   }
 
   @Test

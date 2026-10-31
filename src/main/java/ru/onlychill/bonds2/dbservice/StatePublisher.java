@@ -15,13 +15,22 @@ import java.util.concurrent.Flow;
  */
 final class StatePublisher implements Flow.Publisher<DbState> {
 
+  private static final System.Logger DEFAULT_LOG = System.getLogger(StatePublisher.class.getName());
+
+  private final System.Logger log;
   private final Object lock = new Object();
   private final List<Subscription> subscriptions = new ArrayList<>();
   private DbState current;
   private boolean closed;
 
   StatePublisher(DbState initial) {
+    this(initial, DEFAULT_LOG);
+  }
+
+  /** Точка внедрения журнала для тестов. */
+  StatePublisher(DbState initial, System.Logger log) {
     this.current = initial;
+    this.log = log;
   }
 
   /** Рассылает новое состояние; после {@link #close()} ничего не делает. */
@@ -143,9 +152,10 @@ final class StatePublisher implements Flow.Publisher<DbState> {
 
     /**
      * Доставляет накопленное по одному подписчику строго последовательно. Сбой подписчика ({@code
-     * RuntimeException}) отменяет его подписку и не прекращает публикацию; ошибка среды ({@code
-     * Error}) тоже отменяет подписку, но передаётся вызывающему — фатальные ошибки не поглощаются.
-     * Флаг доставки сбрасывается в любом случае, поэтому публикация не «залипает».
+     * RuntimeException}) отменяет его подписку, журналируется с предупреждением и не прекращает
+     * публикацию; ошибка среды ({@code Error}) тоже отменяет подписку и журналируется, но
+     * передаётся вызывающему — фатальные ошибки не поглощаются. Флаг доставки сбрасывается в любом
+     * случае, поэтому публикация не «залипает».
      */
     void drain() {
       synchronized (this) {
@@ -178,8 +188,18 @@ final class StatePublisher implements Flow.Publisher<DbState> {
               subscriber.onNext(item);
             }
           } catch (RuntimeException e) {
+            log.log(
+                System.Logger.Level.WARNING,
+                "Сбой подписчика при доставке: его подписка отменена, остальные подписчики"
+                    + " продолжают получать состояния",
+                e);
             cancel();
           } catch (Error e) {
+            log.log(
+                System.Logger.Level.WARNING,
+                "Сбой подписчика при доставке: его подписка отменена, остальные подписчики"
+                    + " продолжают получать состояния",
+                e);
             cancel();
             throw e;
           }
