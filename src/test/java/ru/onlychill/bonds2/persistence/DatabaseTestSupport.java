@@ -4,7 +4,6 @@ package ru.onlychill.bonds2.persistence;
 
 import java.nio.file.Path;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -45,15 +44,6 @@ final class DatabaseTestSupport {
         ResultSet rs = st.executeQuery(sql)) {
       rs.next();
       return rs.getString(1);
-    }
-  }
-
-  /** Выполняет SQL отдельным соединением; изменения фиксируются и попадают в файл. */
-  static void executeSql(Path file, String... sql) throws SQLException {
-    try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file)) {
-      for (String text : sql) {
-        exec(c, text);
-      }
     }
   }
 

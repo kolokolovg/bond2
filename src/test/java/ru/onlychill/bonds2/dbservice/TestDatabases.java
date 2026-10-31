@@ -2,6 +2,8 @@
 
 package ru.onlychill.bonds2.dbservice;
 
+import static ru.onlychill.bonds2.testutil.TestSql.executeSql;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -56,16 +58,6 @@ public final class TestDatabases {
         "INSERT INTO flyway_schema_history (installed_rank, version, description, type, script,"
             + " checksum, installed_by, installed_on, execution_time, success) VALUES (2, '99',"
             + " 'future', 'SQL', 'V99__future.sql', 1, 'test', CURRENT_TIMESTAMP, 0, 1)");
-  }
-
-  /** Выполняет SQL отдельным соединением; изменения фиксируются и попадают в файл. */
-  public static void executeSql(Path file, String... sql) throws SQLException {
-    try (Connection connection = DriverManager.getConnection("jdbc:sqlite:" + file);
-        Statement statement = connection.createStatement()) {
-      for (String text : sql) {
-        statement.execute(text);
-      }
-    }
   }
 
   /**

@@ -11,10 +11,10 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.TOO_NEW;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createDatabase;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.createOldDatabaseWithRow;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.exec;
-import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.executeSql;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryString;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
+import static ru.onlychill.bonds2.testutil.TestSql.executeSql;
 
 import java.io.IOException;
 import java.nio.file.Files;

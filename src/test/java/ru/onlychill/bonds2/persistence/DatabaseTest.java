@@ -245,6 +245,7 @@ class DatabaseTest {
   void writerWaitsForShortLock() throws Exception {
     var db = withCounter(Duration.ofSeconds(10));
     var locked = new CountDownLatch(1);
+    var writerStarted = new CountDownLatch(1);
     ExecutorService pool = Executors.newSingleThreadExecutor();
     Future<?> holder =
         pool.submit(
@@ -253,15 +254,13 @@ class DatabaseTest {
                     c -> {
                       exec(c, "UPDATE counter SET value = 1");
                       locked.countDown();
-                      try {
-                        Thread.sleep(500);
-                      } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                      }
+                      await(writerStarted);
                       return null;
                     }));
     assertThat(locked.await(30, TimeUnit.SECONDS)).isTrue();
 
+    // Сигнал строго до блокирующего вызова: держатель фиксирует транзакцию, писатель ждёт её
+    writerStarted.countDown();
     db.inTransaction(
         c -> {
           exec(c, "UPDATE counter SET value = value + 1");

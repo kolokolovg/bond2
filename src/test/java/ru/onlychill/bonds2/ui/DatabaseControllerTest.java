@@ -5,9 +5,9 @@ package ru.onlychill.bonds2.ui;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
-import static ru.onlychill.bonds2.dbservice.TestDatabases.executeSql;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.newDatabaseAt;
+import static ru.onlychill.bonds2.testutil.TestSql.executeSql;
 
 import java.io.IOException;
 import java.nio.file.Files;
