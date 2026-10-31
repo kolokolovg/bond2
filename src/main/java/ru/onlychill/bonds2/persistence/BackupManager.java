@@ -5,9 +5,6 @@ package ru.onlychill.bonds2.persistence;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
-import java.nio.file.DirectoryIteratorException;
-import java.nio.file.DirectoryStream;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -15,8 +12,6 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.time.Clock;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -24,6 +19,7 @@ import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+import ru.onlychill.bonds2.files.StampedFiles;
 
 /**
  * Резервные копии файла БД и его откат: копия перед миграцией, проверка копии, восстановление после
@@ -31,9 +27,6 @@ import java.util.stream.Stream;
  * инициализации.
  */
 final class BackupManager {
-
-  private static final DateTimeFormatter BACKUP_STAMP =
-      DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
   /** Сколько резервных копий файла БД хранится после успешной миграции. */
   private static final int BACKUPS_KEPT = 3;
@@ -59,7 +52,12 @@ final class BackupManager {
     if (state != Database.State.NEEDS_MIGRATION) {
       throw new PersistenceException(refusal(state, absolute));
     }
-    removeOrphanedRestoreFiles(absolute);
+    // Временные файлы восстановления, оставшиеся от прерванного отката, удаляются до копии:
+    // каталог с похожим именем пропускается с записью в лог, миграцию сбои не прерывают
+    StampedFiles.sweepOrphans(
+        directoryOf(absolute),
+        absolute.getFileName() + ".*.restore",
+        "временный файл восстановления");
     Path backup = createBackup(absolute, clock);
     verifyBackup(backup);
     try {
@@ -71,48 +69,6 @@ final class BackupManager {
       pruneBackups(absolute, backup);
     }
     return backup;
-  }
-
-  /**
-   * Удаляет временные файлы восстановления ({@code <файл БД>.*.restore}), оставшиеся от прерванного
-   * отката. Это безопасно: приложение работает под блокировкой единственного экземпляра, поэтому
-   * параллельный откат в тот же каталог не идёт. Ошибка просмотра или удаления пишется в лог и
-   * миграцию не прерывает.
-   */
-  private static void removeOrphanedRestoreFiles(Path file) {
-    Path dir = directoryOf(file);
-    try (DirectoryStream<Path> entries =
-        Files.newDirectoryStream(dir, file.getFileName() + ".*.restore")) {
-      for (Path entry : entries) {
-        deleteRestoreLeftover(entry);
-      }
-    } catch (IOException | DirectoryIteratorException e) {
-      LOG.log(
-          System.Logger.Level.WARNING,
-          "Не удалось просмотреть временные файлы восстановления: " + dir,
-          e);
-    }
-  }
-
-  /**
-   * Удаляет оставшийся временный файл, если это обычный файл. Необычная запись (например, каталог)
-   * и файл, который не удалось удалить, пишутся в лог и пропускаются: они не мешают миграции.
-   */
-  private static void deleteRestoreLeftover(Path entry) {
-    try {
-      if (!Files.isRegularFile(entry)) {
-        LOG.log(
-            System.Logger.Level.WARNING,
-            "Временный файл восстановления не обычный файл, пропущен: " + entry);
-        return;
-      }
-      Files.deleteIfExists(entry);
-    } catch (IOException e) {
-      LOG.log(
-          System.Logger.Level.WARNING,
-          "Не удалось удалить временный файл восстановления: " + entry,
-          e);
-    }
   }
 
   /**
@@ -132,12 +88,18 @@ final class BackupManager {
   /**
    * Создаёт копию командой {@code VACUUM INTO}: она читает согласованный снимок вместе с журналом
    * WAL, поэтому перенос WAL перед копированием не нужен. Имя копии занимает пустой файл, созданный
-   * атомарно, поэтому существующая копия не перезаписывается. Если копию создать не удалось,
-   * частично записанный файл удаляется.
+   * атомарно, поэтому существующая копия не перезаписывается. Если имя занято или копию создать не
+   * удалось, миграция не выполняется; частично записанный файл удаляется.
    */
   private static Path createBackup(Path file, Clock clock) {
-    String base = ".bak-" + LocalDateTime.now(clock).format(BACKUP_STAMP);
-    Path backup = reserveBackupFile(file, base);
+    String base = file.getFileName() + ".bak-" + StampedFiles.stamp(clock);
+    Path backup;
+    try {
+      backup = StampedFiles.reserve(file, base);
+    } catch (IOException e) {
+      throw new MigrationException(
+          "Не удалось создать резервную копию, миграция не выполнена: " + file, e);
+    }
     try {
       SqliteSupport.vacuumInto(SqliteSupport.url(file), backup);
       return backup;
@@ -147,24 +109,6 @@ final class BackupManager {
               "Не удалось создать резервную копию, миграция не выполнена: " + backup, e);
       SqliteSupport.deleteQuietly(backup, failure);
       throw failure;
-    }
-  }
-
-  /**
-   * Создаёт пустой файл с первым свободным именем: {@code base}, затем {@code base-1}, {@code
-   * base-2} и так далее. Занятое имя (файл или каталог) не трогается.
-   */
-  private static Path reserveBackupFile(Path file, String base) {
-    Path candidate = SqliteSupport.withSuffix(file, base);
-    for (int i = 1; ; i++) {
-      try {
-        return Files.createFile(candidate);
-      } catch (FileAlreadyExistsException e) {
-        candidate = SqliteSupport.withSuffix(file, base + "-" + i);
-      } catch (IOException e) {
-        throw new MigrationException(
-            "Не удалось создать резервную копию, миграция не выполнена: " + candidate, e);
-      }
     }
   }
 

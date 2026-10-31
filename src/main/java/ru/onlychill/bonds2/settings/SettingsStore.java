@@ -9,20 +9,17 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.DirectoryIteratorException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Clock;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.Objects;
 import java.util.Properties;
 import org.jspecify.annotations.Nullable;
+import ru.onlychill.bonds2.files.StampedFiles;
 
 /**
  * Хранилище настроек в файле {@code settings.properties} (кодировка UTF-8).
@@ -51,8 +48,6 @@ public final class SettingsStore {
   private static final String HEADER =
       "Настройки bonds2. database.path: путь к файлу БД, пусто — по умолчанию. "
           + "database.autoOpen: открывать БД при запуске, true или false.";
-
-  private static final DateTimeFormatter BAD_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
 
   /** Метка порядка байтов UTF-8, с которой Windows-редакторы сохраняют текстовые файлы. */
   private static final char UTF8_BOM = '\uFEFF';
@@ -100,7 +95,10 @@ public final class SettingsStore {
    * @return настройки из файла либо {@link Settings#defaults()} с признаком сброса и путём к копии
    */
   public LoadResult load() {
-    removeOrphanedTempFiles();
+    Path dir = file.toAbsolutePath().getParent();
+    if (dir != null) {
+      StampedFiles.sweepOrphans(dir, TEMP_PREFIX + "*" + TEMP_SUFFIX, "временный файл настроек");
+    }
     if (Files.notExists(file)) {
       return new LoadResult(Settings.defaults(), null, false);
     }
@@ -155,37 +153,6 @@ public final class SettingsStore {
     return new LoadResult(defaults, null, true);
   }
 
-  /**
-   * Удаляет временные файлы записи, оставшиеся от прерванного сохранения. Это безопасно: чтение
-   * выполняется под блокировкой единственного экземпляра, поэтому другая запись в тот же каталог не
-   * идёт. Ошибка просмотра или удаления пишется в лог и не прерывает чтение.
-   */
-  private void removeOrphanedTempFiles() {
-    Path dir = file.toAbsolutePath().getParent();
-    if (dir == null || !Files.isDirectory(dir)) {
-      return;
-    }
-    try (DirectoryStream<Path> entries =
-        Files.newDirectoryStream(dir, TEMP_PREFIX + "*" + TEMP_SUFFIX)) {
-      for (Path entry : entries) {
-        deleteOrphan(entry);
-      }
-    } catch (IOException | DirectoryIteratorException e) {
-      LOG.log(System.Logger.Level.WARNING, "Не удалось просмотреть каталог настроек: " + dir, e);
-    }
-  }
-
-  private static void deleteOrphan(Path entry) {
-    try {
-      if (Files.isRegularFile(entry)) {
-        Files.deleteIfExists(entry);
-      }
-    } catch (IOException e) {
-      LOG.log(
-          System.Logger.Level.WARNING, "Не удалось удалить временный файл настроек: " + entry, e);
-    }
-  }
-
   /** Сохраняет испорченный файл рядом и записывает значения по умолчанию. */
   private LoadResult recover() {
     Settings defaults = Settings.defaults();
@@ -194,24 +161,20 @@ public final class SettingsStore {
       if (!Files.isRegularFile(file)) {
         throw new IOException("не обычный файл: " + file);
       }
-      Path target = badCopyPath();
-      Files.copy(file, target);
+      Path target =
+          StampedFiles.reserve(file, file.getFileName() + ".bad-" + StampedFiles.stamp(clock));
+      try {
+        Files.copy(file, target, StandardCopyOption.REPLACE_EXISTING);
+      } catch (IOException e) {
+        deleteAfterFailure(target, e);
+        throw e;
+      }
       copy = target;
       save(defaults);
     } catch (IOException | UncheckedIOException e) {
       LOG.log(System.Logger.Level.WARNING, "Не удалось восстановить настройки: " + file, e);
     }
     return new LoadResult(defaults, copy, true);
-  }
-
-  /** Свободное имя копии; при совпадении метки времени добавляется числовой суффикс. */
-  private Path badCopyPath() {
-    String base = file.getFileName() + ".bad-" + LocalDateTime.now(clock).format(BAD_STAMP);
-    Path candidate = file.resolveSibling(base);
-    for (int i = 1; Files.exists(candidate); i++) {
-      candidate = file.resolveSibling(base + "-" + i);
-    }
-    return candidate;
   }
 
   /**
