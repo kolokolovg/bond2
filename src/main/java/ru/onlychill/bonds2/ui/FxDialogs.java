@@ -37,6 +37,21 @@ final class FxDialogs implements Dialogs {
   }
 
   @Override
+  public CompletableFuture<Void> warnBeforeExit(String message) {
+    Alert alert = alert(AlertType.WARNING, "Внимание", message, ButtonType.OK);
+    var result = new CompletableFuture<Void>();
+    alert.setOnHidden(event -> result.complete(null));
+    result.whenComplete(
+        (ignored, error) -> {
+          if (result.isCancelled()) {
+            alert.close();
+          }
+        });
+    alert.show();
+    return result;
+  }
+
+  @Override
   public void warn(String message) {
     alert(AlertType.WARNING, "Внимание", message, ButtonType.OK).show();
   }

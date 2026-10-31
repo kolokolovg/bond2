@@ -3,10 +3,12 @@
 package ru.onlychill.bonds2.ui;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
@@ -18,13 +20,19 @@ import ru.onlychill.bonds2.settings.SettingsStore;
  * <p>Future, возвращаемый {@link #saveSettings(Settings)}, завершается только после записи на
  * исполнителе настроек и применения их на {@code uiExecutor} (в приложении — поток JavaFX). Ошибка
  * записи завершает future исключением, прежние настройки остаются в силе. {@link #stopWriting()}
- * останавливает исполнитель записи; незавершённая запись доходит до конца на потоке-демоне и
- * процесс не удерживает.
+ * останавливает исполнитель записи и ждёт незавершённую запись не дольше {@link
+ * #SETTINGS_WRITE_TIMEOUT}; при любом исходе файл настроек остаётся целым благодаря атомарной
+ * замене.
  */
 final class SettingsPersistence {
 
   /** Имя потока, на котором выполняется запись настроек. */
   static final String SETTINGS_THREAD_NAME = "bonds2-settings";
+
+  /** Сколько ждать незавершённой записи настроек при остановке исполнителя. */
+  static final Duration SETTINGS_WRITE_TIMEOUT = Duration.ofSeconds(5);
+
+  private static final System.Logger LOG = System.getLogger(SettingsPersistence.class.getName());
 
   private final SettingsStore store;
   private final Executor uiExecutor;
@@ -101,10 +109,51 @@ final class SettingsPersistence {
     return saved.thenRunAsync(() -> settings = updated, uiExecutor);
   }
 
-  /** Останавливает фоновую запись настроек; незавершённая запись доходит до конца на демоне. */
+  /**
+   * Останавливает запись настроек и ждёт незавершённую запись не дольше {@link
+   * #SETTINGS_WRITE_TIMEOUT}. Истечение срока и прерывание ожидания не останавливают завершение
+   * приложения: об этом пишется предупреждение в журнал, а файл настроек остаётся целым благодаря
+   * атомарной замене.
+   */
   void stopWriting() {
-    if (settingsExecutor instanceof ExecutorService executorService) {
-      executorService.shutdown();
+    stopWriting(SETTINGS_WRITE_TIMEOUT);
+  }
+
+  /**
+   * Останавливает запись настроек и ждёт незавершённую запись не дольше срока; по истечении срока
+   * ожидание прекращается, в журнал пишется предупреждение, и завершение приложения продолжается.
+   * Прерывание потока записи не используется: при {@link InterruptedException} флаг прерывания
+   * восстанавливается, а ожидание считается не окончившимся (с тем же предупреждением). Файл
+   * настроек при любом исходе остаётся целым благодаря атомарной замене. Исполнитель без интерфейса
+   * {@link ExecutorService} (тестовые обёртки) не трогается.
+   *
+   * @param timeout сколько ждать незавершённую запись; отдельный параметр позволяет тестам не ждать
+   *     реальные пять секунд
+   */
+  void stopWriting(Duration timeout) {
+    if (!(settingsExecutor instanceof ExecutorService executorService)) {
+      // Остановить и ждать нечего: тестовая обёртка без жизненного цикла исполнителя
+      return;
+    }
+    executorService.shutdown();
+    try {
+      if (!executorService.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+        LOG.log(
+            System.Logger.Level.WARNING,
+            "Запись настроек не завершилась за "
+                + timeout.toMillis()
+                + " мс, завершение"
+                + " продолжается");
+      }
+    } catch (InterruptedException e) {
+      // Прерывание потока записи не используется: восстанавливаем флаг и продолжаем завершение
+      Thread.currentThread().interrupt();
+      LOG.log(
+          System.Logger.Level.WARNING,
+          "Запись настроек не завершилась за "
+              + timeout.toMillis()
+              + " мс, завершение"
+              + " продолжается");
     }
   }
 }

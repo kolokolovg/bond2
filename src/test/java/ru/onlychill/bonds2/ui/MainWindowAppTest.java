@@ -7,11 +7,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static ru.onlychill.bonds2.dbservice.Eventually.holds;
 import static ru.onlychill.bonds2.ui.FxToolkit.runOnFxThread;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -29,6 +33,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
+import ru.onlychill.bonds2.dbservice.GatedStorage;
+import ru.onlychill.bonds2.dbservice.OpenResult;
+import ru.onlychill.bonds2.dbservice.TestDatabases;
+import ru.onlychill.bonds2.persistence.InstanceLock;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
@@ -96,6 +104,103 @@ class MainWindowAppTest {
         .isInstanceOf(IllegalStateException.class);
 
     assertThat(calls).containsExactly("lock");
+  }
+
+  @Test
+  void stopDoesNotBlockCallerAndLaunchesExitChainOnce() {
+    var chains = new ArrayList<Runnable>();
+    var externalStops = new AtomicInteger();
+    var app = new MainWindowApp();
+    app.launchExitChainWith(chains::add);
+    MainWindowApp.setExternalStop(externalStops::incrementAndGet);
+    try {
+      app.stop();
+      app.stop();
+
+      // Цепочка запущена один раз и ещё не выполнена: stop() вернулся сразу
+      assertThat(chains).hasSize(1);
+      MainWindowApp.stopDatabaseOnExternalShutdown();
+      assertThat(externalStops.get()).isEqualTo(1);
+
+      chains.get(0).run();
+      // Снятие действия хука — последний шаг цепочки: остановка больше не вызывается
+      MainWindowApp.stopDatabaseOnExternalShutdown();
+      assertThat(externalStops.get()).isEqualTo(1);
+    } finally {
+      MainWindowApp.setExternalStop(null);
+    }
+  }
+
+  @Test
+  void exitChainStopsDatabaseWaitsForSettingsWriteAndThenReleasesLock() throws Exception {
+    var file = dir.resolve("data/bonds.db");
+    var lockFile = dir.resolve("bonds2.lock");
+    var settingsFile = dir.resolve("cfg/settings.properties");
+    var executor =
+        Executors.newSingleThreadExecutor(
+            runnable -> {
+              var thread = new Thread(runnable, "test-settings");
+              thread.setDaemon(true);
+              return thread;
+            });
+    var writeStarted = new CountDownLatch(1);
+    var releaseWrite = new CountDownLatch(1);
+    // Запись сигнализирует о начале и ждёт разрешения на воротах исполнителя
+    Executor gatedWrite =
+        new SettingsPersistenceTest.GatedExecutorService(executor, writeStarted, releaseWrite);
+    TestDatabases.newDatabaseAt(file);
+    var storage = new GatedStorage();
+    var service = new DatabaseService(storage);
+    var exits = new AtomicInteger();
+    var store = new SettingsStore(settingsFile);
+    var db =
+        new DatabaseController(
+            store,
+            store.load(),
+            dir.resolve("default/bonds2.db"),
+            service,
+            new DatabaseControllerTest.RecordingDialogs(),
+            exits::incrementAndGet,
+            Platform::runLater,
+            gatedWrite);
+    Optional<InstanceLock> lock = Optional.empty();
+    try {
+      service.open(file, false).join();
+      lock = InstanceLock.tryAcquire(lockFile);
+      assertThat(lock).isPresent();
+
+      db.saveSettings(new Settings(file, false));
+      assertThat(writeStarted.await(10, TimeUnit.SECONDS)).isTrue();
+
+      var done = CompletableFuture.runAsync(MainWindowApp.exitChain(db, lock.orElse(null)));
+
+      // Запись удерживается: цепочка ждёт её, а блокировка ещё занята этим экземпляром
+      assertThat(done).isNotDone();
+      assertThat(InstanceLock.tryAcquire(lockFile)).isEmpty();
+
+      releaseWrite.countDown();
+      assertThat(done).succeedsWithin(Duration.ofSeconds(10));
+
+      // Блокировка освобождена после остановки БД и записи: её берёт новый экземпляр
+      var reacquired = InstanceLock.tryAcquire(lockFile);
+      assertThat(reacquired).isPresent();
+      reacquired.ifPresent(InstanceLock::close);
+
+      assertThat(service.open(file, false).join())
+          .isInstanceOfSatisfying(
+              OpenResult.Rejected.class,
+              rejected -> assertThat(rejected.message()).contains("остановлен"));
+      // Удержанная запись дошла до файла
+      assertThat(new SettingsStore(settingsFile).load().settings())
+          .isEqualTo(new Settings(file, false));
+    } finally {
+      releaseWrite.countDown();
+      executor.shutdownNow();
+      storage.openGate.release();
+      storage.migrateGate.release();
+      lock.ifPresent(InstanceLock::close);
+      service.shutdown(Duration.ofSeconds(30));
+    }
   }
 
   @Test

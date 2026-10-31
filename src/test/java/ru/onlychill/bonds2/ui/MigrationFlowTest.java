@@ -219,20 +219,44 @@ class MigrationFlowTest {
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
   }
 
+  @Test
+  void warnBeforeExitRecordsMessageAndWaitsForPendingFuture() {
+    dialogs.pendingExitWarning = new CompletableFuture<>();
+    var warning = dialogs.warnBeforeExit("предупреждение перед выходом");
+
+    assertThat(dialogs.exitWarnings).containsExactly("предупреждение перед выходом");
+    assertThat(warning).isNotDone();
+
+    dialogs.pendingExitWarning.complete(null);
+    assertThat(warning).isCompleted();
+  }
+
   static final class RecordingDialogs implements Dialogs {
 
     final List<String> questions = new ArrayList<>();
     final List<String> warnings = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
+    final List<String> exitWarnings = new ArrayList<>();
     boolean migrationAnswer = true;
 
     /** Если задан, диалог остаётся открытым, пока тест не завершит этот future. */
     @Nullable CompletableFuture<Boolean> pending;
 
+    /** Если задан, диалог выхода остаётся открытым, пока тест не завершит этот future. */
+    @Nullable CompletableFuture<Void> pendingExitWarning;
+
     @Override
     public CompletableFuture<Boolean> confirmMigration(String question) {
       questions.add(question);
       return pending != null ? pending : CompletableFuture.completedFuture(migrationAnswer);
+    }
+
+    @Override
+    public CompletableFuture<Void> warnBeforeExit(String message) {
+      exitWarnings.add(message);
+      return pendingExitWarning != null
+          ? pendingExitWarning
+          : CompletableFuture.completedFuture(null);
     }
 
     @Override

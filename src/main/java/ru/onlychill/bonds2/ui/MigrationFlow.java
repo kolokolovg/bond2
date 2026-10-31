@@ -32,11 +32,17 @@ final class MigrationFlow {
   private final BooleanSupplier exitStarted;
   private final BooleanSupplier stopping;
 
-  /** Открытый диалог миграции; {@code null}, если диалога нет. */
-  private @Nullable CompletableFuture<Boolean> migrationDialog;
+  /**
+   * Открытый диалог миграции; {@code null}, если диалога нет. {@code volatile}: его читает поток
+   * завершения в {@link #cancelDialog()} из {@link DatabaseController#shutdown()}.
+   */
+  private volatile @Nullable CompletableFuture<Boolean> migrationDialog;
 
-  /** Запущенная миграция; {@code null}, если её не было. */
-  private @Nullable CompletableFuture<OpenResult> migration;
+  /**
+   * Запущенная миграция; {@code null}, если её не было. {@code volatile}: её читает поток
+   * завершения в {@link #currentMigration()} из {@link DatabaseController#shutdown()}.
+   */
+  private volatile @Nullable CompletableFuture<OpenResult> migration;
 
   /**
    * @param service сервис жизненного цикла БД: запуск и отклонение миграции

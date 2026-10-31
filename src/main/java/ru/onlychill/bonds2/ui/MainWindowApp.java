@@ -4,8 +4,11 @@ package ru.onlychill.bonds2.ui;
 
 import java.io.File;
 import java.nio.file.Path;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import javafx.application.Application;
@@ -35,8 +38,9 @@ import ru.onlychill.bonds2.settings.SettingsStore.LoadResult;
 /**
  * Главное окно приложения: меню «Файл» (настройки, открытие, создание и закрытие БД, выход) и
  * строка состояния БД внизу. Чтение настроек при запуске выполняется вне потока интерфейса, логика
- * БД — в {@link DatabaseController}; здесь сборка интерфейса и действие остановки сервиса для хука
- * завершения JVM.
+ * БД — в {@link DatabaseController}; здесь сборка интерфейса, действие остановки сервиса для хука
+ * завершения JVM и цепочка штатного выхода: она выполняется на выделенном потоке завершения {@link
+ * #EXIT_THREAD_NAME} и не блокирует поток интерфейса.
  */
 public final class MainWindowApp extends Application {
 
@@ -46,6 +50,9 @@ public final class MainWindowApp extends Application {
 
   /** Имя потока, на котором выполняется чтение настроек при запуске. */
   static final String SETTINGS_LOAD_THREAD_NAME = "bonds2-settings-load";
+
+  /** Имя потока, на котором выполняется цепочка завершения приложения. */
+  static final String EXIT_THREAD_NAME = "bonds2-exit";
 
   private static final System.Logger LOG = System.getLogger(MainWindowApp.class.getName());
 
@@ -57,6 +64,13 @@ public final class MainWindowApp extends Application {
 
   private @Nullable DatabaseController controller;
   private @Nullable InstanceLock instanceLock;
+
+  /** Цепочка завершения запускается один раз: повторный {@code stop()} не создаёт вторую. */
+  private final AtomicBoolean exitStarted = new AtomicBoolean();
+
+  /** Запускатель цепочки завершения; тесты подменяют его, чтобы цепочку не выполнять. */
+  private final AtomicReference<Consumer<Runnable>> exitLauncher =
+      new AtomicReference<>(MainWindowApp::startExitThread);
 
   @Override
   public void start(Stage stage) {
@@ -119,7 +133,7 @@ public final class MainWindowApp extends Application {
             Platform::runLater);
     controller = db;
     // Пока сервис не остановлен штатно, хук завершения JVM может остановить его без JavaFX
-    setExternalStop(() -> db.shutdown(DatabaseController.STOP_TIMEOUT));
+    setExternalStop(db::stopForExternalShutdown);
 
     var status = new Label();
     status.textProperty().bind(db.statusProperty());
@@ -142,20 +156,57 @@ public final class MainWindowApp extends Application {
     db.openOnStartup();
   }
 
+  /**
+   * Завершение приложения: возвращается сразу и не блокирует поток интерфейса. Цепочка завершения
+   * запускается один раз на выделенном потоке {@link #EXIT_THREAD_NAME}: остановка БД с ожиданием
+   * записи настроек → освобождение блокировки экземпляра → снятие действия хука завершения JVM.
+   * Повторный {@code stop()} вторую цепочку не создаёт.
+   */
   @Override
   public void stop() {
-    DatabaseController db = controller;
-    InstanceLock lock = instanceLock;
-    shutDownInOrder(db == null ? () -> {} : db::shutdown, lock == null ? () -> {} : lock::close);
-    // Штатный выход завершён: хук завершения JVM больше ничего не останавливает
-    setExternalStop(null);
+    launchExit(exitChain(controller, instanceLock));
   }
 
   /**
-   * Тело хука завершения JVM: останавливает сервис БД, если он ещё не остановлен штатным выходом.
-   * Не касается JavaFX — тулкит к моменту внешнего завершения (сигнал, остановка из среды
-   * разработки) может быть уже мёртв. Ошибки остановки журналируются и завершению не мешают;
-   * идемпотентно со штатным выходом, который снимает действие остановки.
+   * Цепочка завершения: сначала останавливается работа с БД (с ожиданием записи настроек), и только
+   * потом освобождается блокировка экземпляра, чтобы новый экземпляр не открыл файл, пока старый
+   * ещё с ним работает. Блокировка освобождается, даже если остановка завершилась ошибкой.
+   * Последним снимается действие хука: штатный выход завершён, хук больше ничего не останавливает.
+   */
+  static Runnable exitChain(@Nullable DatabaseController db, @Nullable InstanceLock lock) {
+    return () -> {
+      shutDownInOrder(db == null ? () -> {} : db::shutdown, lock == null ? () -> {} : lock::close);
+      // Штатный выход завершён: хук завершения JVM больше ничего не останавливает
+      setExternalStop(null);
+    };
+  }
+
+  /** Запускает цепочку завершения один раз: повторный вызов ничего не делает. */
+  private void launchExit(Runnable chain) {
+    if (exitStarted.compareAndSet(false, true)) {
+      // Запускатель не null по построению: поле инициализировано и меняется только целиком
+      Objects.requireNonNull(exitLauncher.get()).accept(chain);
+    }
+  }
+
+  /** Тестовый крючок: заменяет запускатель цепочки завершения. */
+  void launchExitChainWith(Consumer<Runnable> launcher) {
+    exitLauncher.set(launcher);
+  }
+
+  /** Запускает цепочку завершения на выделенном потоке {@link #EXIT_THREAD_NAME}. */
+  private static void startExitThread(Runnable chain) {
+    // Не демон: процесс живёт до конца цепочки и завершается сам с кодом 0
+    var thread = new Thread(chain, EXIT_THREAD_NAME);
+    thread.setDaemon(false);
+    thread.start();
+  }
+
+  /**
+   * Тело хука завершения JVM: останавливает сервис БД и дожидается записи настроек, если штатный
+   * выход их ещё не остановил. Не касается JavaFX — тулкит к моменту внешнего завершения (сигнал,
+   * остановка из среды разработки) может быть уже мёртв. Ошибки остановки журналируются и
+   * завершению не мешают; идемпотентно со штатным выходом, который снимает действие остановки.
    */
   public static void stopDatabaseOnExternalShutdown() {
     Runnable stop = externalStop;

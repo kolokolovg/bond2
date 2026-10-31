@@ -18,6 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -181,6 +182,16 @@ class DatabaseControllerTest {
               threads.add(Thread.currentThread());
               task.run();
             });
+  }
+
+  /**
+   * Исполнитель записи настроек с воротами: задача перед запуском сигнализирует о начале («запись
+   * началась») и ждёт разрешения на продолжение. Обёртка — {@link ExecutorService}, поэтому
+   * остановка в {@code stopWriting} ждёт удержанную запись по-настоящему.
+   */
+  private static SettingsPersistenceTest.GatedExecutorService gatedSettingsExecutor(
+      ExecutorService executor, CountDownLatch entered, CountDownLatch release) {
+    return new SettingsPersistenceTest.GatedExecutorService(executor, entered, release);
   }
 
   private void saveSettings(Path databasePath, boolean autoOpen) {
@@ -544,6 +555,90 @@ class DatabaseControllerTest {
 
     assertThat(exits.get()).isEqualTo(1);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  @Test
+  void exitTimeoutShowsWarningAndExitsAfterConfirmation() throws InterruptedException {
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    // Выход начат как обычно: флаг exiting выставлен, остановка ждёт открытия
+    db.requestExit();
+    dialogs.pendingExitWarning = new CompletableFuture<>();
+
+    // Истечение срока остановки доставляется как обычный итог остановки
+    ui.execute(() -> db.onExitResult(ShutdownResult.TIMED_OUT));
+    ui.pumpUntil(() -> dialogs.exitWarnings.size() == 1);
+
+    assertThat(dialogs.exitWarnings.get(0)).contains("не полностью").contains("восстановятся");
+    assertThat(exits.get()).isZero();
+
+    // Повторный запрос игнорируется: диалог не накапливается, выход не начинается заново
+    db.requestExit();
+    ui.settle();
+    assertThat(dialogs.exitWarnings).hasSize(1);
+
+    dialogs.pendingExitWarning.complete(null);
+    ui.pumpUntil(() -> exits.get() == 1);
+  }
+
+  @Test
+  void exitTimeoutOutsideMenuIsLoggedWithoutDialog() throws InterruptedException {
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
+
+    var capture = new LogCapture();
+    CONTROLLER_LOG.addHandler(capture);
+    ShutdownResult result;
+    try {
+      result = db.shutdown(Duration.ofMillis(50));
+    } finally {
+      CONTROLLER_LOG.removeHandler(capture);
+    }
+
+    assertThat(result).isEqualTo(ShutdownResult.TIMED_OUT);
+    assertThat(capture.messages)
+        .anySatisfy(m -> assertThat(m).contains("не завершилась в срок").contains("WAL"));
+    // Диалог в пути без меню невозможен: ни предупреждения, ни диалога выхода
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dialogs.exitWarnings).isEmpty();
+  }
+
+  @Test
+  void menuExitDuringOngoingStopRunsSingleShutdownAndExitsOnce() throws InterruptedException {
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
+    storage.openGate.hold();
+    var db = controller();
+    db.openDatabase();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+
+    // Меню-путь начал асинхронную остановку: она ждёт открытия
+    db.requestExit();
+    var chain = CompletableFuture.runAsync(db::shutdown);
+    // Поток «интерфейса» свободен: цепочка завершения ждёт ту же остановку сервиса
+    assertThat(chain).isNotDone();
+
+    storage.openGate.release();
+    assertThat(chain).succeedsWithin(Duration.ofSeconds(10));
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
+
+    // Вторая остановка не потребовалась: сервис получил одну команду, БД закрыта, выход один
+    assertThat(storage.opened).hasSize(1);
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+    assertThat(exits.get()).isEqualTo(1);
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+    assertThat(dialogs.exitWarnings).isEmpty();
   }
 
   @Test
@@ -1147,6 +1242,39 @@ class DatabaseControllerTest {
   }
 
   @Test
+  void externalShutdownHookWaitsForUnfinishedSettingsWrite() throws InterruptedException {
+    var executor = settingsExecutor();
+    var writeStarted = new CountDownLatch(1);
+    var releaseWrite = new CountDownLatch(1);
+    var db =
+        controllerWith(settingsFile(), gatedSettingsExecutor(executor, writeStarted, releaseWrite));
+    try {
+      // createDatabase запускает фоновую запись пути БД через исполнителя с воротами
+      db.createDatabase(userFile());
+      // Итог создания доставляется через очередь «потока интерфейса» и запускает запись:
+      // прокачиваем, пока запись не войдёт в ворота
+      ui.pumpUntil(() -> isOpen(db) && writeStarted.getCount() == 0);
+
+      var stopping = CompletableFuture.runAsync(db::stopForExternalShutdown);
+      // Сервис уже остановлен синхронной частью хука: ждать может только запись настроек
+      assertThat(stopping).isNotDone();
+
+      releaseWrite.countDown();
+      assertThat(stopping).succeedsWithin(Duration.ofSeconds(10));
+
+      assertThat(service.open(userFile(), false).join())
+          .isInstanceOfSatisfying(
+              OpenResult.Rejected.class,
+              rejected -> assertThat(rejected.message()).contains("остановлен"));
+      // Удержанная запись дошла до файла
+      assertThat(settingsFileHas(settingsFile(), userFile(), true)).isTrue();
+    } finally {
+      releaseWrite.countDown();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
   void shutdownWhileClosedDoesNothing() {
     var db = controller();
 
@@ -1357,15 +1485,27 @@ class DatabaseControllerTest {
     final List<String> questions = new ArrayList<>();
     final List<String> warnings = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
+    final List<String> exitWarnings = new ArrayList<>();
     boolean migrationAnswer = true;
 
     /** Если задан, диалог остаётся открытым, пока тест не завершит этот future. */
     @Nullable CompletableFuture<Boolean> pending;
 
+    /** Если задан, диалог выхода остаётся открытым, пока тест не завершит этот future. */
+    @Nullable CompletableFuture<Void> pendingExitWarning;
+
     @Override
     public CompletableFuture<Boolean> confirmMigration(String question) {
       questions.add(question);
       return pending != null ? pending : CompletableFuture.completedFuture(migrationAnswer);
+    }
+
+    @Override
+    public CompletableFuture<Void> warnBeforeExit(String message) {
+      exitWarnings.add(message);
+      return pendingExitWarning != null
+          ? pendingExitWarning
+          : CompletableFuture.completedFuture(null);
     }
 
     @Override
