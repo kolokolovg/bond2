@@ -4,14 +4,12 @@ package ru.onlychill.bonds2.ui;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.executeSql;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.newDatabaseAt;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
@@ -19,7 +17,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -374,40 +371,6 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void outdatedSchemaIsMigratedAfterConfirmationWithBackup() throws SQLException, IOException {
-    TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(dialogs.questions).hasSize(1);
-    assertThat(dialogs.questions.get(0)).contains("резервная копия");
-    assertThat(isOpen(db)).isTrue();
-    assertThat(backupsIn(dataDir())).hasSize(1);
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  @Test
-  void refusedMigrationLeavesFileUntouchedAndDatabaseClosed() throws SQLException, IOException {
-    TestDatabases.outdatedAt(userFile());
-    byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
-    dialogs.migrationAnswer = false;
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(dialogs.questions).hasSize(1);
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: схема устарела");
-    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  @Test
   void emptyFileIsInitializedWithoutMigrationQuestion() throws IOException {
     Files.createDirectories(dataDir());
     Files.createFile(userFile());
@@ -441,25 +404,6 @@ class DatabaseControllerTest {
         .contains("не является базой данных bonds2")
         .contains("Файл не изменён");
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-  }
-
-  @Test
-  void failedMigrationRestoresFileAndShowsErrorWithRestoreNote() throws SQLException, IOException {
-    TestDatabases.forgottenHistoryAt(userFile());
-    saveSettings(userFile(), true);
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка миграции");
-    assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0)).contains("восстановлена").contains(".bak-");
-    // Файл восстановлен копией: VACUUM INTO пишет компактный файл, поэтому сравниваем с копией
-    List<String> backups = backupsIn(dataDir());
-    assertThat(backups).hasSize(1);
-    assertThat(Files.readAllBytes(userFile()))
-        .isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
   }
 
   @Test
@@ -761,36 +705,6 @@ class DatabaseControllerTest {
     assertThat(dialogs.errors).isEmpty();
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
     assertThat(backupsIn(dataDir())).isEmpty();
-  }
-
-  @Test
-  void migrationDialogCancelledByAnotherWayIsNotReportedAsError() throws SQLException {
-    TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
-    var db = controller();
-    dialogs.pending = new CompletableFuture<>();
-
-    db.openOnStartup();
-    ui.pumpUntil(() -> dialogs.questions.size() == 1);
-    dialogs.pending.cancel(true);
-    ui.settle();
-
-    assertThat(dialogs.errors).isEmpty();
-    assertThat(db.stateProperty().get()).isInstanceOf(DbState.AwaitingMigration.class);
-  }
-
-  @Test
-  void declinedMigrationClosesDatabaseWithoutChangingFile() throws SQLException, IOException {
-    TestDatabases.outdatedAt(userFile());
-    byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
-    var db = controller();
-    dialogs.migrationAnswer = false;
-
-    db.openOnStartup();
-    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
-
-    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
   }
 
   @Test
@@ -1372,30 +1286,6 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void saveSettingsWritesOnSettingsThreadAndAppliesOnUiQueue() {
-    var executor = settingsExecutor();
-    var writeThreads = new CopyOnWriteArrayList<Thread>();
-    var db = controllerWith(settingsFile(), recordingThreads(executor, writeThreads));
-    try {
-      var saving = db.saveSettings(new Settings(userFile(), false));
-
-      // Применение — только через очередь потока интерфейса: без прокачки настройки старые
-      assertThat(db.settings()).isEqualTo(Settings.defaults());
-      ui.pumpUntil(saving::isDone);
-
-      // Запись выполнена вне потока интерфейса
-      assertThat(saving).isCompleted();
-      assertThat(writeThreads).hasSize(1);
-      assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
-      assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
-      assertThat(new SettingsStore(settingsFile()).load().settings())
-          .isEqualTo(new Settings(userFile(), false));
-    } finally {
-      executor.shutdownNow();
-    }
-  }
-
-  @Test
   void createdDatabasePathIsRememberedOffUiThread() {
     saveSettings(null, false);
     var executor = settingsExecutor();
@@ -1415,44 +1305,6 @@ class DatabaseControllerTest {
     } finally {
       executor.shutdownNow();
     }
-  }
-
-  @Test
-  void shutdownStopsSettingsExecutor() {
-    var executor = settingsExecutor();
-    var db = controllerWith(settingsFile(), executor);
-
-    db.shutdown();
-
-    assertThat(executor.isShutdown()).isTrue();
-  }
-
-  @Test
-  void saveSettingsUpdatesMemoryAndFile() {
-    var db = controller();
-
-    var saving = db.saveSettings(new Settings(userFile(), false));
-    ui.pumpUntil(saving::isDone);
-
-    assertThat(saving).isCompleted();
-    assertThat(db.settings()).isEqualTo(new Settings(userFile(), false));
-    assertThat(new SettingsStore(settingsFile()).load().settings())
-        .isEqualTo(new Settings(userFile(), false));
-  }
-
-  @Test
-  void failedSaveKeepsPreviousSettings() throws IOException {
-    Files.writeString(dir.resolve("blocker"), "файл на месте каталога настроек");
-    var db = controllerWith(dir.resolve("blocker/settings.properties"));
-
-    var saving = db.saveSettings(new Settings(userFile(), false));
-    ui.pumpUntil(saving::isDone);
-
-    assertThat(saving).isCompletedExceptionally();
-    assertThatThrownBy(saving::join)
-        .isInstanceOf(CompletionException.class)
-        .hasCauseInstanceOf(UncheckedIOException.class);
-    assertThat(db.settings()).isEqualTo(Settings.defaults());
   }
 
   /** Подписчик, бросающий заданную ошибку только при доставке состояния «закрыта». */

@@ -4,20 +4,16 @@ package ru.onlychill.bonds2.ui;
 
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import javafx.beans.property.ReadOnlyObjectProperty;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.beans.property.ReadOnlyStringProperty;
 import javafx.beans.property.ReadOnlyStringWrapper;
-import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.dbservice.CloseResult;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
@@ -38,11 +34,6 @@ import ru.onlychill.bonds2.settings.SettingsStore;
  */
 final class DatabaseController {
 
-  /** Текст вопроса о миграции; резервная копия названа явно. */
-  private static final String MIGRATION_QUESTION =
-      "Схема БД устарела. Применить миграции? Перед миграцией будет создана резервная копия файла"
-          + " БД.";
-
   /** Выход во время миграции откладывается: прервать миграцию посреди нельзя. */
   private static final String MIGRATION_EXIT_WARNING =
       "Идёт миграция базы. Дождитесь её завершения, затем закройте окно.";
@@ -58,35 +49,20 @@ final class DatabaseController {
 
   private static final System.Logger LOG = System.getLogger(DatabaseController.class.getName());
 
-  /** Имя потока, на котором выполняется запись настроек. */
-  static final String SETTINGS_THREAD_NAME = "bonds2-settings";
-
-  private final SettingsStore store;
   private final Path defaultDatabaseFile;
   private final DatabaseService service;
   private final Dialogs dialogs;
   private final Runnable exit;
   private final Executor uiExecutor;
 
-  /** Фоновая запись настроек: один поток-демон, запись не задерживает поток интерфейса. */
-  private final Executor settingsExecutor;
+  /** Фоновая запись настроек: запись не задерживает поток интерфейса. */
+  private final SettingsPersistence persistence;
 
   private final ReadOnlyObjectWrapper<DbState> state = new ReadOnlyObjectWrapper<>(DbState.CLOSED);
   private final ReadOnlyStringWrapper status = new ReadOnlyStringWrapper(StatusText.CLOSED);
 
-  private Settings settings;
-
-  /** Файл настроек при запуске был испорчен и сброшен. */
-  private final boolean recovered;
-
-  /** Копия испорченного файла настроек; {@code null}, если её нет. */
-  private final @Nullable Path badCopy;
-
-  /** Открытый диалог миграции; {@code null}, если диалога нет. */
-  private @Nullable CompletableFuture<Boolean> migrationDialog;
-
-  /** Запущенная миграция; {@code null}, если её не было. */
-  private @Nullable CompletableFuture<OpenResult> migration;
+  /** Сценарий диалога миграции: вопрос, запуск или отклонение миграции, итог. */
+  private final MigrationFlow flow;
 
   /**
    * Открытие или создание идёт: повторный запрос до доставки результата игнорируется. {@code
@@ -132,7 +108,7 @@ final class DatabaseController {
         uiExecutor,
         Executors.newSingleThreadExecutor(
             runnable -> {
-              var thread = new Thread(runnable, SETTINGS_THREAD_NAME);
+              var thread = new Thread(runnable, SettingsPersistence.SETTINGS_THREAD_NAME);
               // Демон: незавершённая запись настроек не удерживает процесс при выходе
               thread.setDaemon(true);
               return thread;
@@ -153,16 +129,14 @@ final class DatabaseController {
       Runnable exit,
       Executor uiExecutor,
       Executor settingsExecutor) {
-    this.store = store;
     this.defaultDatabaseFile = defaultDatabaseFile;
     this.service = service;
     this.dialogs = dialogs;
     this.exit = exit;
     this.uiExecutor = uiExecutor;
-    this.settingsExecutor = settingsExecutor;
-    this.settings = loaded.settings();
-    this.recovered = loaded.recovered();
-    this.badCopy = loaded.badCopy();
+    this.persistence = new SettingsPersistence(store, loaded, uiExecutor, settingsExecutor);
+    // Предикаты — живой взгляд на флаги контроллера: значения читаются в момент решения
+    this.flow = new MigrationFlow(service, dialogs, uiExecutor, () -> exiting, () -> stopped);
     service.states().subscribe(new StateSubscriber(uiExecutor, this::apply));
   }
 
@@ -178,17 +152,19 @@ final class DatabaseController {
 
   /** Настройки, действующие сейчас (последние сохранённые). */
   Settings settings() {
-    return settings;
+    return persistence.settings();
   }
 
   /** Автооткрытие после показа окна: открывает БД, только если это включено в настройках. */
   void openOnStartup() {
+    boolean recovered = persistence.recovered();
     if (recovered) {
+      Path badCopy = persistence.badCopy();
       dialogs.warn(
           "Файл настроек был повреждён, настройки сброшены к значениям по умолчанию."
               + (badCopy != null ? " Копия повреждённого файла: " + badCopy : ""));
     }
-    if (settings.autoOpen()) {
+    if (persistence.settings().autoOpen()) {
       open(!recovered);
     }
   }
@@ -203,7 +179,7 @@ final class DatabaseController {
     if (busy || !state.get().allowsOpen()) {
       return;
     }
-    Path configured = settings.databasePath();
+    Path configured = persistence.settings().databasePath();
     Path file = configured != null ? configured : defaultDatabaseFile;
     deliverOperation(service.open(file, autoCreate && configured == null), this::onOpenResult);
   }
@@ -235,22 +211,7 @@ final class DatabaseController {
    *     закрывается по его завершении
    */
   CompletableFuture<Void> saveSettings(Settings updated) {
-    var saved = new CompletableFuture<Void>();
-    try {
-      settingsExecutor.execute(
-          () -> {
-            try {
-              store.save(updated);
-              saved.complete(null);
-            } catch (RuntimeException e) {
-              saved.completeExceptionally(e);
-            }
-          });
-    } catch (RejectedExecutionException e) {
-      saved.completeExceptionally(e);
-    }
-    // Применение настроек — только после записи и в потоке JavaFX
-    return saved.thenRunAsync(() -> settings = updated, uiExecutor);
+    return persistence.saveSettings(updated);
   }
 
   /**
@@ -272,7 +233,7 @@ final class DatabaseController {
     }
     exiting = true;
     if (current instanceof DbState.AwaitingMigration) {
-      cancelMigrationDialog();
+      flow.cancelDialog();
       declineAndStop();
     } else {
       deliverExitResult(service.shutdownAsync(SHUTDOWN_TIMEOUT));
@@ -340,14 +301,6 @@ final class DatabaseController {
     }
   }
 
-  private void cancelMigrationDialog() {
-    CompletableFuture<Boolean> dialog = migrationDialog;
-    migrationDialog = null;
-    if (dialog != null) {
-      dialog.cancel(true);
-    }
-  }
-
   /**
    * Вызывается при завершении приложения в обход меню: останавливает сервис и ждёт не дольше {@link
    * #STOP_TIMEOUT}. Ожидающая решения миграция считается отклонённой, идущая доводится до конца не
@@ -368,7 +321,7 @@ final class DatabaseController {
       if (shutdown(STOP_TIMEOUT) != ShutdownResult.REFUSED) {
         return;
       }
-      cancelMigrationDialog();
+      flow.cancelDialog();
       // Ожидание миграции в stop() (до MIGRATION_TIMEOUT) сохранено сознательно. Вызов идёт из
       // потока
       // JavaFX, и блокировка этого потока неприятна, но прервать миграцию хуже, чем подождать:
@@ -376,6 +329,7 @@ final class DatabaseController {
       // при следующем запуске потерял бы гарантию «файл не тронут». Случай редкий: без меню stop()
       // почти не вызывается.
       CompletableFuture<?> prepared = CompletableFuture.completedFuture(null);
+      CompletableFuture<OpenResult> migration = flow.currentMigration();
       if (service.state() instanceof DbState.AwaitingMigration) {
         prepared = service.declineMigration();
       } else if (migration != null) {
@@ -392,14 +346,7 @@ final class DatabaseController {
       // журналируется, а завершение продолжается: остановка записи настроек идёт в finally
       LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД при внешнем завершении", e);
     } finally {
-      stopSettingsWriting();
-    }
-  }
-
-  /** Останавливает фоновую запись настроек; незавершённая запись доходит до конца на демоне. */
-  private void stopSettingsWriting() {
-    if (settingsExecutor instanceof ExecutorService executorService) {
-      executorService.shutdown();
+      persistence.stopWriting();
     }
   }
 
@@ -418,7 +365,7 @@ final class DatabaseController {
     }
     switch (result) {
       case OpenResult.Opened opened -> {}
-      case OpenResult.NeedsMigration needs -> askAboutMigration();
+      case OpenResult.NeedsMigration needs -> flow.askAboutMigration();
       case OpenResult.Failed failure -> dialogs.error(failure.message());
       case OpenResult.Rejected rejected ->
           LOG.log(System.Logger.Level.DEBUG, "Открытие отклонено: " + rejected.message());
@@ -463,7 +410,7 @@ final class DatabaseController {
   /** Записывает путь новой БД в настройки в фоне; при ошибке записи БД остаётся открытой. */
   @SuppressWarnings("FutureReturnValueIgnored")
   private void rememberDatabasePath(Path file) {
-    saveSettings(new Settings(file, settings.autoOpen()))
+    saveSettings(new Settings(file, persistence.settings().autoOpen()))
         .exceptionallyAsync(
             error -> {
               dialogs.warn(
@@ -472,48 +419,6 @@ final class DatabaseController {
               return null;
             },
             uiExecutor);
-  }
-
-  /**
-   * Спрашивает согласие на миграцию; без согласия файл не меняется и БД не открывается. Если выход
-   * уже начат или приложение остановлено, диалог не показывается и миграция не запускается.
-   */
-  @SuppressWarnings("FutureReturnValueIgnored")
-  private void askAboutMigration() {
-    if (exiting || stopped) {
-      return;
-    }
-    CompletableFuture<Boolean> dialog = dialogs.confirmMigration(MIGRATION_QUESTION);
-    migrationDialog = dialog;
-    dialog
-        .thenComposeAsync(this::onMigrationAnswer, uiExecutor)
-        .exceptionally(
-            error -> {
-              if (!(error instanceof CancellationException)
-                  && !(error.getCause() instanceof CancellationException)) {
-                LOG.log(System.Logger.Level.ERROR, "Сбой операции с БД", error);
-              }
-              return null;
-            });
-  }
-
-  private CompletableFuture<Void> onMigrationAnswer(boolean confirmed) {
-    migrationDialog = null;
-    if (confirmed) {
-      CompletableFuture<OpenResult> started = service.migrate();
-      migration = started;
-      return started.thenAcceptAsync(this::onMigrationResult, uiExecutor);
-    }
-    return service.declineMigration().thenAccept(result -> {});
-  }
-
-  private void onMigrationResult(OpenResult result) {
-    if (stopped) {
-      return;
-    }
-    if (result instanceof OpenResult.Failed failure) {
-      dialogs.error(failure.message());
-    }
   }
 
   /**
