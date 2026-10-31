@@ -3,6 +3,7 @@ build/
 .idea/
 *.iml
 .opencode/tmp/
+.zcode/tmp/
 .kotlin/
 tools/
 .jqwik-database
