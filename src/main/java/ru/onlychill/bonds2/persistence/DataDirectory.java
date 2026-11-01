@@ -22,16 +22,6 @@ public final class DataDirectory {
     return appDirectory(osName, env, home).resolve("bonds2.db");
   }
 
-  /** Файл настроек для текущей ОС и окружения: в том же каталоге, что и файл БД. */
-  public static Path settingsFile() {
-    return settingsFile(
-        System.getProperty("os.name"), System::getenv, Path.of(System.getProperty("user.home")));
-  }
-
-  static Path settingsFile(String osName, UnaryOperator<String> env, Path home) {
-    return appDirectory(osName, env, home).resolve("settings.properties");
-  }
-
   /** Файл блокировки единственного экземпляра для текущей ОС и окружения. */
   public static Path lockFile() {
     return lockFile(

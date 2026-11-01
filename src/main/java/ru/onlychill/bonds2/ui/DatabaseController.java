@@ -7,7 +7,6 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import javafx.beans.property.ReadOnlyObjectProperty;
@@ -63,8 +62,11 @@ final class DatabaseController {
   private final Runnable exit;
   private final Executor uiExecutor;
 
-  /** Фоновая запись настроек: запись не задерживает поток интерфейса. */
-  private final SettingsPersistence persistence;
+  /** Хранилище настроек: синхронная запись из потока интерфейса. */
+  private final SettingsStore store;
+
+  /** Настройки, действующие сейчас (последние сохранённые). */
+  private Settings settings;
 
   private final ReadOnlyObjectWrapper<DbState> state = new ReadOnlyObjectWrapper<>(DbState.CLOSED);
   private final ReadOnlyStringWrapper status = new ReadOnlyStringWrapper(StatusText.CLOSED);
@@ -93,9 +95,8 @@ final class DatabaseController {
   private volatile boolean stopped;
 
   /**
-   * @param store хранилище настроек; используется для фоновой записи обновлённых настроек
-   * @param loaded результат чтения настроек, выполненного до создания контроллера вне потока
-   *     интерфейса
+   * @param store хранилище настроек; синхронная запись из потока интерфейса
+   * @param loaded настройки, прочитанные до создания контроллера
    * @param defaultDatabaseFile файл БД, если в настройках путь не задан
    * @param service сервис жизненного цикла БД; контроллер подписывается на его состояние
    * @param dialogs диалоги пользователя
@@ -104,49 +105,19 @@ final class DatabaseController {
    */
   DatabaseController(
       SettingsStore store,
-      SettingsStore.LoadResult loaded,
+      Settings loaded,
       Path defaultDatabaseFile,
       DatabaseService service,
       Dialogs dialogs,
       Runnable exit,
       Executor uiExecutor) {
-    this(
-        store,
-        loaded,
-        defaultDatabaseFile,
-        service,
-        dialogs,
-        exit,
-        uiExecutor,
-        Executors.newSingleThreadExecutor(
-            runnable -> {
-              var thread = new Thread(runnable, SettingsPersistence.SETTINGS_THREAD_NAME);
-              // Демон: незавершённая запись настроек не удерживает процесс при выходе
-              thread.setDaemon(true);
-              return thread;
-            }));
-  }
-
-  /**
-   * @param settingsExecutor выполняет запись настроек вне потока интерфейса; приложение использует
-   *     однопоточный исполнитель с потоком-демоном, тесты подменяют его, чтобы проверять поток
-   *     записи
-   */
-  DatabaseController(
-      SettingsStore store,
-      SettingsStore.LoadResult loaded,
-      Path defaultDatabaseFile,
-      DatabaseService service,
-      Dialogs dialogs,
-      Runnable exit,
-      Executor uiExecutor,
-      Executor settingsExecutor) {
     this.defaultDatabaseFile = defaultDatabaseFile;
     this.service = service;
     this.dialogs = dialogs;
     this.exit = exit;
     this.uiExecutor = uiExecutor;
-    this.persistence = new SettingsPersistence(store, loaded, uiExecutor, settingsExecutor);
+    this.store = store;
+    this.settings = loaded;
     // Предикаты — живой взгляд на флаги контроллера: значения читаются в момент решения
     this.flow = new MigrationFlow(service, dialogs, uiExecutor, () -> exiting, () -> stopped);
     service.states().subscribe(new StateSubscriber(uiExecutor, this::apply));
@@ -164,20 +135,13 @@ final class DatabaseController {
 
   /** Настройки, действующие сейчас (последние сохранённые). */
   Settings settings() {
-    return persistence.settings();
+    return settings;
   }
 
   /** Автооткрытие после показа окна: открывает БД, только если это включено в настройках. */
   void openOnStartup() {
-    boolean recovered = persistence.recovered();
-    if (recovered) {
-      Path badCopy = persistence.badCopy();
-      dialogs.warn(
-          "Файл настроек был повреждён, настройки сброшены к значениям по умолчанию."
-              + (badCopy != null ? " Копия повреждённого файла: " + badCopy : ""));
-    }
-    if (persistence.settings().autoOpen()) {
-      open(!recovered);
+    if (settings.autoOpen()) {
+      open(true);
     }
   }
 
@@ -191,7 +155,7 @@ final class DatabaseController {
     if (busy || !state.get().allowsOpen()) {
       return;
     }
-    Path configured = persistence.settings().databasePath();
+    Path configured = settings.databasePath();
     Path file = configured != null ? configured : defaultDatabaseFile;
     deliverOperation(service.open(file, autoCreate && configured == null), this::onOpenResult);
   }
@@ -216,14 +180,13 @@ final class DatabaseController {
   }
 
   /**
-   * Записывает настройки на фоновом исполнителе и применяет их по завершении в потоке JavaFX.
-   * Ошибка записи завершает future исключением, прежние настройки остаются в силе.
-   *
-   * @return завершается после записи и применения настроек; вызывающая сторона (окно настроек)
-   *     закрывается по его завершении
+   * Сохраняет настройки синхронно в потоке интерфейса и применяет их; платформенное хранилище
+   * пишется за миллисекунды. Ошибка записи даёт {@link java.io.UncheckedIOException}; прежние
+   * настройки остаются действующими.
    */
-  CompletableFuture<Void> saveSettings(Settings updated) {
-    return persistence.saveSettings(updated);
+  void saveSettings(Settings updated) {
+    store.save(updated);
+    settings = updated;
   }
 
   /**
@@ -335,8 +298,7 @@ final class DatabaseController {
    * #MIGRATION_TIMEOUT}. Результаты, пришедшие позже, игнорируются. Сбой самой остановки сервиса
    * (синхронной или асинхронной в конце цепочки) журналируется и завершению не мешает: диалог в
    * пути завершения невозможен — тулкит гаснет, процесс обязан завершиться, — поэтому ошибка
-   * остаётся в журнале, а завершение продолжается. В конце ждёт незавершённую запись настроек: она
-   * доходит до файла или истекает её срок, файл остаётся целым благодаря атомарной замене.
+   * остаётся в журнале, а завершение продолжается.
    *
    * <p>Метод выполняется на любом потоке: в приложении это выделенный поток завершения {@code
    * bonds2-exit}, поэтому ожидание не задерживает поток интерфейса.
@@ -367,10 +329,8 @@ final class DatabaseController {
       stopped = true;
     } catch (RuntimeException | Error e) {
       // Диалог здесь невозможен: тулкит гаснет, процесс обязан завершиться. Сбой остановки
-      // журналируется, а завершение продолжается: остановка записи настроек идёт в finally
+      // журналируется, а завершение продолжается
       LOG.log(System.Logger.Level.ERROR, "Сбой остановки сервиса БД при внешнем завершении", e);
-    } finally {
-      persistence.stopWriting();
     }
   }
 
@@ -385,17 +345,11 @@ final class DatabaseController {
   }
 
   /**
-   * Действие хука завершения JVM: останавливает сервис не дольше {@link #STOP_TIMEOUT} и ждёт
-   * незавершённую запись настроек не дольше срока записи. Диалог здесь невозможен; истечение срока
-   * остаётся в журнале.
+   * Действие хука завершения JVM: останавливает сервис не дольше {@link #STOP_TIMEOUT}. Диалог
+   * здесь невозможен; истечение срока остаётся в журнале.
    */
   void stopForExternalShutdown() {
-    try {
-      shutdown(STOP_TIMEOUT);
-    } finally {
-      // Незавершённая запись настроек доходит до файла или истекает её срок: файл остаётся целым
-      persistence.stopWriting();
-    }
+    shutdown(STOP_TIMEOUT);
   }
 
   /** Истечение срока остановки — в журнал: диалог в путях без меню невозможен. */
@@ -456,18 +410,14 @@ final class DatabaseController {
     }
   }
 
-  /** Записывает путь новой БД в настройки в фоне; при ошибке записи БД остаётся открытой. */
-  @SuppressWarnings("FutureReturnValueIgnored")
+  /** Записывает путь новой БД в настройки; при ошибке записи БД остаётся открытой. */
   private void rememberDatabasePath(Path file) {
-    saveSettings(new Settings(file, persistence.settings().autoOpen()))
-        .exceptionallyAsync(
-            error -> {
-              dialogs.warn(
-                  "База создана и открыта, но путь не записан в настройки. "
-                      + ErrorMessages.of(failureOf(error)));
-              return null;
-            },
-            uiExecutor);
+    try {
+      saveSettings(new Settings(file, settings.autoOpen()));
+    } catch (RuntimeException e) {
+      dialogs.warn(
+          "База создана и открыта, но путь не записан в настройки. " + ErrorMessages.of(e));
+    }
   }
 
   /**

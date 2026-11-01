@@ -12,14 +12,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Supplier;
 import javafx.application.Platform;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.scene.Group;
@@ -37,6 +31,7 @@ import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.OpenResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.InstanceLock;
+import ru.onlychill.bonds2.settings.MemorySettingsBackend;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
@@ -132,27 +127,14 @@ class MainWindowAppTest {
   }
 
   @Test
-  void exitChainStopsDatabaseWaitsForSettingsWriteAndThenReleasesLock() throws Exception {
+  void exitChainStopsDatabaseThenReleasesLock() throws Exception {
     var file = dir.resolve("data/bonds.db");
     var lockFile = dir.resolve("bonds2.lock");
-    var settingsFile = dir.resolve("cfg/settings.properties");
-    var executor =
-        Executors.newSingleThreadExecutor(
-            runnable -> {
-              var thread = new Thread(runnable, "test-settings");
-              thread.setDaemon(true);
-              return thread;
-            });
-    var writeStarted = new CountDownLatch(1);
-    var releaseWrite = new CountDownLatch(1);
-    // Запись сигнализирует о начале и ждёт разрешения на воротах исполнителя
-    Executor gatedWrite =
-        new SettingsPersistenceTest.GatedExecutorService(executor, writeStarted, releaseWrite);
     TestDatabases.newDatabaseAt(file);
     var storage = new GatedStorage();
     var service = new DatabaseService(storage);
     var exits = new AtomicInteger();
-    var store = new SettingsStore(settingsFile);
+    var store = new SettingsStore(new MemorySettingsBackend());
     var db =
         new DatabaseController(
             store,
@@ -161,27 +143,20 @@ class MainWindowAppTest {
             service,
             new DatabaseControllerTest.RecordingDialogs(),
             exits::incrementAndGet,
-            Platform::runLater,
-            gatedWrite);
+            Platform::runLater);
     Optional<InstanceLock> lock = Optional.empty();
     try {
       service.open(file, false).join();
       lock = InstanceLock.tryAcquire(lockFile);
       assertThat(lock).isPresent();
 
+      // Настройки сохранены синхронно до цепочки: они переживут завершение
       db.saveSettings(new Settings(file, false));
-      assertThat(writeStarted.await(10, TimeUnit.SECONDS)).isTrue();
 
       var done = CompletableFuture.runAsync(MainWindowApp.exitChain(db, lock.orElse(null)));
-
-      // Запись удерживается: цепочка ждёт её, а блокировка ещё занята этим экземпляром
-      assertThat(done).isNotDone();
-      assertThat(InstanceLock.tryAcquire(lockFile)).isEmpty();
-
-      releaseWrite.countDown();
       assertThat(done).succeedsWithin(Duration.ofSeconds(10));
 
-      // Блокировка освобождена после остановки БД и записи: её берёт новый экземпляр
+      // Блокировка освобождена после остановки БД: её берёт новый экземпляр
       var reacquired = InstanceLock.tryAcquire(lockFile);
       assertThat(reacquired).isPresent();
       reacquired.ifPresent(InstanceLock::close);
@@ -190,17 +165,32 @@ class MainWindowAppTest {
           .isInstanceOfSatisfying(
               OpenResult.Rejected.class,
               rejected -> assertThat(rejected.message()).contains("остановлен"));
-      // Удержанная запись дошла до файла
-      assertThat(new SettingsStore(settingsFile).load().settings())
-          .isEqualTo(new Settings(file, false));
+      assertThat(store.load()).isEqualTo(new Settings(file, false));
     } finally {
-      releaseWrite.countDown();
-      executor.shutdownNow();
       storage.openGate.release();
       storage.migrateGate.release();
       lock.ifPresent(InstanceLock::close);
       service.shutdown(Duration.ofSeconds(30));
     }
+  }
+
+  @Test
+  void shutDownInOrderRunsStopBeforeLockAndReleasesLockEvenOnStopFailure() {
+    var calls = new ArrayList<String>();
+
+    // Сбой остановки пробрасывается, но не лишает блокировку освобождения
+    assertThatThrownBy(
+            () ->
+                MainWindowApp.shutDownInOrder(
+                    () -> {
+                      calls.add("stop");
+                      throw new IllegalStateException("сбой остановки");
+                    },
+                    () -> calls.add("lock")))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessage("сбой остановки");
+
+    assertThat(calls).containsExactly("stop", "lock");
   }
 
   @Test
@@ -282,73 +272,6 @@ class MainWindowAppTest {
   }
 
   @Test
-  void slowSettingsLoadDoesNotBlockFxThreadAndWindowAppearsAfterIt() throws InterruptedException {
-    var loadEntered = new CountDownLatch(1);
-    var releaseLoad = new CountDownLatch(1);
-    var windows = new CopyOnWriteArrayList<Stage>();
-    var showThreads = new CopyOnWriteArrayList<Thread>();
-    // «Медленный диск»: чтение началось, но не завершается, пока ворота не открыты
-    Supplier<SettingsStore.LoadResult> slowLoad =
-        () -> {
-          loadEntered.countDown();
-          await(releaseLoad);
-          return new SettingsStore.LoadResult(new Settings(FILE, true), null, false);
-        };
-    Executor loader =
-        task -> {
-          var thread = new Thread(task, MainWindowApp.SETTINGS_LOAD_THREAD_NAME + "-test");
-          thread.setDaemon(true);
-          thread.start();
-        };
-
-    runOnFxThread(
-        () ->
-            MainWindowApp.loadSettingsThenShow(
-                slowLoad,
-                loader,
-                loaded -> {
-                  showThreads.add(Thread.currentThread());
-                  var stage = new Stage();
-                  stage.setTitle("Bonds");
-                  stage.setScene(new Scene(new Group()));
-                  stage.show();
-                  windows.add(stage);
-                }));
-
-    // Чтение идёт на фоновом потоке: поток интерфейса отвечает, и окно ещё не показано
-    assertThat(loadEntered.await(10, TimeUnit.SECONDS)).isTrue();
-    runOnFxThread(
-        () -> {
-          assertThat(windows).isEmpty();
-          assertThat(showThreads).isEmpty();
-        });
-
-    // Окно появляется только после завершения чтения, продолжение — в потоке JavaFX
-    releaseLoad.countDown();
-    assertThat(holds(() -> !windows.isEmpty() && windows.get(0).isShowing())).isTrue();
-    assertThat(showThreads.get(0)).isNotEqualTo(Thread.currentThread());
-
-    runOnFxThread(
-        () -> {
-          for (Stage stage : windows) {
-            stage.close();
-          }
-        });
-  }
-
-  /** Ждёт открытия ворот; прерывание и тайм-аут превращаются в сбой теста. */
-  private static void await(CountDownLatch gate) {
-    try {
-      if (!gate.await(30, TimeUnit.SECONDS)) {
-        throw new IllegalStateException("Чтение настроек не завершилось вовремя");
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new IllegalStateException(e);
-    }
-  }
-
-  @Test
   void newDatabaseNameWithoutExtensionGetsDbAppended() {
     assertThat(MainWindowApp.withDbExtension(dir.resolve("база")).getFileName().toString())
         .isEqualTo("база.db");
@@ -379,7 +302,7 @@ class MainWindowAppTest {
 
     var failedOnce = new AtomicBoolean();
     var exits = new AtomicInteger();
-    var store = new SettingsStore(dir.resolve("cfg/settings.properties"));
+    var store = new SettingsStore(new MemorySettingsBackend());
     var db =
         new DatabaseController(
             store,

@@ -6,11 +6,9 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.beans.value.ObservableValue;
@@ -32,24 +30,21 @@ import ru.onlychill.bonds2.dbservice.ErrorMessages;
 import ru.onlychill.bonds2.persistence.DataDirectory;
 import ru.onlychill.bonds2.persistence.InstanceLock;
 import ru.onlychill.bonds2.persistence.PersistenceException;
+import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
-import ru.onlychill.bonds2.settings.SettingsStore.LoadResult;
 
 /**
  * Главное окно приложения: меню «Файл» (настройки, открытие, создание и закрытие БД, выход) и
- * строка состояния БД внизу. Чтение настроек при запуске выполняется вне потока интерфейса, логика
- * БД — в {@link DatabaseController}; здесь сборка интерфейса, действие остановки сервиса для хука
- * завершения JVM и цепочка штатного выхода: она выполняется на выделенном потоке завершения {@link
- * #EXIT_THREAD_NAME} и не блокирует поток интерфейса.
+ * строка состояния БД внизу. Настройки читаются синхронно из платформенного хранилища при запуске,
+ * логика БД — в {@link DatabaseController}; здесь сборка интерфейса, действие остановки сервиса для
+ * хука завершения JVM и цепочка штатного выхода: она выполняется на выделенном потоке завершения
+ * {@link #EXIT_THREAD_NAME} и не блокирует поток интерфейса.
  */
 public final class MainWindowApp extends Application {
 
   /** Действия пунктов меню «Файл». */
   record MenuActions(
       Runnable settings, Runnable open, Runnable create, Runnable close, Runnable exit) {}
-
-  /** Имя потока, на котором выполняется чтение настроек при запуске. */
-  static final String SETTINGS_LOAD_THREAD_NAME = "bonds2-settings-load";
 
   /** Имя потока, на котором выполняется цепочка завершения приложения. */
   static final String EXIT_THREAD_NAME = "bonds2-exit";
@@ -80,48 +75,15 @@ public final class MainWindowApp extends Application {
       Platform.exit();
       return;
     }
-    var store = new SettingsStore(DataDirectory.settingsFile());
-    // Чтение настроек идёт вне потока интерфейса: медленный диск не замораживает запуск
-    loadSettingsThenShow(store::load, settingsLoader(), loaded -> showWindow(stage, store, loaded));
-  }
-
-  /**
-   * Читает настройки вне потока интерфейса и по завершении передаёт готовый результат в поток
-   * JavaFX: там строится окно и выполняется автооткрытие по прочитанным значениям. Чтение по
-   * контракту {@link SettingsStore#load()} не бросает и возвращает значения с признаком сброса,
-   * если файл был испорчен.
-   *
-   * @param load чтение настроек
-   * @param loader выполняет чтение вне потока интерфейса
-   * @param show строит и показывает окно по готовому результату; вызывается в потоке JavaFX
-   */
-  static void loadSettingsThenShow(
-      Supplier<LoadResult> load, Executor loader, Consumer<LoadResult> show) {
-    loader.execute(
-        () -> {
-          LoadResult loaded = load.get();
-          try {
-            Platform.runLater(() -> show.accept(loaded));
-          } catch (IllegalStateException e) {
-            // Тулкит уже завершён: окно не нужно, остановку сервиса делает хук завершения JVM
-          }
-        });
-  }
-
-  /** Исполнитель чтения настроек: отдельный поток-демон читает один раз и завершается. */
-  private static Executor settingsLoader() {
-    return task -> {
-      var thread = new Thread(task, SETTINGS_LOAD_THREAD_NAME);
-      thread.setDaemon(true);
-      thread.start();
-    };
+    var store = new SettingsStore();
+    showWindow(stage, store, store.load());
   }
 
   /**
    * Строит меню, показывает окно и запускает автооткрытие по прочитанным настройкам; вызывается в
-   * потоке JavaFX после завершения чтения.
+   * потоке JavaFX.
    */
-  private void showWindow(Stage stage, SettingsStore store, LoadResult loaded) {
+  private void showWindow(Stage stage, SettingsStore store, Settings loaded) {
     var db =
         new DatabaseController(
             store,
@@ -158,9 +120,9 @@ public final class MainWindowApp extends Application {
 
   /**
    * Завершение приложения: возвращается сразу и не блокирует поток интерфейса. Цепочка завершения
-   * запускается один раз на выделенном потоке {@link #EXIT_THREAD_NAME}: остановка БД с ожиданием
-   * записи настроек → освобождение блокировки экземпляра → снятие действия хука завершения JVM.
-   * Повторный {@code stop()} вторую цепочку не создаёт.
+   * запускается один раз на выделенном потоке {@link #EXIT_THREAD_NAME}: остановка БД →
+   * освобождение блокировки экземпляра → снятие действия хука завершения JVM. Повторный {@code
+   * stop()} вторую цепочку не создаёт.
    */
   @Override
   public void stop() {

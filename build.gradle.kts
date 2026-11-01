@@ -157,6 +157,8 @@ spotbugs {
     effort = com.github.spotbugs.snom.Effort.MAX
     reportLevel = com.github.spotbugs.snom.Confidence.MEDIUM
     ignoreFailures = false
+    // Единственное исключение: обоснование в config/spotbugs/exclude.xml
+    excludeFilter = file("config/spotbugs/exclude.xml")
 }
 
 spotless {

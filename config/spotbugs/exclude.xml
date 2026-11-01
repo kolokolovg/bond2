@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Единственное намеренное исключение SpotBugs в проекте.
+
+  EI_EXPOSE_REP2 на внедряемом шве SettingsStore.Backend — ложное срабатывание на
+  зависимость, передаваемую через конструктор (тот же приём, что DatabaseService.Storage,
+  который эвристикой не помечается). Backend — поведение, а не данные: защитная копия
+  невозможна, а внешний доступ к полю отсутствует.
+-->
+<FindBugsFilter>
+  <Match>
+    <Class name="ru.onlychill.bonds2.settings.SettingsStore"/>
+    <Bug pattern="EI_EXPOSE_REP2"/>
+  </Match>
+</FindBugsFilter>

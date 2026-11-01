@@ -5,9 +5,7 @@ package ru.onlychill.bonds2.ui;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
-import java.util.function.Function;
-import javafx.application.Platform;
+import java.util.function.Consumer;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
@@ -22,7 +20,6 @@ import javafx.stage.FileChooser;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
 import javafx.stage.Window;
-import javafx.stage.WindowEvent;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.dbservice.ErrorMessages;
 import ru.onlychill.bonds2.settings.Settings;
@@ -32,11 +29,10 @@ import ru.onlychill.bonds2.settings.SettingsValidator;
  * Модальное окно настроек БД: путь к файлу с кнопкой «Обзор…», флажок автооткрытия, «Сохранить» и
  * «Отмена».
  *
- * <p>Проверку пути делает {@link SettingsValidator}, сохранение — переданный обработчик на фоновом
- * потоке. Окно закрывается только после завершения записи, и всё время записи оно заблокировано:
- * кнопки и поля отключены, закрытие через крестик и «Отмена» игнорируются, повторное сохранение
- * невозможно. Если запись не удалась, окно остаётся открытым, элементы снова активны и показывается
- * причина ошибки.
+ * <p>Проверку пути делает {@link SettingsValidator}, сохранение — переданный обработчик;
+ * платформенное хранилище пишется за миллисекунды, поэтому запись выполняется синхронно в потоке
+ * интерфейса и окно закрывается сразу после неё. Если запись не удалась, окно остаётся открытым и
+ * показывает причину ошибки.
  */
 final class SettingsDialog {
 
@@ -50,23 +46,16 @@ final class SettingsDialog {
   private final Button browseButton = new Button("Обзор…");
   private final Button saveButton = new Button("Сохранить");
   private final Button cancelButton = new Button("Отмена");
-  private final Function<Settings, CompletableFuture<Void>> saver;
-
-  /** Идёт фоновая запись: до её завершения окно заблокировано. */
-  private boolean saving;
+  private final Consumer<Settings> saver;
 
   /**
    * @param owner главное окно, над которым открывается диалог
    * @param current текущие настройки: из них заполняются поля
    * @param defaultFile путь по умолчанию: подсказка для пустого поля
-   * @param saver записывает настройки в фоне и возвращает future, завершающийся после записи;
-   *     ошибка записи завершает future исключением
+   * @param saver сохраняет настройки синхронно; ошибка записи даёт {@link UncheckedIOException}
    */
   SettingsDialog(
-      @Nullable Window owner,
-      Settings current,
-      Path defaultFile,
-      Function<Settings, CompletableFuture<Void>> saver) {
+      @Nullable Window owner, Settings current, Path defaultFile, Consumer<Settings> saver) {
     this.saver = saver;
     this.stage = new Stage();
 
@@ -127,15 +116,10 @@ final class SettingsDialog {
   }
 
   /**
-   * «Сохранить»: проверяет путь и передаёт настройки обработчику; окно закрывается только после
-   * завершения записи. Ошибка проверки или записи показывается в окне, настройки при этом не
-   * меняются. Пока запись идёт, окно заблокировано: повторный вызов ничего не делает.
+   * «Сохранить»: проверяет путь и сохраняет настройки синхронно; при успехе окно закрывается.
+   * Ошибка проверки или записи показывается в окне, настройки при этом не применяются.
    */
   void save() {
-    // Повторный вызов во время записи игнорируется: кнопка отключена, а это страховка
-    if (saving) {
-      return;
-    }
     String text = pathField.getText();
     Optional<String> problem = SettingsValidator.validateDatabasePath(text);
     if (problem.isPresent()) {
@@ -143,50 +127,17 @@ final class SettingsDialog {
       return;
     }
     errorLabel.setText("");
-    CompletableFuture<Void> write;
     try {
-      write = saver.apply(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
+      saver.accept(new Settings(Settings.parseDatabasePath(text), autoOpenBox.isSelected()));
+      stage.close();
     } catch (UncheckedIOException e) {
       errorLabel.setText(ErrorMessages.of(e));
-      return;
     }
-    // Запись идёт в фоне: блокируем окно, чтобы её нельзя было прервать или запустить заново
-    setBusy(true);
-    stage.setOnCloseRequest(WindowEvent::consume);
-    write.whenComplete(
-        (value, error) ->
-            Platform.runLater(
-                () -> {
-                  // Сначала снимаем блокировку и перехват закрытия: окно снова активно
-                  stage.setOnCloseRequest(null);
-                  setBusy(false);
-                  if (error != null) {
-                    errorLabel.setText(ErrorMessages.of(error));
-                  } else {
-                    stage.close();
-                  }
-                }));
   }
 
-  /**
-   * «Отмена» и закрытие окна: настройки не меняются. Пока идёт запись, отменить нельзя: окно
-   * блокируется до завершения записи, поэтому вызов ничего не делает.
-   */
+  /** «Отмена» и закрытие окна: настройки не меняются. */
   void cancel() {
-    if (saving) {
-      return;
-    }
     stage.close();
-  }
-
-  /** Блокирует или разблокирует управляющие элементы окна на время записи. */
-  private void setBusy(boolean busy) {
-    saving = busy;
-    saveButton.setDisable(busy);
-    cancelButton.setDisable(busy);
-    browseButton.setDisable(busy);
-    pathField.setDisable(busy);
-    autoOpenBox.setDisable(busy);
   }
 
   /** Текст ошибки; пустой, если ошибки нет. */
@@ -200,26 +151,6 @@ final class SettingsDialog {
 
   CheckBox autoOpenBox() {
     return autoOpenBox;
-  }
-
-  /** Окно диалога; используется тестами для имитации запроса закрытия. */
-  Stage stage() {
-    return stage;
-  }
-
-  /** Кнопка «Сохранить»; используется тестами. */
-  Button saveButton() {
-    return saveButton;
-  }
-
-  /** Кнопка «Отмена»; используется тестами. */
-  Button cancelButton() {
-    return cancelButton;
-  }
-
-  /** Кнопка «Обзор…»; используется тестами. */
-  Button browseButton() {
-    return browseButton;
   }
 
   private void browse() {

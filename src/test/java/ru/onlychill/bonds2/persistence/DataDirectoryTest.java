@@ -67,40 +67,6 @@ class DataDirectoryTest {
   }
 
   @Test
-  void linuxSettingsFileUsesXdgWhenSet() {
-    assertThat(DataDirectory.settingsFile("Linux", Map.of("XDG_DATA_HOME", ABS)::get, HOME))
-        .isEqualTo(Path.of(ABS, "bonds2/settings.properties"));
-  }
-
-  @Test
-  void linuxSettingsFileFallsBackToHome() {
-    assertThat(DataDirectory.settingsFile("Linux", k -> null, HOME))
-        .isEqualTo(Path.of("home/u/.local/share/bonds2/settings.properties"));
-  }
-
-  @Test
-  void macSettingsFileUsesApplicationSupport() {
-    assertThat(DataDirectory.settingsFile("Mac OS X", k -> null, HOME))
-        .isEqualTo(Path.of("home/u/Library/Application Support/bonds2/settings.properties"));
-  }
-
-  @Test
-  void windowsSettingsFileUsesAppDataOrFallback() {
-    assertThat(DataDirectory.settingsFile("Windows 11", k -> ABS, HOME))
-        .isEqualTo(Path.of(ABS, "bonds2/settings.properties"));
-    assertThat(DataDirectory.settingsFile("Windows 11", k -> " ", HOME))
-        .isEqualTo(Path.of("home/u/AppData/Local/bonds2/settings.properties"));
-  }
-
-  @Test
-  void publicSettingsFileSitsNextToDatabaseFile() {
-    Path settings = DataDirectory.settingsFile();
-
-    assertThat(settings.getFileName()).hasToString("settings.properties");
-    assertThat(settings.getParent()).isEqualTo(DataDirectory.databaseFile().getParent());
-  }
-
-  @Test
   void lockFileIsNextToDatabaseFile() {
     assertThat(DataDirectory.lockFile("Linux", k -> null, HOME))
         .isEqualTo(Path.of("home/u/.local/share/bonds2/bonds2.lock"));

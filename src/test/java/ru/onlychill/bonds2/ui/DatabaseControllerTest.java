@@ -17,11 +17,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Flow;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +40,7 @@ import ru.onlychill.bonds2.dbservice.RejectionCause;
 import ru.onlychill.bonds2.dbservice.ShutdownResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.Database;
+import ru.onlychill.bonds2.settings.MemorySettingsBackend;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
@@ -117,103 +114,25 @@ class DatabaseControllerTest {
     return dataDir().resolve("bonds.db");
   }
 
-  private Path settingsFile() {
-    return dir.resolve("cfg/settings.properties");
-  }
-
   private Path defaultFile() {
     return dir.resolve("default/bonds2.db");
   }
 
+  /** Backend настроек теста: общий для {@link #saveSettings} и создаваемых контроллеров. */
+  private final MemorySettingsBackend backend = new MemorySettingsBackend();
+
   private DatabaseController controller() {
-    return controllerWith(settingsFile());
+    return controllerWith(backend);
   }
 
-  private DatabaseController controllerWith(Path settings) {
+  private DatabaseController controllerWith(MemorySettingsBackend settings) {
     var store = new SettingsStore(settings);
     return new DatabaseController(
         store, store.load(), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
   }
 
-  /** Контроллер с подменённым исполнителем записи настроек: тесты проверяют поток записи. */
-  private DatabaseController controllerWith(Path settings, Executor settingsExecutor) {
-    var store = new SettingsStore(settings);
-    return new DatabaseController(
-        store,
-        store.load(),
-        defaultFile(),
-        service,
-        dialogs,
-        exits::incrementAndGet,
-        ui,
-        settingsExecutor);
-  }
-
-  /** Контроллер с готовым результатом чтения настроек, без обращения к файлу настроек. */
-  private DatabaseController controllerWith(SettingsStore.LoadResult loaded) {
-    return new DatabaseController(
-        new SettingsStore(settingsFile()),
-        loaded,
-        defaultFile(),
-        service,
-        dialogs,
-        exits::incrementAndGet,
-        ui);
-  }
-
-  /**
-   * Однопоточный исполнитель записи настроек; имя потока нейтральное, тестовые проверки его не
-   * читают.
-   */
-  private static ExecutorService settingsExecutor() {
-    return Executors.newSingleThreadExecutor(
-        runnable -> {
-          var thread = new Thread(runnable, "test-settings");
-          thread.setDaemon(true);
-          return thread;
-        });
-  }
-
-  /** Исполнитель, запоминающий поток каждой задачи перед её запуском. */
-  private static Executor recordingThreads(ExecutorService executor, List<Thread> threads) {
-    return task ->
-        executor.execute(
-            () -> {
-              threads.add(Thread.currentThread());
-              task.run();
-            });
-  }
-
-  /**
-   * Исполнитель записи настроек с воротами: задача перед запуском сигнализирует о начале («запись
-   * началась») и ждёт разрешения на продолжение. Обёртка — {@link ExecutorService}, поэтому
-   * остановка в {@code stopWriting} ждёт удержанную запись по-настоящему.
-   */
-  private static SettingsPersistenceTest.GatedExecutorService gatedSettingsExecutor(
-      ExecutorService executor, CountDownLatch entered, CountDownLatch release) {
-    return new SettingsPersistenceTest.GatedExecutorService(executor, entered, release);
-  }
-
   private void saveSettings(Path databasePath, boolean autoOpen) {
-    new SettingsStore(settingsFile()).save(new Settings(databasePath, autoOpen));
-  }
-
-  /**
-   * Запись пути БД дошла до файла настроек: содержимое читается напрямую, без {@link
-   * SettingsStore#load()} — очистка временных файлов при чтении удаляет файл идущей фоновой записи.
-   */
-  private static boolean settingsFileHas(Path settingsFile, Path database, boolean autoOpen) {
-    try {
-      if (Files.notExists(settingsFile)) {
-        return false;
-      }
-      String text = Files.readString(settingsFile);
-      return text.contains("database.path=" + database)
-          && text.contains("database.autoOpen=" + autoOpen);
-    } catch (IOException e) {
-      // Чтение в процессе атомарной записи: попробуем при следующей проверке
-      return false;
-    }
+    new SettingsStore(backend).save(new Settings(databasePath, autoOpen));
   }
 
   private static boolean isOpen(DatabaseController db) {
@@ -265,26 +184,6 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void autoOpenAndResetWarningComeFromLoadedResultNotDefaults() {
-    newDatabaseAt(userFile());
-    // Прочитанные значения противоречат значениям по умолчанию: автооткрытие выключено
-    // (по умолчанию включено), признак сброса есть (по умолчанию его нет)
-    var loaded = new SettingsStore.LoadResult(new Settings(userFile(), false), null, true);
-    var db = controllerWith(loaded);
-
-    db.openOnStartup();
-    ui.settle();
-
-    // Предупреждение о сбросе — по признаку из прочитанного результата
-    assertThat(dialogs.warnings).hasSize(1);
-    assertThat(dialogs.warnings.get(0)).contains("настройки сброшены");
-    // Автооткрытие — по флагу из прочитанного результата: существующая БД не открылась
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(userFile()).isRegularFile();
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  @Test
   void autoOpenOpensExistingDatabaseAndShowsItsPath() {
     var db = opened();
 
@@ -302,57 +201,6 @@ class DatabaseControllerTest {
 
     assertThat(defaultFile()).isRegularFile();
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + defaultFile());
-  }
-
-  private void corruptSettings() throws IOException {
-    Files.createDirectories(dir.resolve("cfg"));
-    Files.writeString(settingsFile(), "database.autoOpen=maybe\n");
-  }
-
-  @Test
-  void resetSettingsWarnAndDoNotCreateDefaultDatabase() throws IOException {
-    corruptSettings();
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(dialogs.warnings).hasSize(1);
-    assertThat(dialogs.warnings.get(0)).contains("settings.properties.bad-");
-    assertThat(defaultFile()).doesNotExist();
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: файл не найден");
-    assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0)).contains("Создать базу");
-  }
-
-  @Test
-  void emptySettingsFileWarnsAboutResetWithoutCopyPathAndDoesNotCreateDefaultDatabase()
-      throws IOException {
-    Files.createDirectories(dir.resolve("cfg"));
-    Files.createFile(settingsFile());
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(dialogs.warnings).hasSize(1);
-    assertThat(dialogs.warnings.get(0)).contains("настройки сброшены").doesNotContain("bad-");
-    assertThat(defaultFile()).doesNotExist();
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: файл не найден");
-  }
-
-  @Test
-  void resetSettingsStillOpenExistingDefaultDatabase() throws IOException {
-    newDatabaseAt(defaultFile());
-    corruptSettings();
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(dialogs.warnings).hasSize(1);
-    assertThat(isOpen(db)).isTrue();
-    assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
@@ -509,8 +357,8 @@ class DatabaseControllerTest {
     ui.pumpUntil(() -> db.statusProperty().get().equals("Создание базы…"));
     storage.openGate.release();
     ui.pumpUntil(() -> isOpen(db));
-    // Путь записан в настройки в фоне: без него открытие пошло бы по пути по умолчанию
-    ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
+    // Путь записан в настройки: без него открытие пошло бы по пути по умолчанию
+    ui.pumpUntil(() -> new SettingsStore(backend).load().equals(new Settings(userFile(), false)));
     db.closeDatabase();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
 
@@ -644,7 +492,7 @@ class DatabaseControllerTest {
   @Test
   void exitChainFailureShowsErrorKeepsAppAliveAndRepeatedExitStartsAgain() {
     var failFirst = new AtomicBoolean(true);
-    var store = new SettingsStore(settingsFile());
+    var store = new SettingsStore(backend);
     var db =
         new DatabaseController(
             store,
@@ -677,7 +525,7 @@ class DatabaseControllerTest {
 
   @Test
   void repeatedExitChainFailureResetsExitingAgain() {
-    var store = new SettingsStore(settingsFile());
+    var store = new SettingsStore(backend);
     var db =
         new DatabaseController(
             store,
@@ -897,12 +745,10 @@ class DatabaseControllerTest {
     db.createDatabase(userFile());
     ui.pumpUntil(() -> isOpen(db));
     var expected = new Settings(userFile(), false);
-    // Путь записывается в настройки в фоне: ждём завершения записи
-    ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
+    ui.pumpUntil(() -> new SettingsStore(backend).load().equals(expected));
 
     assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
     assertThat(userFile()).isRegularFile();
-    assertThat(new SettingsStore(settingsFile()).load().settings()).isEqualTo(expected);
     assertThat(db.settings()).isEqualTo(expected);
     assertThat(dialogs.errors).isEmpty();
   }
@@ -924,7 +770,7 @@ class DatabaseControllerTest {
         .contains("Выберите другое имя")
         .contains("не изменён");
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(settingsFile()).doesNotExist();
+    assertThat(db.settings()).isEqualTo(Settings.defaults());
   }
 
   @Test
@@ -1051,9 +897,10 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void createKeepsDatabaseOpenWhenSettingsCannotBeSaved() throws IOException {
-    Files.writeString(dir.resolve("blocker"), "файл на месте каталога настроек");
-    var db = controllerWith(dir.resolve("blocker/settings.properties"));
+  void createKeepsDatabaseOpenWhenSettingsCannotBeSaved() {
+    var failing = new MemorySettingsBackend();
+    failing.failOnPersist = true;
+    var db = controllerWith(failing);
 
     db.createDatabase(userFile());
     ui.pumpUntil(() -> !dialogs.warnings.isEmpty());
@@ -1242,39 +1089,6 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void externalShutdownHookWaitsForUnfinishedSettingsWrite() throws InterruptedException {
-    var executor = settingsExecutor();
-    var writeStarted = new CountDownLatch(1);
-    var releaseWrite = new CountDownLatch(1);
-    var db =
-        controllerWith(settingsFile(), gatedSettingsExecutor(executor, writeStarted, releaseWrite));
-    try {
-      // createDatabase запускает фоновую запись пути БД через исполнителя с воротами
-      db.createDatabase(userFile());
-      // Итог создания доставляется через очередь «потока интерфейса» и запускает запись:
-      // прокачиваем, пока запись не войдёт в ворота
-      ui.pumpUntil(() -> isOpen(db) && writeStarted.getCount() == 0);
-
-      var stopping = CompletableFuture.runAsync(db::stopForExternalShutdown);
-      // Сервис уже остановлен синхронной частью хука: ждать может только запись настроек
-      assertThat(stopping).isNotDone();
-
-      releaseWrite.countDown();
-      assertThat(stopping).succeedsWithin(Duration.ofSeconds(10));
-
-      assertThat(service.open(userFile(), false).join())
-          .isInstanceOfSatisfying(
-              OpenResult.Rejected.class,
-              rejected -> assertThat(rejected.message()).contains("остановлен"));
-      // Удержанная запись дошла до файла
-      assertThat(settingsFileHas(settingsFile(), userFile(), true)).isTrue();
-    } finally {
-      releaseWrite.countDown();
-      executor.shutdownNow();
-    }
-  }
-
-  @Test
   void shutdownWhileClosedDoesNothing() {
     var db = controller();
 
@@ -1362,18 +1176,10 @@ class DatabaseControllerTest {
     var failing = new DatabaseService(failingStorage);
     newDatabaseAt(userFile());
     saveSettings(userFile(), true);
-    var store = new SettingsStore(settingsFile());
-    var executor = settingsExecutor();
+    var store = new SettingsStore(backend);
     var db =
         new DatabaseController(
-            store,
-            store.load(),
-            defaultFile(),
-            failing,
-            dialogs,
-            exits::incrementAndGet,
-            ui,
-            executor);
+            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
 
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
@@ -1407,32 +1213,9 @@ class DatabaseControllerTest {
     assertThat(dialogs.errors).isEmpty();
     assertThat(dialogs.warnings).isEmpty();
     assertThat(exits.get()).isZero();
-    // Завершение продолжается: запись настроек остановлена, БД закрыта до сбоя публикации
-    assertThat(executor.isShutdown()).isTrue();
+    // Завершение продолжается: БД закрыта до сбоя публикации
     assertThat(failingStorage.opened).hasSize(1);
     assertThat(isClosed(failingStorage.opened.get(0))).isTrue();
-  }
-
-  @Test
-  void createdDatabasePathIsRememberedOffUiThread() {
-    saveSettings(null, false);
-    var executor = settingsExecutor();
-    var writeThreads = new CopyOnWriteArrayList<Thread>();
-    var db = controllerWith(settingsFile(), recordingThreads(executor, writeThreads));
-    try {
-      db.createDatabase(userFile());
-      ui.pumpUntil(() -> isOpen(db));
-      var expected = new Settings(userFile(), false);
-      ui.pumpUntil(() -> settingsFileHas(settingsFile(), userFile(), false));
-
-      assertThat(db.settings()).isEqualTo(expected);
-      assertThat(dialogs.warnings).isEmpty();
-      // Запись выполнена вне потока интерфейса
-      assertThat(writeThreads).hasSize(1);
-      assertThat(writeThreads.get(0)).isNotEqualTo(Thread.currentThread());
-    } finally {
-      executor.shutdownNow();
-    }
   }
 
   /** Подписчик, бросающий заданную ошибку только при доставке состояния «закрыта». */

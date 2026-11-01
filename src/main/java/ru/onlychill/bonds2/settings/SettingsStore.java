@@ -2,42 +2,41 @@
 
 package ru.onlychill.bonds2.settings;
 
-import java.io.IOException;
-import java.io.PushbackReader;
-import java.io.StringWriter;
 import java.io.UncheckedIOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
-import java.time.Clock;
-import java.time.ZoneId;
-import java.util.Objects;
-import java.util.Properties;
+import java.util.Optional;
 import org.jspecify.annotations.Nullable;
-import ru.onlychill.bonds2.files.StampedFiles;
 
 /**
- * Хранилище настроек в файле {@code settings.properties} (кодировка UTF-8).
+ * Хранилище настроек в платформенном хранилище пользователя через {@link Backend}.
  *
- * <p>Чтение не бросает исключений: отсутствующий, нечитаемый или повреждённый файл и некорректные
- * значения заменяются значениями по умолчанию. Запись атомарна и долговечна: сначала во временный
- * файл рядом с целевым, который сбрасывается на диск, затем переименование поверх старого файла.
+ * <p>Чтение не бросает исключений: отсутствующее значение даёт значение по умолчанию, а
+ * некорректное или нечитаемое — значение по умолчанию с записью события в журнал. Запись
+ * выполняется синхронно и завершена к возврату из {@link #save(Settings)}; ошибка хранилища даёт
+ * {@link UncheckedIOException}.
  */
 public final class SettingsStore {
 
   /**
-   * Результат чтения настроек.
-   *
-   * @param settings настройки
-   * @param badCopy копия испорченного файла; {@code null}, если сброса не было или копия не создана
-   * @param recovered файл был испорчен и сброшен к значениям по умолчанию
+   * Минимальный шов между хранилищем настроек и платформенным backend'ом. Отделяет настройки от
+   * глобального JVM-состояния {@code java.util.prefs}: продакшн-реализация — {@link
+   * PreferencesBackend}, тесты работают с in-memory реализацией. Сбой хранилища при записи даёт
+   * {@link UncheckedIOException}.
    */
-  public record LoadResult(Settings settings, @Nullable Path badCopy, boolean recovered) {}
+  public interface Backend {
+
+    /** Читает значение ключа; пуст, если значения нет. */
+    Optional<String> read(String key);
+
+    /** Записывает значение ключа. */
+    void write(String key, String value);
+
+    /**
+     * Делает записанное устойчивым: без вызова значения на платформах с ленивой записью могут
+     * остаться только в памяти процесса.
+     */
+    void persist();
+  }
 
   /** Ключ пути к файлу БД; пустое значение означает путь по умолчанию. */
   static final String KEY_DATABASE_PATH = "database.path";
@@ -45,229 +44,102 @@ public final class SettingsStore {
   /** Ключ флага автооткрытия БД при запуске. */
   static final String KEY_AUTO_OPEN = "database.autoOpen";
 
-  private static final String HEADER =
-      "Настройки bonds2. database.path: путь к файлу БД, пусто — по умолчанию. "
-          + "database.autoOpen: открывать БД при запуске, true или false.";
-
-  /** Метка порядка байтов UTF-8, с которой Windows-редакторы сохраняют текстовые файлы. */
-  private static final char UTF8_BOM = '\uFEFF';
-
-  /** Префикс и суффикс временного файла записи: {@code settings-<случайное>.tmp}. */
-  private static final String TEMP_PREFIX = "settings-";
-
-  private static final String TEMP_SUFFIX = ".tmp";
-
-  /**
-   * Каталог можно сбросить на диск только в POSIX-системах: на Windows открыть каталог как канал
-   * нельзя.
-   */
-  private static final boolean POSIX =
-      FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
-
   private static final System.Logger LOG = System.getLogger(SettingsStore.class.getName());
 
-  private final Path file;
-  private final Clock clock;
+  private final Backend backend;
 
-  /** Хранилище настроек в указанном файле. */
-  public SettingsStore(Path file) {
-    this(file, Clock.system(ZoneId.systemDefault()));
-  }
-
-  /** Хранилище настроек; время в имени копии испорченного файла берётся из {@code clock}. */
-  SettingsStore(Path file, Clock clock) {
-    this.file = file;
-    this.clock = clock;
+  /** Хранилище настроек в платформенном хранилище текущего пользователя. */
+  public SettingsStore() {
+    this(new PreferencesBackend());
   }
 
   /**
-   * Читает настройки из файла.
-   *
-   * <p>Сначала удаляются временные файлы записи, оставшиеся от прерванного сохранения. Ведущая
-   * метка порядка байтов (U+FEFF), которой Windows-редакторы помечают текстовые файлы, срезается и
-   * повреждением не считается. Испорченный файл (нечитаем, битая Unicode-последовательность,
-   * относительный или некорректный путь, флаг не {@code true}/{@code false}) копируется в {@code
-   * settings.properties.bad-<yyyyMMdd-HHmmss>} и заменяется значениями по умолчанию. Файл нулевой
-   * длины тоже считается испорченным, но копия для него не создаётся: в нём нет данных, которые
-   * стоило бы сохранить. Отсутствие файла и отдельных ключей повреждением не считается. Сбой
-   * копирования или записи пишется в лог.
-   *
-   * @return настройки из файла либо {@link Settings#defaults()} с признаком сброса и путём к копии
+   * Хранилище настроек поверх заданного backend'а; тесты используют in-memory реализацию вместо
+   * глобального состояния {@code java.util.prefs}.
    */
-  public LoadResult load() {
-    Path dir = file.toAbsolutePath().getParent();
-    if (dir != null) {
-      StampedFiles.sweepOrphans(dir, TEMP_PREFIX + "*" + TEMP_SUFFIX, "временный файл настроек");
-    }
-    if (Files.notExists(file)) {
-      return new LoadResult(Settings.defaults(), null, false);
-    }
-    if (isEmptyFile()) {
-      return resetEmpty();
-    }
-    var props = new Properties();
-    try (var in = new PushbackReader(Files.newBufferedReader(file, StandardCharsets.UTF_8))) {
-      // Срезается только ведущая метка: у первого символа файла
-      int first = in.read();
-      if (first != -1 && first != UTF8_BOM) {
-        in.unread(first);
-      }
-      props.load(in);
-    } catch (IOException | IllegalArgumentException e) {
-      // IllegalArgumentException: некорректная Unicode-escape-последовательность в файле
-      return recover();
-    }
-    String rawPath = props.getProperty(KEY_DATABASE_PATH);
-    Path path = Settings.parseDatabasePath(rawPath);
-    Boolean autoOpen = parseFlag(props.getProperty(KEY_AUTO_OPEN));
-    boolean pathBroken = path == null && rawPath != null && !rawPath.isBlank();
-    if (pathBroken || autoOpen == null) {
-      return recover();
-    }
-    return new LoadResult(new Settings(path, autoOpen), null, false);
+  public SettingsStore(Backend backend) {
+    this.backend = backend;
   }
 
   /**
-   * Обычный файл нулевой длины. Если размер не читается, файл пустым не считается: чтение сообщит
-   * об ошибке.
+   * Читает настройки. Отсутствующее значение даёт значение по умолчанию без события; значение, не
+   * разбираемое как путь или флаг, и ошибка чтения дают значение по умолчанию с записью события в
+   * журнал.
    */
-  private boolean isEmptyFile() {
-    try {
-      return Files.isRegularFile(file) && Files.size(file) == 0;
-    } catch (IOException e) {
-      return false;
-    }
+  public Settings load() {
+    return new Settings(readPath(), readAutoOpen());
   }
 
   /**
-   * Сбрасывает файл нулевой длины к значениям по умолчанию без копии: в пустом файле нет данных,
-   * которые стоило бы сохранить. Сбой записи пишется в лог и не мешает запуску.
-   */
-  private LoadResult resetEmpty() {
-    Settings defaults = Settings.defaults();
-    try {
-      save(defaults);
-    } catch (UncheckedIOException e) {
-      LOG.log(System.Logger.Level.WARNING, "Не удалось восстановить настройки: " + file, e);
-    }
-    return new LoadResult(defaults, null, true);
-  }
-
-  /** Сохраняет испорченный файл рядом и записывает значения по умолчанию. */
-  private LoadResult recover() {
-    Settings defaults = Settings.defaults();
-    Path copy = null;
-    try {
-      if (!Files.isRegularFile(file)) {
-        throw new IOException("не обычный файл: " + file);
-      }
-      Path target =
-          StampedFiles.reserve(file, file.getFileName() + ".bad-" + StampedFiles.stamp(clock));
-      try {
-        Files.copy(file, target, StandardCopyOption.REPLACE_EXISTING);
-      } catch (IOException e) {
-        deleteAfterFailure(target, e);
-        throw e;
-      }
-      copy = target;
-      save(defaults);
-    } catch (IOException | UncheckedIOException e) {
-      LOG.log(System.Logger.Level.WARNING, "Не удалось восстановить настройки: " + file, e);
-    }
-    return new LoadResult(defaults, copy, true);
-  }
-
-  /**
-   * Сохраняет настройки атомарно и создаёт недостающие каталоги.
+   * Сохраняет настройки синхронно; к возврату из метода запись устойчива.
    *
-   * @throws UncheckedIOException если сохранить не удалось; прежний файл при этом не меняется
+   * @throws UncheckedIOException если хранилище не приняло запись
    */
   public void save(Settings settings) {
-    var props = new Properties();
     Path path = settings.databasePath();
-    props.setProperty(KEY_DATABASE_PATH, path == null ? "" : path.toString());
-    props.setProperty(KEY_AUTO_OPEN, Boolean.toString(settings.autoOpen()));
-    writeAtomically(props);
+    backend.write(KEY_DATABASE_PATH, path == null ? "" : path.toString());
+    backend.write(KEY_AUTO_OPEN, Boolean.toString(settings.autoOpen()));
+    backend.persist();
   }
 
   /**
-   * Пишет настройки во временный файл, сбрасывает его на диск и атомарно переименовывает поверх
-   * прежнего файла. На POSIX-системах затем сбрасывается каталог, чтобы переименование пережило
-   * сбой питания. Если запись не удалась, временный файл удаляется, а прежний файл не меняется.
+   * Путь из хранилища: {@code null} (путь по умолчанию) для отсутствующего и пустого значения;
+   * значение, не разбираемое как абсолютный путь, даёт {@code null} с записью события в журнал.
    */
-  private void writeAtomically(Properties props) {
-    Path dir = Objects.requireNonNull(file.toAbsolutePath().getParent(), "нет каталога настроек");
-    Path tmp = null;
-    try {
-      Files.createDirectories(dir);
-      tmp = Files.createTempFile(dir, TEMP_PREFIX, TEMP_SUFFIX);
-      writeDurably(tmp, props);
-      Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE);
-    } catch (IOException e) {
-      if (tmp != null) {
-        deleteAfterFailure(tmp, e);
-      }
-      throw new UncheckedIOException("Не удалось сохранить настройки: " + file, e);
+  private @Nullable Path readPath() {
+    Optional<String> raw = read(KEY_DATABASE_PATH).filter(text -> !text.isBlank());
+    if (raw.isEmpty()) {
+      return null;
     }
-    syncDirectory(dir);
+    String text = raw.orElseThrow();
+    Path path = Settings.parseDatabasePath(text);
+    if (path == null) {
+      invalidValue(KEY_DATABASE_PATH, text);
+    }
+    return path;
   }
 
   /**
-   * Записывает настройки в файл и сбрасывает его содержимое на диск до переименования. Канал
-   * закрывается до переименования: открытый файл на Windows заменить нельзя.
+   * Флаг из хранилища: {@code true} или {@code false} без учёта регистра; отсутствующее значение
+   * даёт {@link Settings#DEFAULT_AUTO_OPEN}, любое другое — то же значение по умолчанию с записью
+   * события в журнал.
    */
-  private static void writeDurably(Path tmp, Properties props) throws IOException {
-    var text = new StringWriter();
-    props.store(text, HEADER);
-    ByteBuffer bytes = ByteBuffer.wrap(text.toString().getBytes(StandardCharsets.UTF_8));
-    try (FileChannel channel = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
-      while (bytes.hasRemaining()) {
-        channel.write(bytes);
-      }
-      channel.force(true);
-    }
-  }
-
-  /**
-   * Сбрасывает каталог на диск, чтобы переименование пережило сбой питания. Открыть каталог как
-   * канал можно только в POSIX-системах; на остальных шаг пропускается. Файл уже заменён, поэтому
-   * сбой здесь пишется в лог и не считается ошибкой сохранения.
-   */
-  private static void syncDirectory(Path dir) {
-    if (!POSIX) {
-      return;
-    }
-    try (FileChannel channel = FileChannel.open(dir, StandardOpenOption.READ)) {
-      channel.force(true);
-    } catch (IOException e) {
-      LOG.log(System.Logger.Level.WARNING, "Не удалось сбросить каталог настроек: " + dir, e);
-    }
-  }
-
-  /** Удаляет временный файл после неудачной записи; ошибка удаления добавляется к исходной. */
-  private static void deleteAfterFailure(Path tmp, IOException cause) {
-    try {
-      Files.deleteIfExists(tmp);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
-    }
-  }
-
-  /**
-   * Флаг из строки: {@code true} или {@code false} без учёта регистра. Отсутствующее значение даёт
-   * значение по умолчанию, любое другое — {@code null} (файл испорчен).
-   */
-  private static @Nullable Boolean parseFlag(@Nullable String value) {
-    if (value == null) {
+  private boolean readAutoOpen() {
+    Optional<String> raw = read(KEY_AUTO_OPEN);
+    if (raw.isEmpty()) {
       return Settings.DEFAULT_AUTO_OPEN;
     }
-    String text = value.strip();
+    String text = raw.orElseThrow().strip();
     if (text.equalsIgnoreCase("true")) {
       return true;
     }
     if (text.equalsIgnoreCase("false")) {
       return false;
     }
-    return null;
+    invalidValue(KEY_AUTO_OPEN, text);
+    return Settings.DEFAULT_AUTO_OPEN;
+  }
+
+  /** Значение ключа; ошибка backend'а даёт пустое значение с записью события в журнал. */
+  private Optional<String> read(String key) {
+    try {
+      return backend.read(key);
+    } catch (RuntimeException e) {
+      LOG.log(
+          System.Logger.Level.WARNING,
+          "Не удалось прочитать настройки " + key + "; применяется значение по умолчанию",
+          e);
+      return Optional.empty();
+    }
+  }
+
+  private static void invalidValue(String key, String value) {
+    LOG.log(
+        System.Logger.Level.WARNING,
+        "Некорректное значение настроек "
+            + key
+            + ": \""
+            + value
+            + "\"; применяется значение по умолчанию");
   }
 }

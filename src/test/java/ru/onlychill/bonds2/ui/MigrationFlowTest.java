@@ -26,6 +26,7 @@ import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
+import ru.onlychill.bonds2.settings.MemorySettingsBackend;
 import ru.onlychill.bonds2.settings.Settings;
 import ru.onlychill.bonds2.settings.SettingsStore;
 
@@ -104,22 +105,21 @@ class MigrationFlowTest {
     return dataDir().resolve("bonds.db");
   }
 
-  private Path settingsFile() {
-    return dir.resolve("cfg/settings.properties");
-  }
-
   private Path defaultFile() {
     return dir.resolve("default/bonds2.db");
   }
 
+  /** Backend настроек теста: общий для {@link #saveSettings} и создаваемых контроллеров. */
+  private final MemorySettingsBackend backend = new MemorySettingsBackend();
+
   private DatabaseController controller() {
-    var store = new SettingsStore(settingsFile());
+    var store = new SettingsStore(backend);
     return new DatabaseController(
         store, store.load(), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
   }
 
   private void saveSettings(Path databasePath, boolean autoOpen) {
-    new SettingsStore(settingsFile()).save(new Settings(databasePath, autoOpen));
+    new SettingsStore(backend).save(new Settings(databasePath, autoOpen));
   }
 
   private static boolean isOpen(DatabaseController db) {
