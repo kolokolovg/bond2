@@ -3,19 +3,28 @@
 package ru.onlychill.bonds2.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static ru.onlychill.bonds2.dbservice.Eventually.holds;
+import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.newDatabaseAt;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.outdatedAt;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Flow;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -31,6 +40,10 @@ import ru.onlychill.bonds2.persistence.Database;
 /** Машина выхода без интерфейса: фазы, повторы и порядок цепочки завершения. */
 class ExitCoordinatorTest {
 
+  // Сильная ссылка на logger координатора: изменения уровня и хендлеров не теряются при сборке
+  // мусора
+  private static final Logger COORDINATOR_LOG = Logger.getLogger(ExitCoordinator.class.getName());
+
   @TempDir Path dir;
 
   private final GatedStorage storage = new GatedStorage();
@@ -45,8 +58,8 @@ class ExitCoordinatorTest {
     storage.migrateGate.release();
     try {
       service.shutdown(Duration.ofSeconds(30));
-    } catch (RuntimeException ignored) {
-      // Поток жизненного цикла мог погибнуть от подменённого сбоя закрытия — teardown не важен
+    } catch (RuntimeException | Error ignored) {
+      // Поток жизненного цикла мог погибнуть от подменённого сбоя — teardown не важен
     }
   }
 
@@ -76,6 +89,19 @@ class ExitCoordinatorTest {
           Thread.currentThread().interrupt();
           throw new AssertionError(e);
         }
+      }
+    }
+
+    /** Выполняет всё, что успело появиться за короткий простой. */
+    void settle() {
+      try {
+        Runnable task;
+        while ((task = tasks.poll(150, TimeUnit.MILLISECONDS)) != null) {
+          task.run();
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new AssertionError(e);
       }
     }
   }
@@ -113,6 +139,9 @@ class ExitCoordinatorTest {
     var coordinator = new ExitCoordinator(service, view, exit, ui, service::state);
     coordinator.attachMigration(
         new MigrationView() {
+          @Override
+          public void askAboutMigration() {}
+
           @Override
           public void cancelDialog() {}
 
@@ -289,5 +318,158 @@ class ExitCoordinatorTest {
     assertThat(result).isEqualTo(ShutdownResult.STOPPED);
     assertThat(coordinator.concluded()).isTrue();
     assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+  }
+
+  @Test
+  void shutdownTimeoutsMatchSpecification() {
+    assertThat(ExitCoordinator.STOP_TIMEOUT).isEqualTo(Duration.ofSeconds(5));
+    assertThat(ExitCoordinator.SHUTDOWN_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+    assertThat(ExitCoordinator.MIGRATION_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+  }
+
+  @Test
+  void shutdownTimeoutOutsideMenuIsLoggedWithoutDialog() throws Exception {
+    // Диалог в пути без меню невозможен: истечение срока — только в журнал
+    dbFile();
+    storage.openGate.hold();
+    var coordinator = coordinator();
+    service.open();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    assertThat(holds(() -> service.state() instanceof DbState.Opening)).isTrue();
+
+    var capture = new LogCapture();
+    COORDINATOR_LOG.addHandler(capture);
+    ShutdownResult result;
+    try {
+      result = coordinator.shutdownWaiting(Duration.ofMillis(50));
+    } finally {
+      COORDINATOR_LOG.removeHandler(capture);
+    }
+
+    assertThat(result).isEqualTo(ShutdownResult.TIMED_OUT);
+    assertThat(capture.messages)
+        .anySatisfy(m -> assertThat(m).contains("не завершилась в срок").contains("WAL"));
+    assertThat(view.migrationWarnings).isEmpty();
+    assertThat(view.errors).isEmpty();
+  }
+
+  @Test
+  void lateResultAfterShutdownTimeoutIsIgnoredAndItsDatabaseClosed() throws Exception {
+    dbFile();
+    storage.openGate.hold();
+    var coordinator = coordinator();
+    service.open();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    assertThat(holds(() -> service.state() instanceof DbState.Opening)).isTrue();
+
+    assertThat(coordinator.shutdownWaiting(Duration.ofMillis(50)))
+        .isEqualTo(ShutdownResult.TIMED_OUT);
+    storage.openGate.release();
+    ui.settle();
+
+    // Самолечение остановки: запоздавший итог не публикуется, БД закрывается тихо
+    assertThat(holds(() -> storage.opened.size() == 1 && isClosed(storage.opened.get(0)))).isTrue();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(view.errors).isEmpty();
+    assertThat(view.migrationWarnings).isEmpty();
+  }
+
+  @Test
+  void shutdownRefusedDuringMigrationDoesNotStopCoordinator() throws Exception {
+    outdatedAt(dbFile());
+    storage.migrateGate.hold();
+    var coordinator = coordinator();
+    service.open();
+    assertThat(holds(() -> service.state() instanceof DbState.AwaitingMigration)).isTrue();
+    service.migrate();
+    assertThat(holds(() -> service.state() instanceof DbState.Migrating)).isTrue();
+    assertThat(storage.migrateGate.awaitEntered()).isTrue();
+
+    assertThat(coordinator.shutdownWaiting(Duration.ofMillis(50)))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.MIGRATING));
+
+    storage.migrateGate.release();
+    assertThat(holds(() -> service.state() instanceof DbState.Open)).isTrue();
+    assertThat(view.errors).isEmpty();
+  }
+
+  @Test
+  void shutdownFailureIsLoggedAndExternalTerminationContinues() throws Exception {
+    // Сценарий «Сбой остановки при внешнем завершении»: подписчик бросает ошибку при финальной
+    // публикации «закрыта», поэтому синхронная остановка сервиса пробрасывает её вызывающему
+    newDatabaseAt(dbFile());
+    var coordinator = coordinator();
+    service.open().join();
+    // Подписка после открытия: при подписке доставляется текущее состояние, и «закрыта» пришла бы
+    // сразу; сбой нужен только на финальной публикации остановки
+    var failure = new AssertionError("сбой остановки");
+    service.states().subscribe(failingOnClosedState(failure));
+
+    var capture = new LogCapture();
+    COORDINATOR_LOG.addHandler(capture);
+    try {
+      // Завершение продолжается: сбой остановки не пробрасывается вызывающему
+      assertThatCode(coordinator::shutdownForExternalTermination).doesNotThrowAnyException();
+    } finally {
+      COORDINATOR_LOG.removeHandler(capture);
+    }
+
+    // Сбой остановки журналируется как ошибка с самой причиной, без заворачивания
+    assertThat(capture.records)
+        .anySatisfy(
+            record -> {
+              assertThat(record.getLevel()).isEqualTo(Level.SEVERE);
+              assertThat(record.getMessage())
+                  .contains("Сбой остановки сервиса БД при внешнем завершении");
+              assertThat(record.getThrown()).isSameAs(failure);
+            });
+    // Диалог в пути внешнего завершения невозможен: ошибок и предупреждений нет
+    assertThat(view.errors).isEmpty();
+    assertThat(view.migrationWarnings).isEmpty();
+    // Завершение продолжается: БД закрыта до сбоя публикации
+    assertThat(storage.opened).hasSize(1);
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+  }
+
+  /** Подписчик, бросающий заданную ошибку только при доставке состояния «закрыта». */
+  private static Flow.Subscriber<DbState> failingOnClosedState(Error error) {
+    return new Flow.Subscriber<>() {
+      @Override
+      public void onSubscribe(Flow.Subscription subscription) {
+        subscription.request(Long.MAX_VALUE);
+      }
+
+      @Override
+      public void onNext(DbState item) {
+        if (item instanceof DbState.Closed) {
+          throw error;
+        }
+      }
+
+      @Override
+      public void onError(Throwable throwable) {}
+
+      @Override
+      public void onComplete() {}
+    };
+  }
+
+  /** Сборщик записей журнала координатора: проверка журналов остановки. */
+  private static final class LogCapture extends Handler {
+
+    final List<LogRecord> records = new ArrayList<>();
+    final List<String> messages = new ArrayList<>();
+
+    @Override
+    public void publish(LogRecord record) {
+      records.add(record);
+      messages.add(record.getMessage());
+    }
+
+    @Override
+    public void flush() {}
+
+    @Override
+    public void close() {}
   }
 }

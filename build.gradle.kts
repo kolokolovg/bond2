@@ -98,9 +98,9 @@ tasks.jacocoTestReport {
 
 // Политика гейта покрытия (JaCoCo): покрытие измеряется юнит- и headless-тестами,
 // контроллер UI при этом тестируем, поэтому из гейта исключается только не покрываемый
-// автотестами клей запуска — класс Main и окно приложения.
+// автотестами клей запуска — класс Main и вход интерфейса без Application (тулкит, гашение).
 val jacocoExcludedGlue =
-    listOf("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/ui/MainWindowApp.class")
+    listOf("ru/onlychill/bonds2/Main.class", "ru/onlychill/bonds2/ui/FxAppView.class")
 
 tasks.jacocoTestCoverageVerification {
     // GUI-обвязка (запуск JavaFX, показ окна) не покрывается автоматическими тестами

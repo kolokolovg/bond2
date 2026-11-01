@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package ru.onlychill.bonds2.ui;
+package ru.onlychill.bonds2.app;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.Flow;
@@ -8,7 +8,7 @@ import java.util.function.Consumer;
 import ru.onlychill.bonds2.dbservice.DbState;
 
 /**
- * Подписчик на состояние БД: переносит каждое состояние в поток JavaFX по одному, в порядке
+ * Подписчик на состояние БД: переносит каждое состояние в поток интерфейса по одному, в порядке
  * публикации.
  */
 final class StateSubscriber implements Flow.Subscriber<DbState> {
@@ -19,8 +19,8 @@ final class StateSubscriber implements Flow.Subscriber<DbState> {
   private final Consumer<DbState> apply;
 
   /**
-   * @param uiExecutor выполняет задачу в потоке JavaFX
-   * @param apply применяет состояние в потоке JavaFX
+   * @param uiExecutor выполняет задачу в потоке интерфейса
+   * @param apply применяет состояние в потоке интерфейса
    */
   StateSubscriber(Executor uiExecutor, Consumer<DbState> apply) {
     this.uiExecutor = uiExecutor;

@@ -13,8 +13,8 @@ import ru.onlychill.bonds2.dbservice.OpenResult;
 
 /**
  * Сценарий диалога миграции: вопрос пользователю, запуск или отклонение миграции, показ итога.
- * Предикаты {@code exitStarted} и {@code stopping} — живой взгляд контроллера на флаги выхода и
- * остановки: они читаются в момент решения, значения не копируются.
+ * Предикаты {@code exitStarted} и {@code stopping} — живой взгляд на фазу выхода координатора: они
+ * читаются в момент решения, значения не копируются.
  *
  * <p>Методы вызываются из потока JavaFX; результаты сервиса доставляются через {@code uiExecutor}.
  */
@@ -36,13 +36,13 @@ final class MigrationFlow implements MigrationView {
 
   /**
    * Открытый диалог миграции; {@code null}, если диалога нет. {@code volatile}: его читает поток
-   * завершения в {@link #cancelDialog()} из {@link DatabaseController#shutdown()}.
+   * завершения в {@link #cancelDialog()} из машины выхода.
    */
   private volatile @Nullable CompletableFuture<Boolean> migrationDialog;
 
   /**
    * Запущенная миграция; {@code null}, если её не было. {@code volatile}: её читает поток
-   * завершения в {@link #currentMigration()} из {@link DatabaseController#shutdown()}.
+   * завершения в {@link #currentMigration()} из машины выхода.
    */
   private volatile @Nullable CompletableFuture<OpenResult> migration;
 
@@ -71,7 +71,8 @@ final class MigrationFlow implements MigrationView {
    * уже начат или приложение остановлено, диалог не показывается и миграция не запускается.
    */
   @SuppressWarnings("FutureReturnValueIgnored")
-  void askAboutMigration() {
+  @Override
+  public void askAboutMigration() {
     if (exitStarted.getAsBoolean() || stopping.getAsBoolean()) {
       return;
     }

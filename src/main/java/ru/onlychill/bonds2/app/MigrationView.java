@@ -6,8 +6,11 @@ import java.util.concurrent.CompletableFuture;
 import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.dbservice.OpenResult;
 
-/** Взгляд машины выхода на сценарий миграции: отмена диалога и доступ к идущей миграции. */
+/** Взгляд ядра на сценарий миграции: вопрос пользователю, отмена диалога, идущая миграция. */
 public interface MigrationView {
+
+  /** Спрашивает согласие на миграцию и запускает или отклоняет её. */
+  void askAboutMigration();
 
   /** Закрывает ожидающий диалог миграции, не дожидаясь ответа. */
   void cancelDialog();

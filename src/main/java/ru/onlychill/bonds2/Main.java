@@ -2,24 +2,21 @@
 
 package ru.onlychill.bonds2;
 
-import javafx.application.Application;
-import ru.onlychill.bonds2.ui.MainWindowApp;
+import ru.onlychill.bonds2.app.AppCore;
+import ru.onlychill.bonds2.ui.FxAppView;
 
-/** Точка входа: запускает главное окно. */
+/** Точка входа: запускает ядро приложения. */
 public final class Main {
 
   private Main() {}
 
   /**
-   * Запуск GUI; аргументы командной строки игнорируются. До запуска JavaFX регистрируется хук
-   * завершения JVM: при внешнем завершении (сигнал, остановка из среды разработки) он выполняет
-   * лучшую попытку остановить сервис БД с коротким сроком, даже если тулкит уже мёртв. Хук работает
-   * и тогда, когда JavaFX не запустился вовсе: без созданного контроллера делать нечего.
+   * Запуск GUI; аргументы командной строки игнорируются. Ядро поднимает интерфейс через порт {@link
+   * ru.onlychill.bonds2.app.AppView}, держит главный поток до конца цепочки завершения и
+   * регистрирует хук завершения JVM: при внешнем завершении (сигнал, остановка из среды разработки)
+   * он выполняет лучшую попытку остановить сервис БД с коротким сроком, даже если тулкит уже мёртв.
    */
-  public static void main(String[] args) {
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(MainWindowApp::stopDatabaseOnExternalShutdown, "bonds2-shutdown"));
-    Application.launch(MainWindowApp.class);
+  public static void main(String[] args) throws InterruptedException {
+    new AppCore(new FxAppView()).start();
   }
 }

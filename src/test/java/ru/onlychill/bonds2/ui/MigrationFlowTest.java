@@ -22,15 +22,16 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import ru.onlychill.bonds2.app.DbPresenter;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 
 /**
- * Тесты сценария диалога миграции: контроллер собирается с минимальным окружением, сценарий идёт
- * через {@link DatabaseController#openOnStartup()}. Это не тесты выхода и остановки: гонки выхода
- * проверяются в {@code DatabaseControllerTest}.
+ * Тесты сценария диалога миграции: презентер и FX-адаптер собираются с минимальным окружением,
+ * сценарий идёт через {@link DbPresenter#openOnStartup()}. Это не тесты выхода и остановки: гонки
+ * выхода проверяются в {@code DbPresenterTest} и {@code AppCoreTest}.
  */
 class MigrationFlowTest {
 
@@ -101,9 +102,34 @@ class MigrationFlowTest {
     return dataDir().resolve("bonds.db");
   }
 
+  /** Презентер последней сборки; назначается в {@link #controller()}. */
+  @Nullable private DbPresenter presenter;
+
+  /** Презентер и его FX-адаптер: контроллер назначает сценарий миграции и порт операций. */
   private DatabaseController controller() {
     storage.databaseFile = userFile();
-    return new DatabaseController(service, dialogs, exits::incrementAndGet, ui);
+    presenter =
+        new DbPresenter(
+            service,
+            new ru.onlychill.bonds2.app.ExitView() {
+              @Override
+              public CompletableFuture<Void> warnTimedOutBeforeExit(String message) {
+                return dialogs.warnBeforeExit(message);
+              }
+
+              @Override
+              public void warnMigrationInProgress(String message) {
+                dialogs.warn(message);
+              }
+
+              @Override
+              public void showError(String message) {
+                dialogs.error(message);
+              }
+            },
+            exits::incrementAndGet,
+            ui);
+    return new DatabaseController(presenter, service, dialogs, ui);
   }
 
   private static boolean isOpen(DatabaseController db) {
@@ -125,7 +151,7 @@ class MigrationFlowTest {
     TestDatabases.outdatedAt(userFile());
     var db = controller();
 
-    db.openOnStartup();
+    presenter.openOnStartup();
     settleAfterOperation(db);
 
     assertThat(dialogs.questions).hasSize(1);
@@ -144,7 +170,7 @@ class MigrationFlowTest {
     dialogs.migrationAnswer = false;
     var db = controller();
 
-    db.openOnStartup();
+    presenter.openOnStartup();
     settleAfterOperation(db);
 
     assertThat(dialogs.questions).hasSize(1);
@@ -161,7 +187,7 @@ class MigrationFlowTest {
     byte[] before = Files.readAllBytes(userFile());
     var db = controller();
 
-    db.openOnStartup();
+    presenter.openOnStartup();
     settleAfterOperation(db);
 
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка миграции");
@@ -178,7 +204,7 @@ class MigrationFlowTest {
     var db = controller();
     dialogs.pending = new CompletableFuture<>();
 
-    db.openOnStartup();
+    presenter.openOnStartup();
     ui.pumpUntil(() -> dialogs.questions.size() == 1);
     dialogs.pending.cancel(true);
     ui.settle();
@@ -194,7 +220,7 @@ class MigrationFlowTest {
     var db = controller();
     dialogs.migrationAnswer = false;
 
-    db.openOnStartup();
+    presenter.openOnStartup();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
 
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
