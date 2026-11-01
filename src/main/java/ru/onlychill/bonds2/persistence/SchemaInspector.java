@@ -9,56 +9,30 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.Arrays;
-import org.flywaydb.core.Flyway;
-import org.flywaydb.core.api.FlywayException;
-import org.flywaydb.core.api.MigrationInfo;
-import org.flywaydb.core.api.MigrationState;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import ru.onlychill.bonds2.persistence.Database.State;
+import ru.onlychill.bonds2.persistence.Migrations.Applied;
+import ru.onlychill.bonds2.persistence.Migrations.Script;
 
 /**
  * Определение состояния файла БД относительно миграций приложения. Файл не меняется: проверка
- * читает {@code sqlite_master}, заголовок SQLite и историю миграций Flyway. Здесь же настраивается
- * Flyway: для существующего файла соединения не имеют права создать файл, для {@code
- * Database.create} — имеют.
+ * читает {@code sqlite_master}, заголовок SQLite и применённые версии из таблицы истории миграций
+ * напрямую, без библиотеки миграций. Контрольные суммы применённых миграций не сверяются: решающими
+ * являются версии.
  */
 final class SchemaInspector {
-
-  /** Таблица истории миграций Flyway: по ней БД приложения отличается от чужой SQLite-базы. */
-  private static final String HISTORY_TABLE = "flyway_schema_history";
 
   private SchemaInspector() {}
 
   /**
-   * Flyway для существующего файла БД: соединения открываются через DataSource «только существующий
-   * файл», поэтому удалённый к моменту открытия файл даёт ошибку, а пустой файл на его месте не
-   * появляется. Используется при чтении схемы, применении миграций и инициализации.
-   */
-  static Flyway flywayExisting(Path file, String... locations) {
-    return Flyway.configure()
-        .dataSource(SqliteSupport.existingFileDataSource(file))
-        .locations(locations)
-        // Неприменённые и более новые миграции не ошибка валидации: их состояние определяет inspect
-        .ignoreMigrationPatterns("*:pending", "*:future")
-        .load();
-  }
-
-  /**
-   * Flyway по JDBC-адресу: соединения имеют право создать файл, если его нет. Только для {@link
-   * Database#create(Path)}, где создание файла БД — само назначение операции.
-   */
-  static Flyway flywayCreating(String url, String... locations) {
-    return Flyway.configure()
-        .dataSource(url, null, null)
-        .locations(locations)
-        // Неприменённые и более новые миграции не ошибка валидации: их состояние определяет inspect
-        .ignoreMigrationPatterns("*:pending", "*:future")
-        .load();
-  }
-
-  /**
    * Состояние существующего файла по набору миграций {@code locations}; см. {@link
    * Database#inspect(Path)}.
+   *
+   * @throws PersistenceException если файла нет, он не является БД SQLite, история миграций
+   *     содержит неудачную миграцию или версию, неизвестную приложению и не превосходящую последнюю
+   *     известную (нарушение порядка набора)
    */
   static State inspect(Path file, String... locations) {
     Path absolute = file.toAbsolutePath();
@@ -72,22 +46,51 @@ final class SchemaInspector {
     if (!contents.hasHistory()) {
       return contents.blank() ? State.EMPTY : State.FOREIGN;
     }
-    Flyway flyway = flywayExisting(absolute, locations);
-    try {
-      MigrationInfo[] migrations = flyway.info().all();
-      if (Arrays.stream(migrations).anyMatch(SchemaInspector::isNewer)) {
-        return State.TOO_NEW;
-      }
-      var validation = flyway.validateWithResult();
-      if (!validation.validationSuccessful) {
+    List<Applied> applied = readHistory(absolute);
+    List<Script> scripts = Migrations.scripts(locations);
+    return stateOf(applied, scripts);
+  }
+
+  /**
+   * Состояние по применённым версиям и набору. Применённая версия, которой нет в наборе, — схема
+   * новее приложения; неизвестная версия меньше последней известной — несоответствие истории
+   * набору. Неудачная строка истории — несоответствие: такая БД требует внимания, а не миграции.
+   */
+  private static State stateOf(List<Applied> applied, List<Script> scripts) {
+    Set<Long> available = new HashSet<>();
+    long latest = 0;
+    for (Script script : scripts) {
+      available.add(script.version());
+      latest = Math.max(latest, script.version());
+    }
+    Set<Long> appliedOk = new HashSet<>();
+    for (Applied row : applied) {
+      if (!row.success()) {
         throw new PersistenceException(
-            "История миграций не соответствует приложению: " + validation.getAllErrorMessages());
+            "История миграций содержит неудачную миграцию версии " + row.version());
       }
-      boolean pending =
-          Arrays.stream(migrations).anyMatch(m -> m.getState() == MigrationState.PENDING);
-      return pending ? State.NEEDS_MIGRATION : State.UP_TO_DATE;
-    } catch (FlywayException e) {
-      throw new PersistenceException("Не удалось прочитать схему БД: " + absolute, e);
+      if (!available.contains(row.version())) {
+        // Применённая версия вне набора: больше последней известной — схема новее приложения,
+        // меньше — история нарушает порядок набора
+        if (row.version() > latest || scripts.isEmpty()) {
+          return State.TOO_NEW;
+        }
+        throw new PersistenceException(
+            "История миграций не соответствует миграциям приложения: применена неизвестная версия "
+                + row.version());
+      }
+      appliedOk.add(row.version());
+    }
+    return appliedOk.containsAll(available) ? State.UP_TO_DATE : State.NEEDS_MIGRATION;
+  }
+
+  /** Применённые версии из таблицы истории; соединение открывает только существующий файл. */
+  private static List<Applied> readHistory(Path file) {
+    try (Connection c =
+        SqliteSupport.connect(SqliteSupport.url(file), SqliteSupport.maintenanceProperties())) {
+      return Migrations.applied(c);
+    } catch (SQLException e) {
+      throw new PersistenceException("Не удалось прочитать историю миграций БД: " + file, e);
     }
   }
 
@@ -108,7 +111,7 @@ final class SchemaInspector {
       try (ResultSet rs =
           st.executeQuery(
               "SELECT count(*), coalesce(sum(type = 'table' AND name = '"
-                  + HISTORY_TABLE
+                  + Migrations.HISTORY_TABLE
                   + "'), 0) FROM sqlite_master")) {
         rs.next();
         objects = rs.getInt(1);
@@ -137,11 +140,5 @@ final class SchemaInspector {
     } catch (IOException e) {
       throw new PersistenceException("Не удалось прочитать схему БД: " + file, e);
     }
-  }
-
-  /** Миграция новее приложения: она уже применена к файлу, но неизвестна этой сборке. */
-  private static boolean isNewer(MigrationInfo migration) {
-    return migration.getState() == MigrationState.FUTURE_SUCCESS
-        || migration.getState() == MigrationState.FUTURE_FAILED;
   }
 }

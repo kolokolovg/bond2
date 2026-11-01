@@ -17,32 +17,22 @@ import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 import static ru.onlychill.bonds2.testutil.TestSql.executeSql;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.List;
 import java.util.stream.Stream;
-import org.flywaydb.core.api.FlywayException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.sqlite.SQLiteConfig;
 
 class DatabaseMigrationTest {
 
-  /** Фиксированное время: имя копии предсказуемо — {@code app.db.bak-20261029-101530}. */
-  private static final Clock CLOCK =
-      Clock.fixed(Instant.parse("2026-10-29T10:15:30Z"), ZoneOffset.UTC);
-
-  private static final String BACKUP_NAME = "app.db.bak-20261029-101530";
+  /** Служебная копия перед миграцией: фиксированное имя в каталоге данных. */
+  private static final String PRE_MIGRATION = "bonds2.pre-migration.db";
 
   /** Новая версия: V2 создаёт таблицы с внешним ключом, V3 вставляет строку-сироту и падает. */
   private static final String FK_FAIL = "classpath:migrations/fk_fail";
@@ -50,17 +40,65 @@ class DatabaseMigrationTest {
   @TempDir Path dir;
 
   @Test
-  void successfulMigrationKeepsBackupOfPreviousState() throws Exception {
+  void successfulMigrationKeepsPreMigrationBackupOfPreviousState() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
 
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+    Database.migrateWithBackup(file, NEW_OK);
 
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
+    Path backup = dir.resolve(PRE_MIGRATION);
     // Копия VACUUM INTO может отличаться побайтно от исходника, поэтому сравниваем состояние данных
     assertThat(Database.inspect(backup, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
     assertThat(valueOf(backup, OLD)).isEqualTo("v");
     assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
+    assertThat(dirContent()).containsExactlyInAnyOrder("app.db", PRE_MIGRATION);
+  }
+
+  @Test
+  void preMigrationBackupIsOverwrittenWithNewPreviousState() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
+    // Прежняя копия другой миграции: фиксированное имя атомарно перезаписывается
+    Files.writeString(dir.resolve(PRE_MIGRATION), "остаток прежней копии");
+    Database.migrateWithBackup(file, NEW_OK);
+
+    Path backup = dir.resolve(PRE_MIGRATION);
+    assertThat(valueOf(backup, OLD)).isEqualTo("v");
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(dirContent()).containsExactlyInAnyOrder("app.db", PRE_MIGRATION);
+  }
+
+  @Test
+  void failedMigrationLeavesFilePreMigrationAndBackupIntact() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "kept");
+
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_FAIL))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("Миграции не применены")
+        .hasRootCauseInstanceOf(SQLException.class);
+
+    // Транзакция откатила весь набор: файл до-миграционный, служебная копия сохранена
+    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(tableExists(file, OLD, "item")).isFalse();
+    assertThat(rowCount(file, OLD, "app_info")).isEqualTo(1);
+    assertThat(valueOf(file, OLD)).isEqualTo("kept");
+    assertThat(valueOf(dir.resolve(PRE_MIGRATION), OLD)).isEqualTo("kept");
+    assertThat(dirContent()).containsExactlyInAnyOrder("app.db", PRE_MIGRATION);
+  }
+
+  @Test
+  void foreignKeyViolationFailsMigrationAndFileStaysPreMigration() throws Exception {
+    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "kept");
+
+    // Внешние ключи включены и у соединений миграции: строка-сирота из V3 не применяется
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, FK_FAIL))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("Миграции не применены")
+        .hasRootCauseInstanceOf(SQLException.class);
+
+    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(tableExists(file, OLD, "parent")).isFalse();
+    assertThat(tableExists(file, OLD, "child")).isFalse();
+    assertThat(valueOf(file, OLD)).isEqualTo("kept");
   }
 
   @Test
@@ -76,49 +114,12 @@ class DatabaseMigrationTest {
     }
     assertThat(journalMode(file)).isEqualToIgnoringCase("wal");
 
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
+    Database.migrateWithBackup(file, NEW_OK);
 
     assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
     // Режим журнала файла остался прежним: соединения миграции его не задают
     assertThat(journalMode(file)).isEqualToIgnoringCase("wal");
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
-  }
-
-  @Test
-  void failedMigrationRestoresBackupAndReportsOriginalCause() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "kept");
-
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("восстановлена")
-        .hasCauseInstanceOf(FlywayException.class)
-        .hasRootCauseInstanceOf(SQLException.class);
-
-    assertThat(backupsOf(file)).hasSize(1);
-    // Совпадение логическое: схема и данные такие же, как до миграции. Побайтно файл может
-    // отличаться и от исходного, и от копии, поэтому байты не сравниваются.
-    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
-    assertThat(tableExists(file, OLD, "item")).isFalse();
-    assertThat(rowCount(file, OLD, "app_info")).isEqualTo(1);
-    assertThat(valueOf(file, OLD)).isEqualTo("kept");
-  }
-
-  @Test
-  void foreignKeyViolationFailsMigrationAndBackupIsRestored() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "kept");
-
-    // Внешние ключи включены и у соединений миграции: строка-сирота из V3 не применяется
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, FK_FAIL))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("восстановлена")
-        .hasCauseInstanceOf(FlywayException.class)
-        .hasRootCauseInstanceOf(SQLException.class);
-
-    // Файл возвращён к состоянию копии: таблиц с внешним ключом нет, сирота не появилась
-    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
-    assertThat(tableExists(file, OLD, "parent")).isFalse();
-    assertThat(tableExists(file, OLD, "child")).isFalse();
-    assertThat(valueOf(file, OLD)).isEqualTo("kept");
   }
 
   @Test
@@ -128,151 +129,69 @@ class DatabaseMigrationTest {
     byte[] before = Files.readAllBytes(file);
 
     // VACUUM INTO не создаёт копию повреждённой БД: сбой создания копии останавливает миграцию
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_OK))
         .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("резервную копию")
-        .hasCauseInstanceOf(SQLException.class);
+        .hasMessageContaining("служебную копию")
+        .hasRootCauseInstanceOf(SQLException.class);
 
     assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(backupsOf(file)).isEmpty();
     assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
+    assertThat(dirContent()).containsExactly("app.db");
   }
 
   @Test
-  void corruptedCopyFailsIntegrityCheckAndIsDeleted() throws Exception {
-    Path copy = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "MARKER-5501");
+  void corruptedCopyFailsIntegrityCheck() throws Exception {
+    Path copy = createOldDatabaseWithRow(dir.resolve(PRE_MIGRATION), "MARKER-5501");
     corruptPageHolding(copy, "MARKER-5501");
 
-    assertThatThrownBy(() -> BackupManager.verifyBackup(copy))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("целостности");
+    // Проверка целостности копии обязана отвергнуть повреждённый файл
+    assertThatThrownBy(() -> BackupManager.verifyCopy(copy)).isInstanceOf(SQLException.class);
+    // Повреждённая копия остаётся на месте: решение о её судьбе за вызывающим кодом
+    assertThat(copy).isRegularFile();
+  }
+
+  @Test
+  void missingCopyFailsIntegrityCheckWithoutCreatingFile() {
+    Path copy = dir.resolve(PRE_MIGRATION);
+
+    // Отсутствующая копия не «проходит» проверку по заново созданному пустому файлу
+    assertThatThrownBy(() -> BackupManager.verifyCopy(copy)).isInstanceOf(SQLException.class);
+
     assertThat(copy).doesNotExist();
   }
 
   @Test
-  void databaseRemovedBeforeBackupFailsMigrationWithoutEmptyFiles() throws Exception {
+  void preMigrationCopyOfRemovedFileFailsWithoutCreatingEmptyFiles() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Шов — часы копии: файл БД удаляется после распознавания состояния, но до VACUUM INTO
-    Clock clock =
-        new Clock() {
-          @Override
-          public Instant instant() {
-            try {
-              Files.deleteIfExists(file);
-            } catch (IOException e) {
-              throw new UncheckedIOException(e);
-            }
-            return CLOCK.instant();
-          }
-
-          @Override
-          public ZoneId getZone() {
-            return CLOCK.getZone();
-          }
-
-          @Override
-          public Clock withZone(ZoneId zone) {
-            return this;
-          }
-        };
-
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, clock, NEW_OK))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining("резервную копию")
-        .hasCauseInstanceOf(SQLException.class);
-
-    // Пустой файл не появляется ни на месте БД, ни на месте копии
-    assertThat(file).doesNotExist();
-    assertThat(backupsOf(file)).isEmpty();
-  }
-
-  @Test
-  void historyReadOfRemovedFileFailsWithoutCreatingIt() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.NEEDS_MIGRATION);
-    // История миграций читается отдельным соединением Flyway. Файл удалён после чтения схемы,
-    // поэтому чтение истории обязано дать ошибку, а не создать пустую базу «нужна миграция»
+    // Окно из спеки: файл удалён после распознавания состояния, до создания копии
     Files.delete(file);
 
-    assertThatThrownBy(() -> Database.inspect(file, NEW_OK))
-        .isInstanceOf(PersistenceException.class);
-    // Гарантия уровня соединения: чтение истории по отсутствующему файлу не создаёт файл
-    assertThatThrownBy(() -> SchemaInspector.flywayExisting(file, NEW_OK).info())
-        .isInstanceOf(FlywayException.class);
+    assertThatThrownBy(() -> BackupManager.preMigrationCopy(file))
+        .isInstanceOf(MigrationException.class)
+        .hasMessageContaining("служебную копию");
 
-    assertThat(file).doesNotExist();
-    assertThat(sibling(file, "-wal")).doesNotExist();
-    assertThat(sibling(file, "-journal")).doesNotExist();
+    // Пустой файл не появляется ни на месте БД, ни на месте копии
+    assertThat(dirContent()).isEmpty();
   }
 
   @Test
   void migrationOfRemovedFileFailsWithoutCreatingEmptyFile() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Окно: файл удалён после проверки резервной копии, до применения миграций. Соединение Flyway
+    // Окно: файл удалён после распознавания состояния, до применения миграций. Соединение миграции
     // «только существующий файл» не создаёт пустой файл на месте удалённого
     Files.delete(file);
 
-    assertThatThrownBy(() -> SchemaInspector.flywayExisting(file, NEW_OK).migrate())
-        .isInstanceOf(FlywayException.class);
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_OK))
+        .isInstanceOf(PersistenceException.class);
 
     assertThat(file).doesNotExist();
     assertThat(sibling(file, "-wal")).doesNotExist();
     assertThat(sibling(file, "-journal")).doesNotExist();
+    assertThat(dirContent()).isEmpty();
   }
 
   @Test
-  void restoreIsNotStartedForRemovedFileAndBackupPathIsReported() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "current");
-    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
-    // Окно из спеки: файл удалён после успешной проверки копии, до применения миграций. Шов —
-    // реакция на неудачную миграцию: основной файл к этому моменту отсутствует
-    Files.delete(file);
-
-    var cause = new IllegalStateException("миграция");
-    MigrationException failure = BackupManager.migrationFailure(file, backup, cause);
-
-    assertThat(failure)
-        .hasMessageContaining("Файл БД не найден, миграция не выполнена")
-        .hasMessageContaining(BACKUP_NAME);
-    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(NoSuchFileException.class);
-    // Откат не запускался: на месте БД ничего не появилось, копия осталась с данными
-    assertThat(file).doesNotExist();
-    assertThat(valueOf(backup, OLD)).isEqualTo("saved");
-    assertThat(namesInDir()).containsExactly(BACKUP_NAME);
-  }
-
-  @Test
-  void backupRemovedBeforeVerificationFailsWithItsPathAndNoNewFileAppears() throws Exception {
-    Path copy = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "v");
-    // Копия исчезает между созданием и проверкой целостности
-    Files.delete(copy);
-
-    assertThatThrownBy(() -> BackupManager.verifyBackup(copy))
-        .isInstanceOf(MigrationException.class)
-        .hasMessageContaining(BACKUP_NAME);
-
-    // Новый файл на месте копии не появляется
-    assertThat(copy).doesNotExist();
-  }
-
-  @Test
-  void existingBackupWithSameStampGetsNumericSuffix() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Имя копии занято (в том числе каталогом): существующее не трогаем
-    Path occupied = Files.writeString(dir.resolve(BACKUP_NAME), "other");
-    Path occupiedDir = Files.createDirectory(dir.resolve(BACKUP_NAME + "-1"));
-
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME + "-2");
-    assertThat(valueOf(backup, OLD)).isEqualTo("v");
-    assertThat(Files.readString(occupied)).isEqualTo("other");
-    assertThat(occupiedDir).isDirectory();
-    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
-  }
-
-  @Test
-  void backupContainsDataThatIsStillOnlyInWalFile() throws Exception {
+  void preMigrationCopyContainsDataThatIsStillOnlyInWalFile() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
     Path wal = sibling(file, "-wal");
     // Соединение с чтением держит WAL открытым: без него последнее закрытие перенесёт WAL в файл
@@ -282,229 +201,39 @@ class DatabaseMigrationTest {
       assertThat(Files.readString(wal, StandardCharsets.ISO_8859_1)).contains("in-wal");
       assertThat(Files.readString(file, StandardCharsets.ISO_8859_1)).doesNotContain("in-wal");
 
-      Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+      Database.migrateWithBackup(file, NEW_OK);
 
-      assertThat(valueOf(backup, OLD)).isEqualTo("in-wal");
+      // VACUUM INTO читает согласованный снимок вместе с журналом WAL
+      assertThat(valueOf(dir.resolve(PRE_MIGRATION), OLD)).isEqualTo("in-wal");
     }
   }
 
   @Test
-  void backupPathWithApostropheIsCreatedAndMigrated() throws Exception {
+  void migrationWorksInDirectoryWhoseNameHasApostrophe() throws Exception {
     Path apostropheDir = Files.createDirectory(dir.resolve("o'neil"));
     Path file = createOldDatabaseWithRow(apostropheDir.resolve("app.db"), "v");
 
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+    Database.migrateWithBackup(file, NEW_OK);
 
-    assertThat(backup).isRegularFile();
-    assertThat(backup.getParent()).isEqualTo(apostropheDir);
-    assertThat(valueOf(backup, OLD)).isEqualTo("v");
+    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(valueOf(apostropheDir.resolve(PRE_MIGRATION), OLD)).isEqualTo("v");
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
   }
 
   @Test
-  void migrationRemovesLeftoverRestoreFileOfThisDatabase() throws Exception {
+  void oldStampedBackupsAreNotTouchedByMigration() throws Exception {
     Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Обрывок отката от прерванного восстановления: удаляется до создания копии
-    Files.writeString(dir.resolve("app.db.abc123.restore"), "обрывок");
+    // Копии прошлых версий приложения остаются на диске без действий приложения
+    Path oldBackup = Files.writeString(dir.resolve("app.db.bak-20200101-000000"), "старая копия");
+    Path restore = Files.writeString(dir.resolve("app.db.abc123.restore"), "обрывок отката");
 
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
+    Database.migrateWithBackup(file, NEW_OK);
 
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
-    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
-    assertThat(namesInDir()).doesNotContain("app.db.abc123.restore");
-    assertThat(namesInDir()).noneMatch(name -> name.endsWith(".restore"));
-  }
-
-  @Test
-  void restoreLeftoverDirectoryDoesNotStopMigration() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Необычная запись с именем временного файла: пропускается и миграции не мешает
-    Path leftoverDir = Files.createDirectory(dir.resolve("app.db.xyz.restore"));
-    Files.writeString(leftoverDir.resolve("keep.txt"), "не трогать");
-
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
-    assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
-    assertThat(leftoverDir).isDirectory();
-    assertThat(leftoverDir.resolve("keep.txt")).hasContent("не трогать");
-  }
-
-  @Test
-  void successfulMigrationKeepsOnlyThreeNewestBackupsOfThisFile() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    for (String name :
-        List.of(
-            "app.db.bak-20200101-000000",
-            "app.db.bak-20250101-000000",
-            "app.db.bak-20250101-000000-1",
-            "app.db.bak-20250101-000000-10",
-            "app.db.bak-20250101-000000-2")) {
-      Files.writeString(dir.resolve(name), name);
-    }
-    Files.writeString(dir.resolve("other.db.bak-20200101-000000"), "x");
-    Files.writeString(dir.resolve("app.db.bak-old"), "x");
-    Files.writeString(dir.resolve("app.db.bak-20200101-000000.txt"), "x");
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backupNames())
+    assertThat(oldBackup).hasContent("старая копия");
+    assertThat(restore).hasContent("обрывок отката");
+    assertThat(dirContent())
         .containsExactlyInAnyOrder(
-            BACKUP_NAME,
-            "app.db.bak-20250101-000000-10",
-            "app.db.bak-20250101-000000-2",
-            "other.db.bak-20200101-000000",
-            "app.db.bak-old",
-            "app.db.bak-20200101-000000.txt");
-  }
-
-  @Test
-  void newBackupIsKeptWhenOlderBackupsHaveLaterStamps() throws Exception {
-    // Часы перевели назад: все прежние копии новее метки новой копии (20261029-101530)
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    for (String name :
-        List.of(
-            "app.db.bak-20261101-000000",
-            "app.db.bak-20261102-000000",
-            "app.db.bak-20261103-000000")) {
-      Files.writeString(dir.resolve(name), name);
-    }
-
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
-    assertThat(backup).isRegularFile();
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20261103-000000", "app.db.bak-20261102-000000");
-  }
-
-  @Test
-  void fewerThanThreeBackupsAreAllKept() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    Files.writeString(dir.resolve("app.db.bak-20200101-000000"), "старая");
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backupNames()).containsExactlyInAnyOrder(BACKUP_NAME, "app.db.bak-20200101-000000");
-  }
-
-  @Test
-  void exactlyThreeBackupsWithNewOneAreAllKept() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    Files.writeString(dir.resolve("app.db.bak-20200101-000000"), "старая");
-    Files.writeString(dir.resolve("app.db.bak-20210101-000000"), "старая");
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20200101-000000", "app.db.bak-20210101-000000");
-  }
-
-  @Test
-  void copiesWithSameStampAreOrderedByNumericSuffix() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Одна метка у одиннадцати копий: без суффикса (номер 0), «-1»…«-10»; создаются не по порядку
-    for (String suffix : List.of("", "-1", "-10", "-3", "-2", "-9", "-5", "-4", "-8", "-7", "-6")) {
-      String name = "app.db.bak-20250101-000000" + suffix;
-      Files.writeString(dir.resolve(name), name);
-    }
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    // Сравниваются числа, а не строки: остаются «-10» и «-9», остальные удаляются
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20250101-000000-10", "app.db.bak-20250101-000000-9");
-  }
-
-  @Test
-  void keepsTwoNewestOfManyOlderBackups() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    // Метки создаются не по порядку, поэтому порядок каталога не совпадает с порядком меток
-    for (int day : List.of(5, 1, 8, 3, 9, 2, 7, 4, 6)) {
-      String name = "app.db.bak-202501" + String.format("%02d", day) + "-000000";
-      Files.writeString(dir.resolve(name), name);
-    }
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20250109-000000", "app.db.bak-20250108-000000");
-  }
-
-  @Test
-  void foreignFilesCopiesOfOtherDatabasesAndDirectoriesAreNotPruned() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    for (String name :
-        List.of(
-            "app.db.bak-20200101-000000",
-            "app.db.bak-20210101-000000",
-            "app.db.bak-20220101-000000")) {
-      Files.writeString(dir.resolve(name), name);
-    }
-    // Не копии этой БД: другая БД, другое расширение, другое имя и каталог с похожим именем
-    Files.writeString(dir.resolve("other.db.bak-20190101-000000"), "x");
-    Files.writeString(dir.resolve("app.db.bak-20190101-000000.txt"), "x");
-    Files.writeString(dir.resolve("app.db.bak-old"), "x");
-    Files.createDirectory(dir.resolve("app.db.bak-20190101-000000-9"));
-
-    Database.migrateWithBackup(file, CLOCK, NEW_OK);
-
-    // Четыре копии этой БД: самая старая удалена, все прочие имена не затронуты
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME,
-            "app.db.bak-20210101-000000",
-            "app.db.bak-20220101-000000",
-            "other.db.bak-20190101-000000",
-            "app.db.bak-20190101-000000.txt",
-            "app.db.bak-old",
-            "app.db.bak-20190101-000000-9");
-  }
-
-  @Test
-  void failedMigrationKeepsOnlyThreeNewestBackupsIncludingNewOne() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    for (String name :
-        List.of(
-            "app.db.bak-20200101-000000",
-            "app.db.bak-20210101-000000",
-            "app.db.bak-20220101-000000",
-            "app.db.bak-20230101-000000",
-            "app.db.bak-20240101-000000")) {
-      Files.writeString(dir.resolve(name), name);
-    }
-
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
-        .isInstanceOf(MigrationException.class);
-
-    // Лимит действует и после неудачи: остаются только что созданная и две самые новые старые
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20240101-000000", "app.db.bak-20230101-000000");
-  }
-
-  @Test
-  void failedMigrationKeepsNewBackupWhenOlderBackupsHaveLaterStamps() throws Exception {
-    // Часы перевели назад: все прежние копии новее метки новой копии (20261029-101530)
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "v");
-    for (String name :
-        List.of(
-            "app.db.bak-20261101-000000",
-            "app.db.bak-20261102-000000",
-            "app.db.bak-20261103-000000")) {
-      Files.writeString(dir.resolve(name), name);
-    }
-
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_FAIL))
-        .isInstanceOf(MigrationException.class);
-
-    assertThat(backupNames())
-        .containsExactlyInAnyOrder(
-            BACKUP_NAME, "app.db.bak-20261103-000000", "app.db.bak-20261102-000000");
+            "app.db", PRE_MIGRATION, "app.db.bak-20200101-000000", "app.db.abc123.restore");
   }
 
   @Test
@@ -512,12 +241,12 @@ class DatabaseMigrationTest {
     Path file = createDatabase(dir.resolve("app.db"), NEW_OK);
     byte[] before = Files.readAllBytes(file);
 
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_OK))
         .isInstanceOf(PersistenceException.class)
         .hasMessageContaining("не требуется");
 
     assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(backupsOf(file)).isEmpty();
+    assertThat(dirContent()).containsExactly("app.db");
   }
 
   @Test
@@ -525,12 +254,12 @@ class DatabaseMigrationTest {
     Path file = createDatabase(dir.resolve("app.db"), TOO_NEW);
     byte[] before = Files.readAllBytes(file);
 
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, OLD))
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, OLD))
         .isInstanceOf(PersistenceException.class)
         .hasMessageContaining("новее");
 
     assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(backupsOf(file)).isEmpty();
+    assertThat(dirContent()).containsExactly("app.db");
   }
 
   @Test
@@ -543,7 +272,7 @@ class DatabaseMigrationTest {
         .hasMessageContaining("пуст");
 
     assertThat(file).isEmptyFile();
-    assertThat(backupsOf(file)).isEmpty();
+    assertThat(dirContent()).containsExactly("empty.db");
   }
 
   @Test
@@ -552,12 +281,12 @@ class DatabaseMigrationTest {
     executeSql(file, "CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT)");
     byte[] before = Files.readAllBytes(file);
 
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_OK))
         .isInstanceOf(PersistenceException.class)
         .hasMessageContaining("не база данных приложения");
 
     assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(backupsOf(file)).isEmpty();
+    assertThat(dirContent()).containsExactly("app.db");
   }
 
   @Test
@@ -567,17 +296,15 @@ class DatabaseMigrationTest {
     byte[] before = Files.readAllBytes(file);
 
     // Открытый экземпляр владеет файлом: миграция отказывает до любых файловых операций
-    assertThatThrownBy(() -> Database.migrateWithBackup(file, CLOCK, NEW_OK))
+    assertThatThrownBy(() -> Database.migrateWithBackup(file, NEW_OK))
         .isInstanceOf(PersistenceException.class)
         .hasMessageContaining("уже открыт")
         .hasMessageContaining(file.toAbsolutePath().normalize().toString());
     assertThat(Files.readAllBytes(file)).isEqualTo(before);
-    assertThat(backupsOf(file)).isEmpty();
 
     // После закрытия экземпляра владение освобождено: миграция проходит по общим правилам
     db.close();
-    Path backup = Database.migrateWithBackup(file, CLOCK, NEW_OK);
-    assertThat(backup.getFileName()).hasToString(BACKUP_NAME);
+    Database.migrateWithBackup(file, NEW_OK);
     assertThat(Database.inspect(file, NEW_OK)).isEqualTo(Database.State.UP_TO_DATE);
     assertThat(valueOf(file, NEW_OK)).isEqualTo("v");
   }
@@ -615,79 +342,7 @@ class DatabaseMigrationTest {
     db.close();
   }
 
-  @Test
-  void rollbackRestoresBackupContentAndRemovesStaleSidecars() throws Exception {
-    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "saved");
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "broken");
-    // Журнал неудачной миграции не должен примениться к восстановленному файлу
-    Path wal = Files.writeString(sibling(file, "-wal"), "stale journal");
-
-    MigrationException failure =
-        BackupManager.restore(file, backup, new IllegalStateException("миграция"));
-
-    assertThat(failure).hasMessageContaining("восстановлена").hasMessageContaining(BACKUP_NAME);
-    assertThat(Files.readAllBytes(file)).isEqualTo(Files.readAllBytes(backup));
-    assertThat(wal).doesNotExist();
-    assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);
-    assertThat(valueOf(file, OLD)).isEqualTo("saved");
-  }
-
-  @Test
-  void busyWalDoesNotStopRestoreAndBackupReplacesMainFile() throws Exception {
-    Path file = createOldDatabaseWithRow(dir.resolve("app.db"), "current");
-    Path backup = createOldDatabaseWithRow(dir.resolve(BACKUP_NAME), "MARKER-9102");
-    // Читатель держит снимок: перенос WAL невозможен, восстановление продолжается без него
-    try (Connection reader = DriverManager.getConnection("jdbc:sqlite:" + file)) {
-      reader.setAutoCommit(false);
-      queryLong(reader, "SELECT count(*) FROM app_info");
-      executeSql(file, "UPDATE app_info SET value = 'in-wal' WHERE key = 'k'");
-
-      MigrationException failure =
-          BackupManager.restore(file, backup, new IllegalStateException("миграция"));
-
-      assertThat(failure).hasMessageContaining("восстановлена").hasMessageContaining(BACKUP_NAME);
-      // Замена состоялась несмотря на занятый WAL: на месте БД данные только из копии
-      assertThat(valueOf(file, OLD)).isEqualTo("MARKER-9102");
-    }
-    // Сайдкары занятого WAL удалены, временный файл не остался
-    assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);
-  }
-
-  @Test
-  void failedReplacementKeepsDatabaseNamesBackupAndLeavesNoTempFile() throws Exception {
-    Path backup = Files.writeString(dir.resolve(BACKUP_NAME), "копия");
-    // Занятый каталогом путь БД — SQLite не может открыть каталог, сбой происходит на шаге
-    // переноса WAL, который продолжается по возможности, а затем на шаге замены файла
-    Path file = Files.createDirectory(dir.resolve("app.db"));
-    Files.writeString(file.resolve("keep.txt"), "не трогать");
-    var cause = new IllegalStateException("миграция");
-
-    MigrationException failure = BackupManager.restore(file, backup, cause);
-
-    assertThat(failure).hasMessageContaining(backup.toString()).hasMessageContaining("вручную");
-    // Сбой замены файла прикладывается к исходной ошибке миграции; сбой переноса WAL пишется в лог
-    assertThat(cause.getSuppressed()).singleElement().isInstanceOf(IOException.class);
-    assertThat(file).isDirectory();
-    assertThat(file.resolve("keep.txt")).hasContent("не трогать");
-    assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", BACKUP_NAME);
-  }
-
-  @Test
-  void failedCopyOfBackupKeepsSidecarsAndLeavesNoTempFile() throws Exception {
-    Path file = Files.writeString(dir.resolve("app.db"), "текущий файл");
-    Path wal = Files.writeString(sibling(file, "-wal"), "журнал");
-    Path missing = dir.resolve(BACKUP_NAME);
-
-    MigrationException failure =
-        BackupManager.restore(file, missing, new IllegalStateException("миграция"));
-
-    assertThat(failure).hasMessageContaining(missing.toString());
-    assertThat(file).hasContent("текущий файл");
-    assertThat(wal).hasContent("журнал");
-    assertThat(namesInDir()).containsExactlyInAnyOrder("app.db", "app.db-wal");
-  }
-
-  private List<String> namesInDir() throws IOException {
+  private List<String> dirContent() throws IOException {
     try (Stream<Path> files = Files.list(dir)) {
       return files.map(p -> String.valueOf(p.getFileName())).toList();
     }
@@ -725,25 +380,9 @@ class DatabaseMigrationTest {
     }
   }
 
-  private List<String> backupNames() throws IOException {
-    try (Stream<Path> files = Files.list(dir)) {
-      return files
-          .map(p -> String.valueOf(p.getFileName()))
-          .filter(n -> n.contains(".bak-"))
-          .toList();
-    }
-  }
-
-  private static List<Path> backupsOf(Path file) throws IOException {
-    String prefix = file + ".bak-";
-    try (Stream<Path> files = Files.list(file.getParent())) {
-      return files.filter(p -> p.toString().startsWith(prefix)).toList();
-    }
-  }
-
   /**
    * Портит страницу таблицы с маркером: тип страницы B-дерева заменяется недопустимым значением, и
-   * {@code PRAGMA integrity_check} обязан это обнаружить. Служебные таблицы Flyway не
+   * {@code PRAGMA integrity_check} обязан это обнаружить. Служебные таблицы истории не
    * затрагиваются.
    */
   private static void corruptPageHolding(Path file, String marker) throws Exception {

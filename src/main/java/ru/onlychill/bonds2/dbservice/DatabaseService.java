@@ -24,10 +24,10 @@ import ru.onlychill.bonds2.persistence.Database;
 import ru.onlychill.bonds2.persistence.PersistenceException;
 
 /**
- * Единственный владелец файла БД: открытие, создание, миграция, закрытие и остановка выполняются
- * строго по одной на отдельном потоке {@code bonds2-db}. Сервис не зависит от интерфейса и ничего
- * не спрашивает у пользователя: решение о миграции приходит командами {@link #migrate()} или {@link
- * #declineMigration()}. Состояние публикуется через {@link #states()}.
+ * Единственный владелец файла БД: открытие, миграция, резервное копирование, закрытие и остановка
+ * выполняются строго по одной на отдельном потоке {@code bonds2-db}. Сервис не зависит от
+ * интерфейса и ничего не спрашивает у пользователя: решение о миграции приходит командами {@link
+ * #migrate()} или {@link #declineMigration()}. Состояние публикуется через {@link #states()}.
  *
  * <p>Методы можно вызывать из любого потока. Транзакции данных выполняются самой {@link Database}
  * вне потока жизненного цикла.
@@ -41,6 +41,9 @@ public final class DatabaseService {
   /** Операции с файлами БД; тесты подменяют их, чтобы управлять временем и сбоями. */
   public interface Storage {
 
+    /** Единственный файл БД приложения в каталоге данных. */
+    Path databaseFile();
+
     Database.State inspect(Path file);
 
     Database open(Path file);
@@ -50,6 +53,9 @@ public final class DatabaseService {
     Database initialize(Path file);
 
     void migrateWithBackup(Path file);
+
+    /** Резервная копия открытой БД по выбранному пути. */
+    void backup(Database database, Path target);
 
     /** Закрывает БД и переносит журнал WAL в основной файл. */
     void close(Database database);
@@ -109,17 +115,21 @@ public final class DatabaseService {
   }
 
   /**
-   * Открывает БД. Устаревшая схема даёт {@link OpenResult.NeedsMigration} без изменения файла.
-   *
-   * @param createIfMissing создать БД, если файла нет; иначе отсутствие файла — ошибка
+   * Открывает единственную БД приложения: файл всегда берётся из каталога данных, отсутствующий
+   * файл создаётся с актуальной схемой. Устаревшая схема даёт {@link OpenResult.NeedsMigration} без
+   * изменения файла.
    */
-  public CompletableFuture<OpenResult> open(Path file, boolean createIfMissing) {
-    return submit(() -> doOpen(file, createIfMissing), OpenResult.Rejected::new);
+  public CompletableFuture<OpenResult> open() {
+    return submit(this::doOpen, OpenResult.Rejected::new);
   }
 
-  /** Создаёт БД с актуальной схемой; существующий файл не изменяется. */
-  public CompletableFuture<OpenResult> create(Path file) {
-    return submit(() -> doCreate(file), OpenResult.Rejected::new);
+  /**
+   * Создаёт резервную копию открытой БД по выбранному пользователем пути. Копирование идёт строго
+   * по одному с другими операциями сервиса и доступно только при открытой БД; при любом сбое БД
+   * остаётся открытой.
+   */
+  public CompletableFuture<BackupResult> backup(Path target) {
+    return submit(() -> doBackup(target), BackupResult.Rejected::new);
   }
 
   /** Мигрирует БД с резервной копией и открывает её; допустимо после {@code NeedsMigration}. */
@@ -352,23 +362,56 @@ public final class DatabaseService {
     publisher.publish(next);
   }
 
-  private OpenResult doOpen(Path file, boolean createIfMissing) {
+  private OpenResult doOpen() {
     if (!(state instanceof DbState.Closed)) {
       return new OpenResult.Rejected(STATE, OpenFailures.notAllowed("открыть"));
     }
-    publish(new DbState.Opening(DbState.Kind.OPEN, file));
-    return finish(file, () -> attempt(file, createIfMissing));
+    Path file = storage.databaseFile();
+    publish(new DbState.Opening(file));
+    return finish(file, () -> attempt(file));
   }
 
-  private OpenResult doCreate(Path file) {
-    if (!(state instanceof DbState.Closed)) {
-      return new OpenResult.Rejected(STATE, OpenFailures.notAllowed("создать"));
+  /**
+   * Копирование открытой БД: доступно только в состоянии «открыта». Неудача не закрывает БД и не
+   * меняет её состояние — публикуется прежнее «открыта», пользователю возвращается
+   * классифицированная причина.
+   */
+  private BackupResult doBackup(Path target) {
+    if (!(state instanceof DbState.Open open)) {
+      return new BackupResult.Rejected(STATE, OpenFailures.notAllowed("сделать резервную копию"));
     }
-    if (Files.exists(file)) {
-      return OpenFailures.fileExists(file);
+    Database opened = database;
+    if (opened == null) {
+      throw new IllegalStateException("Открытая БД не передана");
     }
-    publish(new DbState.Opening(DbState.Kind.CREATE, file));
-    return finish(file, () -> createDatabase(file));
+    publish(new DbState.BackingUp(target));
+    BackupResult result;
+    try {
+      storage.backup(opened, target);
+      result = new BackupResult.Copied(target);
+    } catch (VirtualMachineError e) {
+      throw e;
+    } catch (PersistenceException e) {
+      result =
+          abandoned
+              ? new BackupResult.Rejected(STOPPED, MESSAGE_STOPPED)
+              : OpenFailures.backupFailed(target, e);
+    } catch (RuntimeException | Error e) {
+      LOG.log(System.Logger.Level.ERROR, "Внутренняя ошибка при копировании БД: " + target, e);
+      result =
+          abandoned
+              ? new BackupResult.Rejected(STOPPED, MESSAGE_STOPPED)
+              : new BackupResult.Failed(
+                  "Не удалось создать резервную копию "
+                      + target
+                      + ". "
+                      + OpenFailures.unexpected(e).message());
+    }
+    // БД остаётся открытой при любом исходе копирования; покинутая операция не публикует ничего
+    if (!abandoned) {
+      publish(new DbState.Open(open.file()));
+    }
+    return result;
   }
 
   private OpenResult doMigrate() {
@@ -502,13 +545,15 @@ public final class DatabaseService {
   }
 
   /**
-   * Открытие: по наличию файла и состоянию схемы выбирает действие. Отсутствующий файл создаётся
-   * только с {@code createIfMissing}. Пустой файл инициализируется без вопроса о миграции; чужой
-   * файл отклоняется и не меняется.
+   * Открытие: по наличию файла и состоянию схемы выбирает действие. Отсутствующий файл создаётся с
+   * актуальной схемой. Пустой файл инициализируется без вопроса о миграции; чужой файл отклоняется
+   * и не меняется.
    */
-  private Attempt attempt(Path file, boolean createIfMissing) {
-    if (Files.notExists(file)) {
-      return createIfMissing ? createDatabase(file) : new Attempt(OpenFailures.missing(file), null);
+  private Attempt attempt(Path file) {
+    // Не «notExists»: если родитель пути не каталог, существование неопределимо — такой файл
+    // нельзя ни открыть, ни создать, поэтому он идёт по пути создания со своей причиной
+    if (!Files.exists(file)) {
+      return createDatabase(file);
     }
     try {
       return switch (storage.inspect(file)) {

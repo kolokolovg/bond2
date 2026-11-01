@@ -57,6 +57,11 @@ final class FxDialogs implements Dialogs {
   }
 
   @Override
+  public void info(String message) {
+    alert(AlertType.INFORMATION, "Информация", message, ButtonType.OK).show();
+  }
+
+  @Override
   public void error(String message) {
     alert(AlertType.ERROR, "Ошибка", message, ButtonType.OK).show();
   }

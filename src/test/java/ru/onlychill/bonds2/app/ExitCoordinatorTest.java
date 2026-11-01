@@ -125,7 +125,10 @@ class ExitCoordinatorTest {
   }
 
   private Path dbFile() {
-    return dir.resolve("data/bonds.db");
+    Path file = dir.resolve("data/bonds.db");
+    // Файл единственной БД задаётся хранилищу: сервис открывает его без параметров
+    storage.databaseFile = file;
+    return file;
   }
 
   @Test
@@ -170,7 +173,7 @@ class ExitCoordinatorTest {
     outdatedAt(dbFile());
     var coordinator = coordinator();
 
-    var opened = service.open(dbFile(), false).join();
+    var opened = service.open().join();
     assertThat(opened).isInstanceOf(OpenResult.NeedsMigration.class);
     assertThat(service.state()).isInstanceOf(DbState.AwaitingMigration.class);
 
@@ -237,7 +240,7 @@ class ExitCoordinatorTest {
   @Test
   void exitChainStopsDatabaseThenReleasesLockThenDisarmsHook() throws Exception {
     newDatabaseAt(dbFile());
-    service.open(dbFile(), false).join();
+    service.open().join();
     assertThat(service.state()).isInstanceOf(DbState.Open.class);
     List<String> events = new CopyOnWriteArrayList<>();
     var coordinator = coordinator();
@@ -262,7 +265,7 @@ class ExitCoordinatorTest {
   @Test
   void exitChainReleasesLockAndDisarmsHookEvenWhenStopFails() throws Exception {
     newDatabaseAt(dbFile());
-    service.open(dbFile(), false).join();
+    service.open().join();
     storage.closeFailure = new IllegalStateException("сбой закрытия");
     List<String> events = new CopyOnWriteArrayList<>();
     var coordinator = coordinator();
@@ -277,7 +280,7 @@ class ExitCoordinatorTest {
   @Test
   void shutdownWaitingWithOpenDatabaseClosesIt() throws Exception {
     newDatabaseAt(dbFile());
-    service.open(dbFile(), false).join();
+    service.open().join();
     assertThat(service.state()).isInstanceOf(DbState.Open.class);
     var coordinator = coordinator();
 

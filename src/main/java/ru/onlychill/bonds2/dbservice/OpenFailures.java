@@ -16,7 +16,6 @@ final class OpenFailures {
   /** Причина, по которой БД закрыта после отказа от миграции. */
   static final String REASON_OUTDATED = "схема устарела";
 
-  private static final String REASON_MISSING = "файл не найден";
   private static final String REASON_TOO_NEW = "схема новее приложения";
   private static final String REASON_FOREIGN = "не база bonds2";
   private static final String REASON_OPEN = "ошибка открытия";
@@ -50,22 +49,14 @@ final class OpenFailures {
     return "Операция «" + operation + "» недопустима в текущем состоянии БД.";
   }
 
-  /** Создание отклонено: файл уже существует и не изменяется. */
-  static OpenResult.Rejected fileExists(Path file) {
-    return new OpenResult.Rejected(
-        RejectionCause.FILE_EXISTS,
-        "Файл уже существует: "
-            + file
-            + ". Выберите другое имя файла: существующий файл не изменён.");
-  }
-
-  /** Файла нет, а создавать его не просили. */
-  static OpenResult.Failed missing(Path file) {
-    return new OpenResult.Failed(
-        REASON_MISSING,
-        "Файл БД не найден: "
-            + file
-            + ". Чтобы создать новую базу, выберите «Файл → Создать базу…».");
+  /**
+   * Классифицированный сбой копирования: короткая причина по коду SQLite из цепочки причин либо
+   * текст исключения. БД остаётся открытой, цель не изменена.
+   */
+  static BackupResult.Failed backupFailed(Path target, PersistenceException e) {
+    Classified byCode = bySqliteCode(e);
+    String details = byCode != null ? byCode.message() : ErrorMessages.of(e);
+    return new BackupResult.Failed("Не удалось создать резервную копию " + target + ". " + details);
   }
 
   /** Схема файла новее приложения: файл не открывается и не меняется. */
@@ -91,9 +82,10 @@ final class OpenFailures {
     return sqliteCodeOrByPlace(REASON_CREATE, e);
   }
 
-  /** Ошибка миграции уже содержит путь к резервной копии. */
+  /** Ошибка миграции: транзакция откатила изменения, файл БД остался прежним. */
   static OpenResult.Failed migrationFailed(PersistenceException e) {
-    return sqliteCodeOrByPlace(REASON_MIGRATION, e);
+    OpenResult.Failed failure = sqliteCodeOrByPlace(REASON_MIGRATION, e);
+    return new OpenResult.Failed(failure.reason(), failure.message() + " Файл БД не изменён.");
   }
 
   /**
@@ -102,35 +94,40 @@ final class OpenFailures {
    * неизвестный (включая незаполненный драйвером) — прежнюю классификацию по месту возникновения.
    */
   private static OpenResult.Failed sqliteCodeOrByPlace(String placeReason, PersistenceException e) {
-    OpenResult.Failed byCode = bySqliteCode(e);
-    return byCode != null ? byCode : new OpenResult.Failed(placeReason, ErrorMessages.of(e));
+    Classified byCode = bySqliteCode(e);
+    return byCode != null
+        ? new OpenResult.Failed(byCode.reason(), byCode.message())
+        : new OpenResult.Failed(placeReason, ErrorMessages.of(e));
   }
 
   /** Причина по коду результата SQLite; неизвестный код (в том числе 0) даёт {@code null}. */
-  private static OpenResult.@Nullable Failed bySqliteCode(PersistenceException e) {
+  private static @Nullable Classified bySqliteCode(PersistenceException e) {
     return switch (ErrorMessages.sqliteResultCode(e)) {
       case SQLITE_BUSY, SQLITE_LOCKED ->
-          new OpenResult.Failed(
+          new Classified(
               REASON_BUSY,
               "База данных занята другим процессом или соединением. Повторите операцию позже.");
       case SQLITE_CORRUPT ->
-          new OpenResult.Failed(
+          new Classified(
               REASON_CORRUPT,
               "Файл базы данных повреждён: открыть его нельзя. Используйте резервную копию, если"
                   + " она есть.");
       case SQLITE_FULL ->
-          new OpenResult.Failed(
+          new Classified(
               REASON_FULL,
               "На диске нет свободного места: операция не выполнена. Освободите место и повторите"
                   + " операцию.");
       case SQLITE_CANTOPEN, SQLITE_IOERR ->
-          new OpenResult.Failed(
+          new Classified(
               REASON_FILE_UNAVAILABLE,
               "Файл базы данных недоступен: его не удалось открыть. Проверьте, что файл на месте"
                   + " и не занят другой программой.");
       default -> null;
     };
   }
+
+  /** Короткая причина и подробный текст классифицированного сбоя. */
+  private record Classified(String reason, String message) {}
 
   /**
    * Исключение или ошибка среды выполнения, не предусмотренные контрактом операции: поток

@@ -40,7 +40,6 @@ repositories {
 dependencies {
     compileOnly(libs.jspecify)
     implementation(libs.sqlite.jdbc)
-    implementation(libs.flyway.core)
     errorprone(libs.errorprone.core)
     errorprone(libs.nullaway)
 

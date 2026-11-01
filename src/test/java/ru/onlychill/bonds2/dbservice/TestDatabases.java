@@ -76,10 +76,13 @@ public final class TestDatabases {
     }
   }
 
-  /** Резервные копии рядом с файлом БД: имена содержат {@code .bak-}. */
-  public static List<String> backupsIn(Path directory) throws IOException {
+  /** Служебные копии перед миграцией в каталоге: имена содержат {@code bonds2.pre-migration.db}. */
+  public static List<String> preMigrationCopiesIn(Path directory) throws IOException {
     try (Stream<Path> files = Files.list(directory)) {
-      return files.map(Path::toString).filter(name -> name.contains(".bak-")).toList();
+      return files
+          .map(Path::toString)
+          .filter(name -> name.contains("bonds2.pre-migration.db"))
+          .toList();
     }
   }
 

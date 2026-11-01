@@ -3,20 +3,16 @@
 package ru.onlychill.bonds2.persistence;
 
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.List;
 import java.util.Properties;
-import java.util.logging.Logger;
-import javax.sql.DataSource;
-import org.jspecify.annotations.Nullable;
 import org.sqlite.SQLiteConfig;
 import org.sqlite.SQLiteOpenMode;
 
@@ -67,8 +63,8 @@ final class SqliteSupport {
   /**
    * Общие свойства соединения «только существующий файл» без смены режима журнала: файл открывается
    * существующим, ожидание блокировки — по переданному таймауту. Синхронизация полная, внешние
-   * ключи включены: миграции Flyway и служебные соединения соблюдают те же гарантии, что и
-   * транзакции. Основа служебных свойств и соединений Flyway.
+   * ключи включены: миграции и служебные соединения соблюдают те же гарантии, что и транзакции
+   * приложения. Основа служебных свойств.
    */
   static Properties existingFileProperties(Duration busyTimeout) {
     var config = new SQLiteConfig();
@@ -88,89 +84,28 @@ final class SqliteSupport {
   }
 
   /**
+   * Настройки соединения прогона миграций: как у служебных соединений (только существующий файл,
+   * полная синхронизация, внешние ключи), но запись начинается с {@code BEGIN IMMEDIATE} — весь
+   * неприменённый набор применяется одной транзакцией. Режим журнала не задаётся: он принадлежит
+   * файлу и внутри транзакции меняться не может.
+   */
+  static Properties migrationProperties(Duration busyTimeout) {
+    var config = new SQLiteConfig();
+    existingFileOnly(config);
+    config.setSynchronous(SQLiteConfig.SynchronousMode.FULL);
+    config.enforceForeignKeys(true);
+    config.setBusyTimeout((int) busyTimeout.toMillis());
+    config.setTransactionMode(SQLiteConfig.TransactionMode.IMMEDIATE);
+    return config.toProperties();
+  }
+
+  /**
    * Настройки служебных соединений (проверки, копия): не переводят файл в WAL и не меняют его,
    * ожидание блокировки — по умолчанию. Файл открывается только существующим, поэтому удалённый или
    * перемещённый файл БД даёт ошибку открытия, а пустой файл на его месте не появляется.
    */
   static Properties maintenanceProperties() {
     return existingFileProperties(Database.DEFAULT_BUSY_TIMEOUT);
-  }
-
-  /**
-   * DataSource соединений Flyway к существующему файлу БД: каждое {@link #getConnection()}
-   * открывает новое соединение со свойствами «только существующий файл», поэтому Flyway (чтение
-   * истории, миграции, инициализация) не может создать файл на месте удалённого — открытие даёт
-   * ошибку.
-   */
-  static DataSource existingFileDataSource(Path file) {
-    return new ExistingFileDataSource(
-        url(file), existingFileProperties(Database.DEFAULT_BUSY_TIMEOUT));
-  }
-
-  /**
-   * Минимальная реализация {@link DataSource} без пула: новое соединение SQLite открывается на
-   * каждый вызов {@link #getConnection()}. Логины и таймаут входа к локальному файлу не
-   * применяются.
-   */
-  static final class ExistingFileDataSource implements DataSource {
-
-    private final String url;
-    private final Properties properties;
-
-    ExistingFileDataSource(String url, Properties properties) {
-      this.url = url;
-      this.properties = properties;
-    }
-
-    @Override
-    public Connection getConnection() throws SQLException {
-      return SqliteSupport.connect(url, properties);
-    }
-
-    /** Логины SQLite не применяются: соединение открывается тем же способом, без них. */
-    @Override
-    public Connection getConnection(String username, String password) throws SQLException {
-      return getConnection();
-    }
-
-    @Override
-    public <T> T unwrap(Class<T> iface) throws SQLException {
-      if (iface.isInstance(this)) {
-        return iface.cast(this);
-      }
-      throw new SQLException("Тип " + getClass().getName() + " не реализует " + iface.getName());
-    }
-
-    @Override
-    public boolean isWrapperFor(Class<?> iface) {
-      return iface.isInstance(this);
-    }
-
-    /** Журналирование идёт через исключения соединений и System.Logger самого приложения. */
-    @Override
-    public @Nullable PrintWriter getLogWriter() {
-      return null;
-    }
-
-    @Override
-    public void setLogWriter(PrintWriter out) {
-      // Журналирование DataSource не настраивается: ошибки открытия видны в исключениях соединений
-    }
-
-    @Override
-    public void setLoginTimeout(int seconds) {
-      // Таймаут входа к локальному файлу не применяется: ожидание блокировки задаёт busy_timeout
-    }
-
-    @Override
-    public int getLoginTimeout() {
-      return 0;
-    }
-
-    @Override
-    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
-      throw new SQLFeatureNotSupportedException("Драйвер SQLite не поддерживает java.util.logging");
-    }
   }
 
   /**
@@ -240,10 +175,19 @@ final class SqliteSupport {
     }
   }
 
+  /** Пути служебных файлов WAL и журнала рядом с файлом БД. */
+  static List<Path> sidecars(Path file) {
+    var paths = new java.util.ArrayList<Path>();
+    for (String suffix : SIDECAR_SUFFIXES) {
+      paths.add(withSuffix(file, suffix));
+    }
+    return List.copyOf(paths);
+  }
+
   /** Удаляет служебные файлы WAL и журнала; первая ошибка прерывает удаление. */
   static void deleteSidecars(Path file) throws IOException {
-    for (String suffix : SIDECAR_SUFFIXES) {
-      Files.deleteIfExists(withSuffix(file, suffix));
+    for (Path sidecar : sidecars(file)) {
+      Files.deleteIfExists(sidecar);
     }
   }
 }

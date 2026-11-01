@@ -5,9 +5,9 @@ package ru.onlychill.bonds2.dbservice;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
-import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.newDatabaseAt;
+import static ru.onlychill.bonds2.dbservice.TestDatabases.preMigrationCopiesIn;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -45,6 +45,7 @@ class DatabaseServiceTest {
   void stopService() {
     storage.openGate.release();
     storage.migrateGate.release();
+    storage.backupGate.release();
     service.shutdown(Duration.ofSeconds(30));
   }
 
@@ -54,6 +55,12 @@ class DatabaseServiceTest {
 
   private Path file() {
     return dir.resolve("data/bonds.db");
+  }
+
+  /** Открывает БД по заданному файлу: задаёт его хранилищу и ждёт результат на месте. */
+  private OpenResult openSync(Path file) {
+    storage.databaseFile = file;
+    return get(service.open());
   }
 
   private static <T> T get(CompletableFuture<T> future) {
@@ -102,7 +109,7 @@ class DatabaseServiceTest {
     return states;
   }
 
-  /** БД действительно закрыта: новая транзакция по держателю отклоняется с точной причиной. */
+  /** БД действительно закрыта: новая транзакция по держателю отклоняется. */
   private static void assertReallyClosed(Database database) {
     assertThatThrownBy(() -> database.inTransaction(connection -> null))
         .isInstanceOf(PersistenceException.class)
@@ -157,14 +164,13 @@ class DatabaseServiceTest {
 
   @Test
   void lifecycleRunsWithoutUserInterface() {
-    var opened = get(service.create(file()));
-    assertThat(opened).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(service.state()).isEqualTo(new DbState.Open(file()));
 
     assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
 
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
     assertThat(file()).isRegularFile();
   }
@@ -172,9 +178,9 @@ class DatabaseServiceTest {
   @Test
   void operationsRunOnSingleBackgroundThread() {
     Thread caller = Thread.currentThread();
-    get(service.create(file()));
+    openSync(file());
     get(service.close());
-    get(service.open(file(), false));
+    openSync(file());
     get(service.close());
 
     // Все операции выполнились на одном и том же фоновом потоке, не совпадающем с потоком теста.
@@ -190,21 +196,18 @@ class DatabaseServiceTest {
     var states = record();
     assertThat(states).containsExactly(DbState.CLOSED);
 
-    get(service.create(file()));
+    openSync(file());
     get(service.close());
 
     assertThat(Eventually.holds(() -> states.size() == 4)).isTrue();
     assertThat(states)
         .containsExactly(
-            DbState.CLOSED,
-            new DbState.Opening(DbState.Kind.CREATE, file()),
-            new DbState.Open(file()),
-            DbState.CLOSED);
+            DbState.CLOSED, new DbState.Opening(file()), new DbState.Open(file()), DbState.CLOSED);
   }
 
   @Test
   void lateSubscriberGetsCurrentStateFirst() {
-    get(service.create(file()));
+    openSync(file());
 
     var states = record();
 
@@ -214,13 +217,14 @@ class DatabaseServiceTest {
   @Test
   void operationsRunOneAtATimeInOrderOfRequests() throws InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var close = service.close();
 
     assertThat(close).isNotDone();
-    assertThat(service.state()).isEqualTo(new DbState.Opening(DbState.Kind.OPEN, file()));
+    assertThat(service.state()).isEqualTo(new DbState.Opening(file()));
 
     storage.openGate.release();
     assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
@@ -252,21 +256,26 @@ class DatabaseServiceTest {
               assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
               assertThat(rejected.message()).contains("недопустима в текущем состоянии");
             });
+    assertThat(get(service.backup(dir.resolve("копия.db"))))
+        .isInstanceOfSatisfying(
+            BackupResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
+              assertThat(rejected.message()).contains("недопустима в текущем состоянии");
+            });
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
+    assertThat(file()).doesNotExist();
 
-    get(service.create(file()));
+    openSync(file());
     byte[] before = Files.readAllBytes(file());
-    assertThat(get(service.open(file(), false)))
+    storage.databaseFile = file();
+    assertThat(get(service.open()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected -> {
               assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE);
               assertThat(rejected.message()).contains("недопустима в текущем состоянии");
             });
-    assertThat(get(service.create(dir.resolve("other.db"))))
-        .isInstanceOfSatisfying(
-            OpenResult.Rejected.class,
-            rejected -> assertThat(rejected.cause()).isEqualTo(RejectionCause.STATE));
     assertThat(get(service.migrate()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
@@ -274,42 +283,31 @@ class DatabaseServiceTest {
 
     assertThat(service.state()).isEqualTo(new DbState.Open(file()));
     assertThat(Files.readAllBytes(file())).isEqualTo(before);
-    assertThat(dir.resolve("other.db")).doesNotExist();
   }
 
   @Test
-  void createOverExistingFileIsRejectedAndFileKept() throws IOException {
-    Files.createDirectories(dataDir());
-    Files.writeString(file(), "чужой файл");
-    byte[] before = Files.readAllBytes(file());
-
-    var result = get(service.create(file()));
-
-    // Причина «файл существует» типизирована, текст и неизменность файла сохраняются
-    assertThat(result)
-        .isInstanceOfSatisfying(
-            OpenResult.Rejected.class,
-            rejected -> {
-              assertThat(rejected.cause()).isEqualTo(RejectionCause.FILE_EXISTS);
-              assertThat(rejected.message()).contains("уже существует");
-            });
-    assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(Files.readAllBytes(file())).isEqualTo(before);
-  }
-
-  @Test
-  void missingFileIsFailureUnlessCreationIsAllowed() {
-    var failure = get(service.open(file(), false));
-
-    assertThat(failure).isInstanceOf(OpenResult.Failed.class);
-    assertThat(((OpenResult.Failed) failure).reason()).isEqualTo("файл не найден");
-    assertThat(((OpenResult.Failed) failure).message()).contains("Создать базу");
-    assertThat(service.state())
-        .isEqualTo(new DbState.Closed("файл не найден", ((OpenResult.Failed) failure).message()));
+  void missingFileIsCreatedWithCurrentSchema() throws SQLException {
     assertThat(file()).doesNotExist();
 
-    assertThat(get(service.open(file(), true))).isEqualTo(new OpenResult.Opened(file()));
+    var result = openSync(file());
+
+    // Отсутствующий файл создаётся с актуальной схемой: результат «открыта», а не вопрос
+    assertThat(result).isEqualTo(new OpenResult.Opened(file()));
     assertThat(file()).isRegularFile();
+    assertThat(Database.inspect(file())).isEqualTo(Database.State.UP_TO_DATE);
+    assertThat(service.state()).isEqualTo(new DbState.Open(file()));
+  }
+
+  @Test
+  void creationFailureClosesWithCreateReason() throws IOException {
+    Files.writeString(dir.resolve("blocker"), "файл на месте каталога");
+    storage.databaseFile = dir.resolve("blocker/bonds.db");
+
+    var result = get(service.open());
+
+    assertThat(result).isInstanceOf(OpenResult.Failed.class);
+    assertThat(((OpenResult.Failed) result).reason()).isEqualTo("ошибка создания");
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
   }
 
   @Test
@@ -317,25 +315,26 @@ class DatabaseServiceTest {
     TestDatabases.outdatedAt(file());
     byte[] before = Files.readAllBytes(file());
 
-    var result = get(service.open(file(), false));
+    var result = openSync(file());
 
     assertThat(result).isEqualTo(new OpenResult.NeedsMigration(file()));
     assertThat(service.state()).isEqualTo(new DbState.AwaitingMigration(file()));
     assertThat(Files.readAllBytes(file())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
   }
 
   @Test
   void migrateCommandMigratesWithBackupAndOpens() throws SQLException, IOException {
     TestDatabases.outdatedAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     var states = record();
 
     var result = get(service.migrate());
 
     assertThat(result).isEqualTo(new OpenResult.Opened(file()));
     assertThat(service.state()).isEqualTo(new DbState.Open(file()));
-    assertThat(backupsIn(dataDir())).hasSize(1);
+    // Служебная копия перед миграцией создана с фиксированным именем
+    assertThat(preMigrationCopiesIn(dataDir())).hasSize(1);
     assertThat(Eventually.holds(() -> states.size() == 3)).isTrue();
     assertThat(states)
         .containsExactly(
@@ -350,33 +349,33 @@ class DatabaseServiceTest {
   void declineCommandClosesWithOutdatedReasonAndKeepsFile() throws SQLException, IOException {
     TestDatabases.outdatedAt(file());
     byte[] before = Files.readAllBytes(file());
-    get(service.open(file(), false));
+    openSync(file());
 
     var result = get(service.declineMigration());
 
     assertThat(result).isEqualTo(new CloseResult.Closed(null));
     assertThat(service.state()).isEqualTo(new DbState.Closed("схема устарела", null));
     assertThat(Files.readAllBytes(file())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
   }
 
   @Test
-  void failedMigrationRestoresFileAndClosesWithReason() throws SQLException, IOException {
+  void failedMigrationKeepsFileAndLeavesSinglePreMigrationCopy() throws SQLException, IOException {
     TestDatabases.forgottenHistoryAt(file());
-    // Файл с «забытой» историей считается устаревшим: миграция падает и восстанавливает файл
-    get(service.open(file(), false));
+    // Файл с «забытой» историей считается устаревшим: миграция падает, файл не изменён
+    openSync(file());
 
     var result = get(service.migrate());
 
     assertThat(result).isInstanceOf(OpenResult.Failed.class);
     var failure = (OpenResult.Failed) result;
     assertThat(failure.reason()).isEqualTo("ошибка миграции");
-    assertThat(failure.message()).contains("восстановлена").contains(".bak-");
+    assertThat(failure.message()).contains("Файл БД не изменён").doesNotContain("восстановлена");
     assertThat(service.state()).isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
-    // Файл восстановлен копией: VACUUM INTO пишет компактный файл, поэтому сравниваем с копией
-    List<String> backups = backupsIn(dataDir());
-    assertThat(backups).hasSize(1);
-    assertThat(Files.readAllBytes(file())).isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
+    // Файл остался до-миграционным: транзакция миграции откатилась
+    assertThat(Database.inspect(file())).isEqualTo(Database.State.NEEDS_MIGRATION);
+    // Служебная копия создана до применения набора: ровно одна, с фиксированным именем
+    assertThat(preMigrationCopiesIn(dataDir())).hasSize(1);
   }
 
   @Test
@@ -384,7 +383,7 @@ class DatabaseServiceTest {
     // Сценарий «БД занята» на настоящей БД: постороннее соединение держит незавершённую транзакцию
     // записи, миграция ждёт busy_timeout драйвера и получает SQLITE_BUSY
     TestDatabases.outdatedAt(file());
-    get(service.open(file(), false));
+    openSync(file());
 
     try (Connection blocker = DriverManager.getConnection("jdbc:sqlite:" + file())) {
       blocker.setAutoCommit(false);
@@ -408,7 +407,7 @@ class DatabaseServiceTest {
   void foreignNewerAndCorruptFilesAreRejectedWithoutChanges() throws SQLException, IOException {
     TestDatabases.foreignAt(file());
     byte[] foreign = Files.readAllBytes(file());
-    var result = (OpenResult.Failed) get(service.open(file(), false));
+    var result = (OpenResult.Failed) openSync(file());
     assertThat(result.reason()).isEqualTo("не база bonds2");
     assertThat(result.message()).contains("не является базой данных bonds2");
     assertThat(Files.readAllBytes(file())).isEqualTo(foreign);
@@ -416,7 +415,7 @@ class DatabaseServiceTest {
     Path newer = dir.resolve("newer.db");
     TestDatabases.tooNewAt(newer);
     byte[] newerBytes = Files.readAllBytes(newer);
-    result = (OpenResult.Failed) get(service.open(newer, false));
+    result = (OpenResult.Failed) openSync(newer);
     assertThat(result.reason()).isEqualTo("схема новее приложения");
     assertThat(result.message()).contains("новее");
     assertThat(Files.readAllBytes(newer)).isEqualTo(newerBytes);
@@ -427,7 +426,7 @@ class DatabaseServiceTest {
         "это обычный текст, а не база данных SQLite, поэтому открыть его нельзя",
         StandardCharsets.UTF_8);
     byte[] corruptBytes = Files.readAllBytes(corrupt);
-    result = (OpenResult.Failed) get(service.open(corrupt, false));
+    result = (OpenResult.Failed) openSync(corrupt);
     assertThat(result.reason()).isEqualTo("ошибка открытия");
     assertThat(Files.readAllBytes(corrupt)).isEqualTo(corruptBytes);
     assertThat(service.state()).isInstanceOf(DbState.Closed.class);
@@ -438,21 +437,10 @@ class DatabaseServiceTest {
     Files.createDirectories(dataDir());
     Files.createFile(file());
 
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
     get(service.close());
 
     assertThat(Database.inspect(file())).isEqualTo(Database.State.UP_TO_DATE);
-  }
-
-  @Test
-  void creationFailureClosesWithCreateReason() throws IOException {
-    Files.writeString(dir.resolve("blocker"), "файл на месте каталога");
-
-    var result = get(service.create(dir.resolve("blocker/bonds.db")));
-
-    assertThat(result).isInstanceOf(OpenResult.Failed.class);
-    assertThat(((OpenResult.Failed) result).reason()).isEqualTo("ошибка создания");
-    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
   }
 
   @Test
@@ -460,7 +448,7 @@ class DatabaseServiceTest {
     newDatabaseAt(file());
     storage.openFailure = new IllegalStateException("сбой");
 
-    var result = get(service.open(file(), false));
+    var result = openSync(file());
 
     assertThat(result).isInstanceOf(OpenResult.Failed.class);
     var failure = (OpenResult.Failed) result;
@@ -469,7 +457,7 @@ class DatabaseServiceTest {
     assertThat(service.state()).isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
 
     storage.openFailure = null;
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
   }
 
   @Test
@@ -478,8 +466,9 @@ class DatabaseServiceTest {
     var states = record();
     // Например, не загрузилась встроенная библиотека SQLite: это ошибка среды, а не исключение
     storage.openFailure = new UnsatisfiedLinkError("библиотека SQLite не загружена");
+    storage.databaseFile = file();
 
-    var result = get(service.open(file(), false));
+    var result = get(service.open());
 
     assertThat(result).isInstanceOf(OpenResult.Failed.class);
     var failure = (OpenResult.Failed) result;
@@ -489,11 +478,11 @@ class DatabaseServiceTest {
     assertThat(states)
         .containsExactly(
             DbState.CLOSED,
-            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Opening(file()),
             new DbState.Closed(failure.reason(), failure.message()));
 
     storage.openFailure = null;
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.open())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(service.state()).isEqualTo(new DbState.Open(file()));
   }
 
@@ -501,8 +490,9 @@ class DatabaseServiceTest {
   void virtualMachineErrorIsNotSwallowedByOpen() {
     newDatabaseAt(file());
     storage.openFailure = new OutOfMemoryError("тест: нехватка памяти");
+    storage.databaseFile = file();
 
-    var future = service.open(file(), false);
+    var future = service.open();
 
     assertThatThrownBy(() -> future.get(30, TimeUnit.SECONDS))
         .isInstanceOf(ExecutionException.class)
@@ -515,7 +505,7 @@ class DatabaseServiceTest {
   @Test
   void unexpectedErrorDuringCloseClosesServiceAndReturnsFailure() {
     newDatabaseAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     var states = record();
     storage.closeFailure = new UnsatisfiedLinkError("сбой закрытия");
 
@@ -532,14 +522,14 @@ class DatabaseServiceTest {
 
     // Сервис остаётся работоспособным: после сбоя БД снова открывается и закрывается
     storage.closeFailure = null;
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
   }
 
   @Test
   void virtualMachineErrorIsNotSwallowedByClose() {
     newDatabaseAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     storage.closeFailure = new OutOfMemoryError("тест: нехватка памяти");
 
     var future = service.close();
@@ -552,9 +542,10 @@ class DatabaseServiceTest {
   @Test
   void internalCloseErrorRetriesQuietlyAndDatabaseIsReallyClosed() {
     var failingStorage = new FailingCloseStorage();
+    failingStorage.databaseFile = file();
     failingStorage.failFirstClose = true;
     var failingService = new DatabaseService(failingStorage);
-    assertThat(get(failingService.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failingService.open())).isEqualTo(new OpenResult.Opened(file()));
     var states = record(failingService);
     Database opened = failingStorage.opened.get(0);
 
@@ -579,16 +570,17 @@ class DatabaseServiceTest {
   @Test
   void reopenAfterInternalCloseErrorSucceeds() {
     var failingStorage = new FailingCloseStorage();
+    failingStorage.databaseFile = file();
     failingStorage.failFirstClose = true;
     var failingService = new DatabaseService(failingStorage);
-    assertThat(get(failingService.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failingService.open())).isEqualTo(new OpenResult.Opened(file()));
     Database opened = failingStorage.opened.get(0);
     assertThat(get(failingService.close())).isInstanceOf(CloseResult.Failed.class);
     assertReallyClosed(opened);
 
     // Повторное открытие того же файла после сбойного закрытия выполняется успешно
     failingStorage.failFirstClose = false;
-    assertThat(get(failingService.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failingService.open())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(failingService.state()).isEqualTo(new DbState.Open(file()));
     assertThat(get(failingService.close())).isEqualTo(new CloseResult.Closed(null));
     assertThat(failingService.state()).isEqualTo(DbState.CLOSED);
@@ -625,8 +617,9 @@ class DatabaseServiceTest {
               @Override
               public void onComplete() {}
             });
+    storage.databaseFile = file();
 
-    var open = service.open(file(), false);
+    var open = service.open();
 
     assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
         .isInstanceOf(ExecutionException.class)
@@ -640,11 +633,11 @@ class DatabaseServiceTest {
     assertThat(states)
         .containsExactly(
             DbState.CLOSED,
-            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Opening(file()),
             new DbState.Closed(closed.reason(), closed.message()));
 
     // Сервис продолжает принимать операции
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.open())).isEqualTo(new OpenResult.Opened(file()));
   }
 
   @Test
@@ -654,8 +647,9 @@ class DatabaseServiceTest {
     service
         .states()
         .subscribe(failingOnOpenState(new AssertionError("сбой подписчика на «открыта»")));
+    storage.databaseFile = file();
 
-    var open = service.open(file(), false);
+    var open = service.open();
 
     // Ошибка доходит до вызывающего исключительно: будущее не завершается успехом
     assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
@@ -670,13 +664,13 @@ class DatabaseServiceTest {
     assertThat(states)
         .containsExactly(
             DbState.CLOSED,
-            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Opening(file()),
             new DbState.Open(file()),
             new DbState.Closed(closed.reason(), closed.message()));
     assertReallyClosed(storage.opened.get(0));
 
     // Последующие открытие и закрытие того же файла работают
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(service.open())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
   }
 
@@ -686,8 +680,9 @@ class DatabaseServiceTest {
     service
         .states()
         .subscribe(failingOnOpenState(new StackOverflowError("тест: переполнение стека")));
+    storage.databaseFile = file();
 
-    var open = service.open(file(), false);
+    var open = service.open();
 
     // Фатальная ошибка виртуальной машины не поглощается и доходит до вызывающего
     assertThatThrownBy(() -> open.get(30, TimeUnit.SECONDS))
@@ -698,7 +693,7 @@ class DatabaseServiceTest {
   @Test
   void closeFailureIsReportedAsWarningAndDatabaseIsClosed() throws SQLException {
     newDatabaseAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     var results = new CopyOnWriteArrayList<CloseResult>();
 
     // Реальное ожидание busy-timeout SQLite при закрытии — щедрый явный бюджет
@@ -715,7 +710,7 @@ class DatabaseServiceTest {
   @Test
   void closeAfterFileDeletionPublishesClosedWithWarningAndCreatesNoFile() throws IOException {
     newDatabaseAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     var states = record();
     Files.delete(file());
 
@@ -729,14 +724,141 @@ class DatabaseServiceTest {
   }
 
   @Test
+  void backupCreatesRealCopyAndPublishesStates() throws IOException {
+    openSync(file());
+    var states = record();
+    Files.createDirectories(dir.resolve("резерв"));
+    Path target = dir.resolve("резерв/копия.db");
+
+    var result = get(service.backup(target));
+
+    // Копия реальная: она открывается как база bonds2 с актуальной схемой
+    assertThat(result).isEqualTo(new BackupResult.Copied(target));
+    assertThat(target).isRegularFile();
+    assertThat(Database.inspect(target)).isEqualTo(Database.State.UP_TO_DATE);
+    // Состояния копирования: «открыта» → «копируется» → снова «открыта»
+    assertThat(Eventually.holds(() -> states.size() == 3)).isTrue();
+    assertThat(states)
+        .containsExactly(
+            new DbState.Open(file()), new DbState.BackingUp(target), new DbState.Open(file()));
+  }
+
+  @Test
+  void backupWaitsForGateAndCompletesAfterRelease() throws InterruptedException {
+    openSync(file());
+    Path target = dir.resolve("копия.db");
+    storage.backupGate.hold();
+    var copying = service.backup(target);
+    assertThat(storage.backupGate.awaitEntered()).isTrue();
+
+    // Пока ворота закрыты, копирование не завершено
+    assertThat(copying).isNotDone();
+
+    storage.backupGate.release();
+    assertThat(get(copying)).isEqualTo(new BackupResult.Copied(target));
+    assertThat(service.state()).isEqualTo(new DbState.Open(file()));
+  }
+
+  @Test
+  void backupWithoutOpenDatabaseIsRejectedWithStateCause() {
+    var result = get(service.backup(dir.resolve("копия.db")));
+
+    // Без открытой БД копирование отклоняется с причиной STATE, состояние не меняется
+    assertThat(result)
+        .isEqualTo(
+            new BackupResult.Rejected(
+                RejectionCause.STATE, OpenFailures.notAllowed("сделать резервную копию")));
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
+  void backupAfterShutdownIsRejectedWithStoppedCause() {
+    openSync(file());
+    assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
+
+    var result = get(service.backup(dir.resolve("копия.db")));
+
+    assertThat(result)
+        .isInstanceOfSatisfying(
+            BackupResult.Rejected.class,
+            rejected -> {
+              assertThat(rejected.cause()).isEqualTo(RejectionCause.STOPPED);
+              assertThat(rejected.message()).isEqualTo("Сервис БД остановлен.");
+            });
+  }
+
+  @Test
+  void backupFailureKeepsDatabaseOpenAndWorking() {
+    openSync(file());
+    Database opened = storage.opened.get(0);
+    storage.backupFailure = new IllegalStateException("сбой копии");
+
+    var result = get(service.backup(dir.resolve("копия.db")));
+
+    // Сбой копирования не закрывает БД: состояние остаётся «открыта»
+    assertThat(result)
+        .isInstanceOfSatisfying(
+            BackupResult.Failed.class,
+            failed ->
+                assertThat(failed.message())
+                    .startsWith("Не удалось создать резервную копию ")
+                    .contains("сбой копии"));
+    assertThat(service.state()).isEqualTo(new DbState.Open(file()));
+
+    // БД работает: новая транзакция проходит
+    opened.inTransaction(connection -> null);
+    assertThat(isClosed(opened)).isFalse();
+
+    storage.backupFailure = null;
+    assertThat(get(service.backup(dir.resolve("копия.db"))))
+        .isEqualTo(new BackupResult.Copied(dir.resolve("копия.db")));
+  }
+
+  @Test
+  void backupToUnwritableTargetIsFailedWithCopyMessage() {
+    openSync(file());
+
+    // Цель в несуществующем каталоге: драйвер не может открыть файл копии
+    var result = get(service.backup(dir.resolve("нет-такого-каталога/копия.db")));
+
+    assertThat(result)
+        .isInstanceOfSatisfying(
+            BackupResult.Failed.class,
+            failed ->
+                assertThat(failed.message()).startsWith("Не удалось создать резервную копию "));
+    assertThat(service.state()).isEqualTo(new DbState.Open(file()));
+  }
+
+  @Test
+  void shutdownDuringBackupWaitsForCopyingToFinish() throws InterruptedException {
+    openSync(file());
+    Path target = dir.resolve("копия.db");
+    storage.backupGate.hold();
+    var copying = service.backup(target);
+    assertThat(storage.backupGate.awaitEntered()).isTrue();
+
+    // Остановка ставится в очередь и дожидается окончания копирования
+    var stopping = service.shutdownAsync(Duration.ofSeconds(30));
+    assertThat(stopping).isNotDone();
+
+    storage.backupGate.release();
+    assertThat(get(stopping)).isEqualTo(ShutdownResult.STOPPED);
+    assertThat(get(copying)).isEqualTo(new BackupResult.Copied(target));
+    assertThat(isClosed(storage.opened.get(0))).isTrue();
+    assertThat(target).isRegularFile();
+    assertThat(service.state()).isEqualTo(DbState.CLOSED);
+  }
+
+  @Test
   void shutdownCompletesEvenIfClosingDatabaseFailsWithError() {
-    get(service.create(file()));
+    openSync(file());
     storage.closeFailure = new UnsatisfiedLinkError("сбой закрытия при остановке");
 
     assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
 
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(get(service.open(file(), false)))
+    storage.databaseFile = file();
+    assertThat(get(service.open()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected ->
@@ -746,14 +868,15 @@ class DatabaseServiceTest {
 
   @Test
   void shutdownClosesOpenDatabaseAndRejectsNewOperations() {
-    get(service.create(file()));
+    openSync(file());
     var database = storage.opened.get(0);
 
     assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
 
     assertThat(isClosed(database)).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(get(service.open(file(), false)))
+    storage.databaseFile = file();
+    assertThat(get(service.open()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected ->
@@ -831,8 +954,9 @@ class DatabaseServiceTest {
   @Test
   void shutdownDuringOpeningWithinTimeoutClosesResultingDatabase() throws InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var releaser = new Thread(() -> release(storage.openGate));
     releaser.start();
@@ -850,8 +974,9 @@ class DatabaseServiceTest {
   @Test
   void shutdownAsyncDoesNotBlockCallerAndCompletesAfterOperation() throws InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     var stopping = service.shutdownAsync(Duration.ofSeconds(30));
@@ -868,12 +993,13 @@ class DatabaseServiceTest {
     // Операция, поставленная после начала остановки, отклоняется сразу с типизированной причиной
     // STOPPED и каноническим текстом
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    service.open(file(), false);
+    service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     service.shutdownAsync(Duration.ofSeconds(30));
 
-    assertThat(get(service.create(file())))
+    assertThat(get(service.open()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected -> {
@@ -887,8 +1013,9 @@ class DatabaseServiceTest {
   @Test
   void shutdownAsyncTimesOutAndLateDatabaseIsClosed() throws InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    service.open(file(), false);
+    service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     var stopping = service.shutdownAsync(Duration.ofMillis(50));
@@ -913,7 +1040,7 @@ class DatabaseServiceTest {
   @Test
   void shutdownAsyncIsRefusedWhileAwaitingMigrationDecision() throws SQLException {
     TestDatabases.outdatedAt(file());
-    get(service.open(file(), false));
+    openSync(file());
 
     assertThat(get(service.shutdownAsync(Duration.ofSeconds(1))))
         .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
@@ -935,7 +1062,7 @@ class DatabaseServiceTest {
 
     // Состояние не изменилось, остановка не началась: сервис работает как до отвергнутых вызовов
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
-    assertThat(get(service.open(file(), true))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.Opened(file()));
     assertThat(get(service.close())).isEqualTo(new CloseResult.Closed(null));
     assertThat(file()).isRegularFile();
   }
@@ -950,7 +1077,7 @@ class DatabaseServiceTest {
         .isInstanceOf(IllegalArgumentException.class);
 
     // Остановка не началась: БД открывается, а остановка завершается как обычно
-    get(service.create(file()));
+    openSync(file());
     assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
@@ -968,8 +1095,9 @@ class DatabaseServiceTest {
   @Test
   void lateOperationAfterTimeoutClosesItsDatabaseWithoutPublishing() throws InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -993,8 +1121,7 @@ class DatabaseServiceTest {
         .isTrue();
     // Результат операции не публикуется, но остановка завершается согласованно: «закрыта»
     assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
-    assertThat(states)
-        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Opening(file()), DbState.CLOSED);
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
   }
 
@@ -1005,8 +1132,9 @@ class DatabaseServiceTest {
     // операция удержана воротами, остановка с минимальным сроком истекает, затем операция
     // отпускается
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -1031,15 +1159,15 @@ class DatabaseServiceTest {
     assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
-    assertThat(states)
-        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Opening(file()), DbState.CLOSED);
   }
 
   @Test
-  void shutdownDoesNotDuplicateClosedStateWhenItIsAlreadyClosed() {
+  void shutdownDoesNotDuplicateClosedStateWhenItIsAlreadyClosed() throws SQLException, IOException {
     var states = record();
-    // Открытие отсутствующего файла публикует «закрыта» с причиной: последнее состояние закрыто
-    var failure = (OpenResult.Failed) get(service.open(file(), false));
+    // Открытие чужого файла публикует «закрыта» с причиной: последнее состояние закрыто
+    TestDatabases.foreignAt(file());
+    var failure = (OpenResult.Failed) openSync(file());
     assertThat(service.state()).isEqualTo(new DbState.Closed(failure.reason(), failure.message()));
 
     assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
@@ -1048,7 +1176,7 @@ class DatabaseServiceTest {
     assertThat(states)
         .containsExactly(
             DbState.CLOSED,
-            new DbState.Opening(DbState.Kind.OPEN, file()),
+            new DbState.Opening(file()),
             new DbState.Closed(failure.reason(), failure.message()));
   }
 
@@ -1056,7 +1184,7 @@ class DatabaseServiceTest {
   void shutdownIsRefusedDuringMigrationAndAllowedAfterIt()
       throws SQLException, InterruptedException {
     TestDatabases.outdatedAt(file());
-    get(service.open(file(), false));
+    openSync(file());
     storage.migrateGate.hold();
     var migrate = service.migrate();
     assertThat(storage.migrateGate.awaitEntered()).isTrue();
@@ -1074,7 +1202,7 @@ class DatabaseServiceTest {
   @Test
   void shutdownIsRefusedWhileAwaitingMigrationDecision() throws SQLException {
     TestDatabases.outdatedAt(file());
-    get(service.open(file(), false));
+    openSync(file());
 
     assertThat(service.shutdown(Duration.ofSeconds(1)))
         .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
@@ -1088,8 +1216,9 @@ class DatabaseServiceTest {
   void shutdownTurnedIntoRefusalWhileQueuedKeepsServiceWorking()
       throws SQLException, InterruptedException {
     TestDatabases.outdatedAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var releaser = new Thread(() -> release(storage.openGate));
     releaser.start();
@@ -1104,14 +1233,14 @@ class DatabaseServiceTest {
   }
 
   @Test
-  void serviceIsFullyFunctionalAfterShutdownRefusal() throws Exception {
+  void serviceIsFullyFunctionalAfterShutdownRefusal() throws SQLException, IOException {
     // Сценарий дельты «Возврат к работе после отказа за истечением срока»: отказ остановки
     // возвращает сервис к работе целиком — «покинутость» попытки не переживает отказ.
     // Гонку «истечение срока против отказа» прямо воспроизвести нельзя, поэтому проверяется
     // её следствие по спецификации: после отказа публикуются и результаты, и ошибки,
     // повторная остановка выполняется штатно
     TestDatabases.outdatedAt(file());
-    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.NeedsMigration(file()));
+    assertThat(openSync(file())).isEqualTo(new OpenResult.NeedsMigration(file()));
     assertThat(get(service.shutdownAsync(Duration.ofSeconds(1))))
         .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
 
@@ -1120,8 +1249,9 @@ class DatabaseServiceTest {
     assertThat(service.state()).isInstanceOf(DbState.Closed.class);
 
     // Ошибка последующей операции видима вызывающему, а не молча проглочена
-    assertThat(get(service.open(Path.of("несуществующий-каталог/базы/нет.db"), false)))
-        .isInstanceOf(OpenResult.Failed.class);
+    Files.writeString(dir.resolve("blocker"), "файл на месте каталога");
+    storage.databaseFile = dir.resolve("blocker/нет.db");
+    assertThat(get(service.open())).isInstanceOf(OpenResult.Failed.class);
     assertThat(service.state()).isInstanceOf(DbState.Closed.class);
 
     // Повторная остановка выполняется штатно
@@ -1134,6 +1264,7 @@ class DatabaseServiceTest {
     // возвращает успех после завершения остановки STOPPED
     for (int attempt = 0; attempt < 50; attempt++) {
       GatedStorage racingStorage = new GatedStorage();
+      racingStorage.databaseFile = file();
       DatabaseService racing = new DatabaseService(racingStorage);
       try {
         var open = new AtomicReference<CompletableFuture<OpenResult>>();
@@ -1141,7 +1272,7 @@ class DatabaseServiceTest {
         var opener =
             new Thread(
                 () -> {
-                  var future = racing.open(file(), false);
+                  var future = racing.open();
                   open.set(future);
                 });
         opener.start();
@@ -1175,8 +1306,9 @@ class DatabaseServiceTest {
   void lateNeedsMigrationAfterStopTimeoutIsNotPublishedAndOpensNothing()
       throws SQLException, InterruptedException {
     TestDatabases.outdatedAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -1198,16 +1330,16 @@ class DatabaseServiceTest {
     assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
-    assertThat(states)
-        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Opening(file()), DbState.CLOSED);
   }
 
   @Test
   void lateFailureAfterStopTimeoutIsNotPublishedAndOpensNothing()
       throws SQLException, InterruptedException {
     TestDatabases.tooNewAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -1229,16 +1361,16 @@ class DatabaseServiceTest {
     assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
-    assertThat(states)
-        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Opening(file()), DbState.CLOSED);
   }
 
   @Test
   void lateUnexpectedErrorAfterStopTimeoutIsNotPublished() throws Exception {
     newDatabaseAt(file());
     storage.openFailure = new IllegalStateException("сбой");
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -1258,16 +1390,16 @@ class DatabaseServiceTest {
     assertThat(Eventually.holds(() -> service.state().equals(DbState.CLOSED))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
     assertThat(Eventually.holds(() -> states.size() == 2)).isTrue();
-    assertThat(states)
-        .containsExactly(new DbState.Opening(DbState.Kind.OPEN, file()), DbState.CLOSED);
+    assertThat(states).containsExactly(new DbState.Opening(file()), DbState.CLOSED);
   }
 
   @Test
   void repeatedShutdownWithShorterTimeoutDoesNotAbandonOperation()
       throws SQLException, InterruptedException {
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var states = record();
 
@@ -1281,10 +1413,7 @@ class DatabaseServiceTest {
     assertThat(get(open)).isEqualTo(new OpenResult.Opened(file()));
     assertThat(get(first)).isEqualTo(ShutdownResult.STOPPED);
     assertThat(states)
-        .containsExactly(
-            new DbState.Opening(DbState.Kind.OPEN, file()),
-            new DbState.Open(file()),
-            DbState.CLOSED);
+        .containsExactly(new DbState.Opening(file()), new DbState.Open(file()), DbState.CLOSED);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 
@@ -1293,8 +1422,9 @@ class DatabaseServiceTest {
     // Сценарий «Прерывание ожидания до завершения остановки»: остановка ещё не завершилась,
     // поэтому прерванное ожидание даёт честное «не дождались», а не выдуманный итог
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     var outcome = new AtomicReference<ShutdownResult>();
@@ -1331,8 +1461,9 @@ class DatabaseServiceTest {
     // наступивший факт — ожидание возвращает результат завершившейся остановки «остановлена»,
     // а не подменяет его наблюдением «не дождались»
     newDatabaseAt(file());
+    storage.databaseFile = file();
     storage.openGate.hold();
-    var open = service.open(file(), false);
+    var open = service.open();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     var stopping = service.shutdownAsync(Duration.ofSeconds(30));
     storage.openGate.release();
@@ -1363,8 +1494,9 @@ class DatabaseServiceTest {
     // остановки: асинхронная остановка завершается ошибкой, а не «остановлена», синхронная
     // пробрасывает тот же сбой вызывающему
     var failingStorage = new FailingCloseStorage();
+    failingStorage.databaseFile = file();
     var failing = new DatabaseService(failingStorage);
-    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failing.open())).isEqualTo(new OpenResult.Opened(file()));
     var failure = new AssertionError("сбой подписчика при остановке");
     failing.states().subscribe(failingOnClosedState(failure));
 
@@ -1387,8 +1519,9 @@ class DatabaseServiceTest {
     // Сценарий «Повторная остановка после сбоя»: повторный вызов возвращает ту же ошибку без
     // повторных попыток закрытия БД: поток жизненного цикла погиб, сервис неработоспособен
     var countingStorage = new CountingCloseStorage();
+    countingStorage.databaseFile = file();
     var failing = new DatabaseService(countingStorage);
-    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failing.open())).isEqualTo(new OpenResult.Opened(file()));
     var failure = new AssertionError("сбой подписчика при остановке");
     failing.states().subscribe(failingOnClosedState(failure));
 
@@ -1412,8 +1545,9 @@ class DatabaseServiceTest {
   void operationsAfterShutdownFailureAreRejectedAsStopped() {
     // После сбоя остановки сервис неработоспособен: новые операции отклоняются с причиной STOPPED
     var failingStorage = new FailingCloseStorage();
+    failingStorage.databaseFile = file();
     var failing = new DatabaseService(failingStorage);
-    assertThat(get(failing.create(file()))).isEqualTo(new OpenResult.Opened(file()));
+    assertThat(get(failing.open())).isEqualTo(new OpenResult.Opened(file()));
     var failure = new AssertionError("сбой подписчика при остановке");
     failing.states().subscribe(failingOnClosedState(failure));
 
@@ -1422,7 +1556,7 @@ class DatabaseServiceTest {
         .isInstanceOf(ExecutionException.class)
         .hasCause(failure);
 
-    assertThat(get(failing.open(file(), false)))
+    assertThat(get(failing.open()))
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected ->
@@ -1442,6 +1576,9 @@ class DatabaseServiceTest {
    */
   private static final class FailingCloseStorage implements DatabaseService.Storage {
 
+    /** Файл единственной БД приложения; тест задаёт его до открытия. */
+    volatile Path databaseFile = Path.of("bonds.db");
+
     /** Открытые через это хранилище БД. */
     final List<Database> opened = new CopyOnWriteArrayList<>();
 
@@ -1450,6 +1587,11 @@ class DatabaseServiceTest {
 
     /** Если задано, первый вызов {@code close} бросает сбой без закрытия БД. */
     volatile boolean failFirstClose;
+
+    @Override
+    public Path databaseFile() {
+      return databaseFile;
+    }
 
     @Override
     public Database.State inspect(Path file) {
@@ -1474,6 +1616,11 @@ class DatabaseServiceTest {
     @Override
     public void migrateWithBackup(Path file) {
       Database.migrateWithBackup(file);
+    }
+
+    @Override
+    public void backup(Database database, Path target) {
+      database.backupTo(target);
     }
 
     @Override
@@ -1496,11 +1643,19 @@ class DatabaseServiceTest {
    */
   private static final class CountingCloseStorage implements DatabaseService.Storage {
 
+    /** Файл единственной БД приложения; тест задаёт его до открытия. */
+    volatile Path databaseFile = Path.of("bonds.db");
+
     /** Открытые через это хранилище БД. */
     final List<Database> opened = new CopyOnWriteArrayList<>();
 
     /** Общее число вызовов {@code close}: учитывается каждый вызов. */
     final AtomicInteger closeCalls = new AtomicInteger();
+
+    @Override
+    public Path databaseFile() {
+      return databaseFile;
+    }
 
     @Override
     public Database.State inspect(Path file) {
@@ -1525,6 +1680,11 @@ class DatabaseServiceTest {
     @Override
     public void migrateWithBackup(Path file) {
       Database.migrateWithBackup(file);
+    }
+
+    @Override
+    public void backup(Database database, Path target) {
+      database.backupTo(target);
     }
 
     @Override

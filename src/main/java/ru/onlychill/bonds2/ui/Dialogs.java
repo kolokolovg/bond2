@@ -26,6 +26,9 @@ interface Dialogs {
    */
   void warn(String message);
 
+  /** Информационное сообщение без ожидания закрытия: операция выполнена успешно. */
+  void info(String message);
+
   /** Сообщение об ошибке без ожидания закрытия. */
   void error(String message);
 }

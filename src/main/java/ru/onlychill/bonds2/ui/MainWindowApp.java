@@ -29,21 +29,17 @@ import ru.onlychill.bonds2.dbservice.ErrorMessages;
 import ru.onlychill.bonds2.persistence.DataDirectory;
 import ru.onlychill.bonds2.persistence.InstanceLock;
 import ru.onlychill.bonds2.persistence.PersistenceException;
-import ru.onlychill.bonds2.settings.Settings;
-import ru.onlychill.bonds2.settings.SettingsStore;
 
 /**
- * Главное окно приложения: меню «Файл» (настройки, открытие, создание и закрытие БД, выход) и
- * строка состояния БД внизу. Настройки читаются синхронно из платформенного хранилища при запуске,
- * логика БД — в {@link DatabaseController}; здесь сборка интерфейса, действие остановки сервиса для
- * хука завершения JVM и цепочка штатного выхода: она выполняется на выделенном потоке завершения
- * {@link #EXIT_THREAD_NAME} и не блокирует поток интерфейса.
+ * Главное окно приложения: меню «Файл» (резервная копия, повторное открытие БД, выход) и строка
+ * состояния БД внизу. Логика БД — в {@link DatabaseController}; здесь сборка интерфейса, действие
+ * остановки сервиса для хука завершения JVM и цепочка штатного выхода: она выполняется на
+ * выделенном потоке завершения {@link #EXIT_THREAD_NAME} и не блокирует поток интерфейса.
  */
 public final class MainWindowApp extends Application {
 
   /** Действия пунктов меню «Файл». */
-  record MenuActions(
-      Runnable settings, Runnable open, Runnable create, Runnable close, Runnable exit) {}
+  record MenuActions(Runnable backup, Runnable retryOpen, Runnable exit) {}
 
   /** Имя потока, на котором выполняется цепочка завершения приложения. */
   static final String EXIT_THREAD_NAME = "bonds2-exit";
@@ -65,30 +61,23 @@ public final class MainWindowApp extends Application {
 
   @Override
   public void start(Stage stage) {
-    // Блокировка берётся до чтения настроек: второй экземпляр не должен трогать общие файлы
+    // Блокировка берётся до любых общих файлов: второй экземпляр не должен их трогать
     instanceLock = acquireInstanceLock(DataDirectory.lockFile(), MainWindowApp::showStartupError);
     if (instanceLock == null) {
       Platform.exit();
       return;
     }
-    var store = new SettingsStore();
-    showWindow(stage, store, store.load());
+    showWindow(stage);
   }
 
   /**
-   * Строит меню, показывает окно и запускает автооткрытие по прочитанным настройкам; вызывается в
-   * потоке JavaFX.
+   * Строит меню, показывает окно и безусловно открывает единственную БД приложения; вызывается в
+   * потоке JavaFX. Ошибка открытия показывается диалогом, окно остаётся работоспособным.
    */
-  private void showWindow(Stage stage, SettingsStore store, Settings loaded) {
+  private void showWindow(Stage stage) {
     var db =
         new DatabaseController(
-            store,
-            loaded,
-            DataDirectory.databaseFile(),
-            new DatabaseService(),
-            new FxDialogs(stage),
-            Platform::exit,
-            Platform::runLater);
+            new DatabaseService(), new FxDialogs(stage), Platform::exit, Platform::runLater);
     controller = db;
     // Пока сервис не остановлен штатно, хук завершения JVM может остановить его без JavaFX
     setExternalStop(db::stopForExternalShutdown);
@@ -168,10 +157,10 @@ public final class MainWindowApp extends Application {
   }
 
   /**
-   * Тело хука завершения JVM: останавливает сервис БД и дожидается записи настроек, если штатный
-   * выход их ещё не остановил. Не касается JavaFX — тулкит к моменту внешнего завершения (сигнал,
-   * остановка из среды разработки) может быть уже мёртв. Ошибки остановки журналируются и
-   * завершению не мешают; идемпотентно со штатным выходом, который снимает действие остановки.
+   * Тело хука завершения JVM: останавливает сервис БД, если штатный выход его ещё не остановил. Не
+   * касается JavaFX — тулкит к моменту внешнего завершения (сигнал, остановка из среды разработки)
+   * может быть уже мёртв. Ошибки остановки журналируются и завершению не мешают; идемпотентно со
+   * штатным выходом, который снимает действие остановки.
    */
   public static void stopDatabaseOnExternalShutdown() {
     Runnable stop = externalStop;
@@ -222,10 +211,9 @@ public final class MainWindowApp extends Application {
         new Menu(
             "Файл",
             null,
-            menuItem("Настройки…", actions.settings(), state.map(s -> !s.allowsSettings())),
-            menuItem("Открыть базу", actions.open(), state.map(s -> !s.allowsOpen())),
-            menuItem("Создать базу…", actions.create(), state.map(s -> !s.allowsCreate())),
-            menuItem("Закрыть базу", actions.close(), state.map(s -> !s.allowsClose())),
+            menuItem(
+                "Сделать резервную копию…", actions.backup(), state.map(s -> !s.allowsBackup())),
+            menuItem("Повторить открытие", actions.retryOpen(), state.map(s -> !s.allowsOpen())),
             new SeparatorMenuItem(),
             exit));
   }
@@ -240,23 +228,18 @@ public final class MainWindowApp extends Application {
 
   private static MenuActions menuActions(Stage stage, DatabaseController db) {
     return new MenuActions(
-        () ->
-            new SettingsDialog(stage, db.settings(), DataDirectory.databaseFile(), db::saveSettings)
-                .showAndWait(),
-        db::openDatabase,
-        () -> chooseNewDatabase(stage).ifPresent(db::createDatabase),
-        db::closeDatabase,
-        db::requestExit);
+        () -> chooseBackupTarget(stage).ifPresent(db::backupTo), db::retryOpen, db::requestExit);
   }
 
   /**
-   * Диалог выбора файла для новой БД; пустой результат означает отмену. Имя без расширения
-   * дополняется {@code .db}, чтобы созданный файл был виден фильтрам диалогов приложения.
+   * Единственный в приложении файловый диалог: выбор места резервной копии. Пустой результат
+   * означает отмену. Имя без расширения дополняется {@code .db}, чтобы копия была видна фильтрам
+   * диалогов приложения.
    */
-  private static Optional<Path> chooseNewDatabase(Stage stage) {
+  private static Optional<Path> chooseBackupTarget(Stage stage) {
     var chooser = new FileChooser();
-    chooser.setTitle("Создать базу данных");
-    chooser.setInitialFileName("bonds2.db");
+    chooser.setTitle("Сделать резервную копию");
+    chooser.setInitialFileName("bonds2-copy.db");
     chooser
         .getExtensionFilters()
         .add(new FileChooser.ExtensionFilter("База данных SQLite", "*.db"));

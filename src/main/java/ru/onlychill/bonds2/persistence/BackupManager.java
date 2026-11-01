@@ -3,267 +3,180 @@
 package ru.onlychill.bonds2.persistence;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
-import java.time.Clock;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Stream;
-import ru.onlychill.bonds2.files.StampedFiles;
 
 /**
- * Резервные копии файла БД и его откат: копия перед миграцией, проверка копии, восстановление после
- * неудачной миграции, хранение последних копий и возврат файла к пустому состоянию после неудачной
- * инициализации.
+ * Резервные копии файла БД. Два применения одной операции «проверенная копия»: служебная копия
+ * фиксированного имени перед миграцией и копия по указанию пользователя. Копия создаётся командой
+ * {@code VACUUM INTO} во временный файл рядом с целью, проверяется {@code PRAGMA integrity_check},
+ * сбрасывается на диск и атомарно заменяет прежний файл цели; частично записанный временный файл
+ * никогда не оказывается на месте цели.
  */
 final class BackupManager {
 
-  /** Сколько резервных копий файла БД хранится после успешной миграции. */
-  private static final int BACKUPS_KEPT = 3;
-
-  private static final System.Logger LOG = System.getLogger(BackupManager.class.getName());
+  /** Имя служебной копии перед миграцией в каталоге данных приложения. */
+  private static final String PRE_MIGRATION_NAME = "bonds2.pre-migration.db";
 
   private BackupManager() {}
 
   /**
-   * Миграция существующей БД с резервной копией; см. {@link Database#migrateWithBackup(Path)}.
-   * Копия создаётся рядом командой {@code VACUUM INTO} и проверяется {@code PRAGMA
-   * integrity_check}. Перед созданием копии удаляются временные файлы восстановления, оставшиеся от
-   * прерванного отката. Если миграция завершилась ошибкой, файл атомарно заменяется копией; если к
-   * этому моменту основной файл удалён, откат не запускается — ошибка несёт путь к копии для
-   * ручного восстановления. После любой попытки миграции, успешной или неудачной, копии
-   * ограничиваются лимитом.
+   * Миграция существующей БД со служебной копией; см. {@link Database#migrateWithBackup(Path)}.
+   * Копия фиксированного имени {@value #PRE_MIGRATION_NAME} атомарно перезаписывается; если копию
+   * создать или проверить не удалось, миграция не выполняется и файл БД не изменяется. Набор
+   * миграций применяется одной транзакцией: его сбой откатывает транзакция, восстановление из копии
+   * не выполняется — файл остаётся до-миграционным.
    *
    * @param absolute абсолютный путь к файлу БД
-   * @return путь к резервной копии
+   * @throws PersistenceException если файл уже открыт этим экземпляром приложения, миграция не
+   *     нужна, схема новее приложения, файл пуст или не является БД приложения
+   * @throws MigrationException если служебную копию создать или проверить не удалось (миграция не
+   *     выполнена, временный файл удалён, прежняя копия не тронута) либо миграция завершилась
+   *     ошибкой (транзакция откачена, файл до-миграционный)
    */
-  static Path migrateWithBackup(Path absolute, Clock clock, String... locations) {
+  static void migrateWithBackup(Path absolute, String... locations) {
     Database.State state = SchemaInspector.inspect(absolute, locations);
     if (state != Database.State.NEEDS_MIGRATION) {
       throw new PersistenceException(refusal(state, absolute));
     }
-    // Временные файлы восстановления, оставшиеся от прерванного отката, удаляются до копии:
-    // каталог с похожим именем пропускается с записью в лог, миграцию сбои не прерывают
-    StampedFiles.sweepOrphans(
-        directoryOf(absolute),
-        absolute.getFileName() + ".*.restore",
-        "временный файл восстановления");
-    Path backup = createBackup(absolute, clock);
-    verifyBackup(backup);
-    try {
-      SchemaInspector.flywayExisting(absolute, locations).migrate();
-    } catch (RuntimeException e) {
-      throw migrationFailure(absolute, backup, e);
-    } finally {
-      // Лимит копий действует после любой попытки, в том числе неудачной; новая копия остаётся
-      pruneBackups(absolute, backup);
-    }
-    return backup;
+    preMigrationCopy(absolute);
+    Migrations.applyPending(absolute, locations);
   }
 
   /**
-   * Возвращает существующий файл к пустому состоянию после неудачной инициализации: удаляет
-   * служебные файлы WAL и журнала и обрезает основной файл до 0 байт. Ошибка добавляется к {@code
-   * cause}.
+   * Служебная копия состояния до миграции: {@value #PRE_MIGRATION_NAME} в каталоге файла БД,
+   * атомарно перезаписываемая. Порядок: {@code VACUUM INTO} во временный файл того же каталога →
+   * проверка целостности → сброс на диск (канал закрыт до перемещения: на Windows перемещение
+   * открытого файла ненадёжно) → атомарная замена прежней копии. Сбой любого шага удаляет временный
+   * файл, прежняя копия остаётся, миграция не выполняется.
+   *
+   * @throws MigrationException если копию создать или проверить не удалось
    */
-  static void resetToEmpty(Path file, Throwable cause) {
+  static void preMigrationCopy(Path file) {
+    Path target = file.resolveSibling(PRE_MIGRATION_NAME);
     try {
-      SqliteSupport.deleteSidecars(file);
-      Files.write(file, new byte[0]);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
-    }
-  }
-
-  /**
-   * Создаёт копию командой {@code VACUUM INTO}: она читает согласованный снимок вместе с журналом
-   * WAL, поэтому перенос WAL перед копированием не нужен. Имя копии занимает пустой файл, созданный
-   * атомарно, поэтому существующая копия не перезаписывается. Если имя занято или копию создать не
-   * удалось, миграция не выполняется; частично записанный файл удаляется.
-   */
-  private static Path createBackup(Path file, Clock clock) {
-    String base = file.getFileName() + ".bak-" + StampedFiles.stamp(clock);
-    Path backup;
-    try {
-      backup = StampedFiles.reserve(file, base);
-    } catch (IOException e) {
+      writeVerifiedCopy(file, target, false);
+    } catch (PersistenceException e) {
       throw new MigrationException(
-          "Не удалось создать резервную копию, миграция не выполнена: " + file, e);
-    }
-    try {
-      SqliteSupport.vacuumInto(SqliteSupport.url(file), backup);
-      return backup;
-    } catch (SQLException e) {
-      var failure =
-          new MigrationException(
-              "Не удалось создать резервную копию, миграция не выполнена: " + backup, e);
-      SqliteSupport.deleteQuietly(backup, failure);
-      throw failure;
+          "Не удалось создать служебную копию "
+              + target
+              + ", миграция не выполнена. Файл БД не изменён.",
+          e);
     }
   }
 
   /**
-   * Проверяет копию; если она повреждена, удаляет её и сообщает об ошибке. Отсутствующий файл копии
-   * — тоже ошибка: проверка начинается с наличия, чтобы исчезнувшая копия не «проходила» проверку
-   * по заново созданному пустому файлу. Пакетный доступ нужен тестам: копию, которую создал {@code
-   * VACUUM INTO}, проверочный отказ напрямую не получить.
+   * Резервная копия по указанию пользователя: {@code VACUUM INTO} во временный файл рядом с целью
+   * (цель может быть на другой файловой системе, чем БД), проверка целостности, сброс на диск и
+   * замена цели — атомарная, а при невозможности обычным перемещением с заменой. Решение о замене
+   * существующей цели подтверждает сам диалог сохранения. При любом сбое цель не тронута, временный
+   * файл удалён.
+   *
+   * <p>Целью не может стать файл самой БД, её служебные файлы WAL/журнала, служебная копия перед
+   * миграцией или файл блокировки экземпляра: замена открытой БД снимком молча отбросила бы
+   * зафиксированные после начала копирования данные, а подмена блокировки лишила бы смысла защиту
+   * от второго экземпляра.
+   *
+   * @throws PersistenceException если цель запрещена, либо копию создать, проверить или поставить
+   *     на место не удалось; исходная причина сохранена в цепочке
    */
-  static void verifyBackup(Path backup) {
-    if (Files.notExists(backup)) {
-      throw new MigrationException(
-          "Резервная копия не найдена, миграция не выполнена: " + backup,
-          new NoSuchFileException(backup.toString()));
-    }
-    String result;
-    try {
-      result = SqliteSupport.integrityCheck(SqliteSupport.url(backup));
-    } catch (SQLException e) {
-      throw rejectBackup(backup, e);
-    }
-    if (!"ok".equals(result)) {
-      throw rejectBackup(backup, new SQLException("PRAGMA integrity_check: " + result));
-    }
-  }
-
-  private static MigrationException rejectBackup(Path backup, SQLException cause) {
-    var failure =
-        new MigrationException(
-            "Резервная копия не прошла проверку целостности, миграция не выполнена: " + backup,
-            cause);
-    SqliteSupport.deleteQuietly(backup, failure);
-    return failure;
+  static void userCopy(Path sourceFile, Path target) {
+    Path goal = target.toAbsolutePath();
+    rejectForbiddenTarget(sourceFile, goal);
+    writeVerifiedCopy(sourceFile, goal, true);
   }
 
   /**
-   * Оставляет новую копию {@code created} и самые новые из остальных копий файла БД, всего не
-   * больше {@link #BACKUPS_KEPT}. Новая копия не участвует в сортировке, поэтому не удаляется при
-   * любом порядке меток времени, например после перевода часов назад. Остальные копии упорядочены
-   * по метке времени в имени, затем по числовому суффиксу. Другие файлы не затрагиваются, сбой
-   * удаления пишется в лог.
+   * Отвергает цель, совпадающую с файлами приложения: сама БД, её {@code -wal}/{@code -shm}/{@code
+   * -journal}, служебная копия миграции и {@code bonds2.lock}. Сравнение — по реальным путям
+   * существующих файлов (символические ссылки раскрыты) и по нормализованным для отсутствующих.
    */
-  private static void pruneBackups(Path file, Path created) {
-    Path dir = file.getParent();
-    var pattern =
-        Pattern.compile(
-            Pattern.quote(file.getFileName() + ".bak-") + "(\\d{8}-\\d{6})(?:-(\\d+))?");
-    Path createdName = created.getFileName();
-    record Found(Path path, String stamp, int number) {}
-    List<Found> found = new ArrayList<>();
-    try (Stream<Path> files = Files.list(dir)) {
-      files.forEach(
-          p -> {
-            Matcher m = pattern.matcher(String.valueOf(p.getFileName()));
-            if (m.matches() && Files.isRegularFile(p) && !createdName.equals(p.getFileName())) {
-              found.add(new Found(p, m.group(1), m.group(2) == null ? 0 : parseSuffix(m.group(2))));
-            }
-          });
-    } catch (IOException | UncheckedIOException e) {
-      // Сбой просмотра не должен подменить ошибку миграции, которую prune выполняет в finally
-      LOG.log(System.Logger.Level.WARNING, "Не удалось просмотреть резервные копии: " + dir, e);
-      return;
-    }
-    found.sort(Comparator.comparing(Found::stamp).thenComparingInt(Found::number).reversed());
-    for (Found old : found.subList(Math.min(BACKUPS_KEPT - 1, found.size()), found.size())) {
-      try {
-        Files.deleteIfExists(old.path());
-      } catch (IOException e) {
-        LOG.log(System.Logger.Level.WARNING, "Не удалось удалить старую копию: " + old.path(), e);
+  private static void rejectForbiddenTarget(Path source, Path target) {
+    List<Path> forbidden = new ArrayList<>(SqliteSupport.sidecars(source));
+    forbidden.add(source);
+    forbidden.add(source.resolveSibling(PRE_MIGRATION_NAME));
+    forbidden.add(DataDirectory.lockFile());
+    for (Path file : forbidden) {
+      if (sameFile(file, target)) {
+        throw new PersistenceException(
+            "Резервная копия не может заменить файл приложения: " + target);
       }
     }
   }
 
-  private static int parseSuffix(String digits) {
+  /** Одно и то же место на диске: для существующих путей — с раскрытием символических ссылок. */
+  private static boolean sameFile(Path a, Path b) {
     try {
-      return Integer.parseInt(digits);
-    } catch (NumberFormatException e) {
-      return Integer.MAX_VALUE;
+      return Files.isSameFile(a, b);
+    } catch (IOException e) {
+      // Цель может ещё не существовать: сравниваем нормализованные абсолютные пути
+      return a.toAbsolutePath().normalize().equals(b.toAbsolutePath().normalize());
     }
   }
 
-  /** Каталог файла БД: абсолютный путь к файлу БД всегда содержит родительский каталог. */
-  private static Path directoryOf(Path file) {
-    return Objects.requireNonNull(file.toAbsolutePath().getParent(), "каталог файла БД");
-  }
-
   /**
-   * Реакция на неудачную миграцию. Если основного файла больше нет, откат не запускается:
-   * восстанавливать нечего, перенос WAL по отсутствующему файлу всё равно завершается ошибкой, а
-   * замена файла вернула бы на его место копию вместо отсутствующей БД; ошибка несёт путь к
-   * сохранённой копии для ручного восстановления. Иначе файл возвращается к состоянию копии.
-   * Пакетный доступ нужен тестам.
+   * Копия командой {@code VACUUM INTO}: она читает согласованный снимок вместе с журналом WAL,
+   * поэтому перенос WAL перед копированием не нужен. Временный файл создаётся рядом с целью: к
+   * моменту замены копия уже на целевой файловой системе. {@code VACUUM INTO} требует отсутствующий
+   * или пустой файл назначения — созданный {@code createTempFile} пустой файл подходит. {@code
+   * plainMoveFallback} разрешает замену обычным перемещением, когда атомарное не поддерживается
+   * файловой системой.
    */
-  static MigrationException migrationFailure(Path file, Path backup, RuntimeException cause) {
-    if (Files.notExists(file)) {
-      cause.addSuppressed(new NoSuchFileException(file.toString()));
-      return new MigrationException(
-          "Файл БД не найден, миграция не выполнена. Восстановите файл вручную из резервной копии: "
-              + backup,
-          cause);
-    }
-    return restore(file, backup, cause);
-  }
-
-  /**
-   * Возвращает файл БД к состоянию резервной копии после неудачной миграции. К этому моменту
-   * соединения Flyway уже закрыты. Копия сначала переносится во временный файл рядом с БД (в том же
-   * каталоге, чтобы перемещение оставалось в пределах одной файловой системы) и сбрасывается на
-   * диск — потеря питания сразу после замены не оставит укороченный файл. Затем зафиксированные
-   * транзакции переносятся из WAL в основной файл ({@code wal_checkpoint(TRUNCATE)}); перенос
-   * выполняется по возможности: если он не удался (например, WAL занят другим соединением), сбой
-   * пишется в лог, и восстановление продолжается — копия самодостаточна, а транзакции, оставшиеся
-   * только в WAL, теряются. Затем удаляются служебные файлы WAL и журнала, и временный файл
-   * атомарно заменяет БД; поэтому частично записанная копия никогда не окажется на месте БД. Если
-   * копию перенести, сбросить на диск или заменить файл не удалось, временный файл удаляется, а
-   * ошибка несёт путь к копии для ручного восстановления. Пакетный доступ нужен тестам.
-   */
-  static MigrationException restore(Path file, Path backup, RuntimeException cause) {
-    Path staged = null;
+  private static void writeVerifiedCopy(Path source, Path target, boolean plainMoveFallback) {
+    Path temp = null;
     try {
-      staged = Files.createTempFile(directoryOf(file), file.getFileName() + ".", ".restore");
-      Files.copy(backup, staged, StandardCopyOption.REPLACE_EXISTING);
+      // Цель абсолютна по построению, поэтому каталог у неё есть
+      Path targetDirectory = Objects.requireNonNull(target.getParent(), "каталог цели копии");
+      temp = Files.createTempFile(targetDirectory, target.getFileName() + ".", ".part");
+      SqliteSupport.vacuumInto(SqliteSupport.url(source), temp);
+      verifyCopy(temp);
       // Канал закрывается до перемещения: на Windows перемещение открытого файла ненадёжно
-      try (FileChannel channel = FileChannel.open(staged, StandardOpenOption.WRITE)) {
+      try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.WRITE)) {
         channel.force(true);
       }
-      // Перенос WAL выполняется по возможности: копия самодостаточна, а занятый другим
-      // соединением WAL не должен оставлять БД в состоянии неудачной миграции
-      try {
-        SqliteSupport.checkpoint(SqliteSupport.url(file), Database.DEFAULT_BUSY_TIMEOUT);
-      } catch (SQLException e) {
-        LOG.log(
-            System.Logger.Level.WARNING,
-            "Не удалось перенести WAL, восстановление продолжается: " + file,
-            e);
+      replace(temp, target, plainMoveFallback);
+    } catch (IOException | SQLException | RuntimeException e) {
+      if (temp != null) {
+        SqliteSupport.deleteQuietly(temp, e);
       }
-      SqliteSupport.deleteSidecars(file);
-      Files.move(staged, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-    } catch (IOException e) {
-      cause.addSuppressed(e);
-      if (staged != null) {
-        SqliteSupport.deleteQuietly(staged, cause);
-      }
-      return new MigrationException(
-          "Миграция не выполнена, и восстановить БД из резервной копии не удалось. Восстановите"
-              + " файл вручную из: "
-              + backup,
-          cause);
+      throw new PersistenceException("Не удалось создать резервную копию: " + target, e);
     }
-    return new MigrationException(
-        "Миграция не выполнена, БД восстановлена из резервной копии "
-            + backup
-            + ": "
-            + cause.getMessage(),
-        cause);
+  }
+
+  /**
+   * Проверяет копию; повреждённый файл не становится копией. Отсутствующий файл копии — тоже
+   * ошибка: проверка начинается с наличия, чтобы исчезнувшая копия не «проходила» проверку по
+   * заново созданному пустому файлу. Пакетный доступ нужен тестам.
+   */
+  static void verifyCopy(Path copy) throws SQLException {
+    if (Files.notExists(copy)) {
+      throw new SQLException("Резервная копия не найдена: " + copy);
+    }
+    String result = SqliteSupport.integrityCheck(SqliteSupport.url(copy));
+    if (!"ok".equals(result)) {
+      throw new SQLException("PRAGMA integrity_check: " + result);
+    }
+  }
+
+  /** Заменяет цель копией: атомарно в пределах каталога, при поддержке файловой системой. */
+  private static void replace(Path temp, Path target, boolean plainMoveFallback)
+      throws IOException {
+    try {
+      Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    } catch (AtomicMoveNotSupportedException e) {
+      if (!plainMoveFallback) {
+        throw e;
+      }
+      Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+    }
   }
 
   /** Причина отказа в миграции для состояния, кроме {@link Database.State#NEEDS_MIGRATION}. */

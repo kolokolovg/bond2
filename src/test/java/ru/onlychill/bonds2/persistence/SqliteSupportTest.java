@@ -4,14 +4,12 @@ package ru.onlychill.bonds2.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.queryLong;
 import static ru.onlychill.bonds2.persistence.DatabaseTestSupport.sibling;
 
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
-import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.sqlite.SQLiteConfig;
@@ -74,52 +72,43 @@ class SqliteSupportTest {
 
   @Test
   void serviceConnectionsRequestFullSynchronousMode() {
-    // Служебные соединения и миграции Flyway: синхронизация полная, как у транзакций
+    // Служебные соединения и миграции: синхронизация полная, как у транзакций
     var timeout = Duration.ofMillis(100);
     assertThat(SqliteSupport.maintenanceProperties().getProperty("synchronous")).isEqualTo("FULL");
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("synchronous"))
+        .isEqualTo("FULL");
+    assertThat(SqliteSupport.migrationProperties(timeout).getProperty("synchronous"))
         .isEqualTo("FULL");
   }
 
   @Test
   void serviceConnectionsDoNotSetJournalMode() {
-    // Режим журнала файла остаётся его собственным: соединение проверки или копии его не меняет
+    // Режим журнала файла остаётся его собственным: соединение проверки, копии или миграции его
+    // не меняет
     var timeout = Duration.ofMillis(100);
     assertThat(SqliteSupport.maintenanceProperties().getProperty("journal_mode")).isNull();
     assertThat(SqliteSupport.checkpointProperties(timeout).getProperty("journal_mode")).isNull();
+    assertThat(SqliteSupport.migrationProperties(timeout).getProperty("journal_mode")).isNull();
   }
 
   @Test
-  void dataSourceOpensWorkingConnectionsToExistingFile() throws SQLException {
-    Path file = createDatabase();
-    DataSource dataSource = SqliteSupport.existingFileDataSource(file);
-
-    try (Connection c = dataSource.getConnection()) {
-      assertThat(queryLong(c, "SELECT count(*) FROM app_info")).isZero();
-    }
-    // Каждый вызов getConnection открывает новое соединение: второе тоже рабочее
-    try (Connection c = dataSource.getConnection()) {
-      assertThat(queryLong(c, "SELECT count(*) FROM app_info")).isZero();
-    }
+  void migrationConnectionStartsImmediateTransactions() {
+    // Набор миграций применяется одной транзакцией записи: BEGIN IMMEDIATE, как у транзакций
+    // приложения
+    var props = SqliteSupport.migrationProperties(Duration.ofMillis(100));
+    assertThat(props.getProperty("transaction_mode")).isEqualTo("IMMEDIATE");
   }
 
   @Test
-  void dataSourceUnwrapsOnlyItsOwnType() throws SQLException {
-    DataSource dataSource = SqliteSupport.existingFileDataSource(dir.resolve("unused.db"));
-
-    assertThat(dataSource.isWrapperFor(DataSource.class)).isTrue();
-    assertThat(dataSource.unwrap(DataSource.class)).isSameAs(dataSource);
-    assertThat(dataSource.isWrapperFor(String.class)).isFalse();
-    assertThatThrownBy(() -> dataSource.unwrap(String.class)).isInstanceOf(SQLException.class);
-  }
-
-  @Test
-  void dataSourceConnectionToMissingFileFailsWithoutCreatingIt() {
+  void migrationConnectionToMissingFileFailsWithoutCreatingIt() {
     Path file = dir.resolve("missing.db");
-    DataSource dataSource = SqliteSupport.existingFileDataSource(file);
+    String url = SqliteSupport.url(file);
 
-    assertThatThrownBy(dataSource::getConnection).isInstanceOf(SQLException.class);
-
+    assertThatThrownBy(
+            () ->
+                SqliteSupport.connect(
+                    url, SqliteSupport.migrationProperties(Duration.ofMillis(100))))
+        .isInstanceOf(SQLException.class);
     assertThat(file).doesNotExist();
     assertThat(sibling(file, "-wal")).doesNotExist();
     assertThat(sibling(file, "-journal")).doesNotExist();

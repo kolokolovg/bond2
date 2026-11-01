@@ -20,10 +20,11 @@ import ru.onlychill.bonds2.dbservice.OpenResult;
  */
 final class MigrationFlow implements MigrationView {
 
-  /** Текст вопроса о миграции; резервная копия названа явно. */
+  /** Текст вопроса о миграции: служебная копия и одна транзакция названы явно. */
   private static final String MIGRATION_QUESTION =
-      "Схема БД устарела. Применить миграции? Перед миграцией будет создана резервная копия файла"
-          + " БД.";
+      "Схема БД устарела. Применить миграции? Перед миграцией в каталоге данных будет создана"
+          + " служебная копия bonds2.pre-migration.db, а миграции применятся одной транзакцией: при"
+          + " сбое файл БД не изменится.";
 
   private static final System.Logger LOG = System.getLogger(MigrationFlow.class.getName());
 

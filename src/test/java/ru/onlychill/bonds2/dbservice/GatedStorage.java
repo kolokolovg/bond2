@@ -11,8 +11,8 @@ import org.jspecify.annotations.Nullable;
 import ru.onlychill.bonds2.persistence.Database;
 
 /**
- * Настоящие операции с файлами БД, которыми можно управлять в тестах: задерживать открытие и
- * миграцию, подменять сбой и смотреть, какие БД были открыты.
+ * Настоящие операции с файлами БД, которыми можно управлять в тестах: задерживать открытие,
+ * копирование и миграцию, подменять сбой, выбирать файл БД и смотреть, какие БД были открыты.
  */
 public final class GatedStorage implements DatabaseService.Storage {
 
@@ -58,6 +58,13 @@ public final class GatedStorage implements DatabaseService.Storage {
 
   public final Gate openGate = new Gate();
   public final Gate migrateGate = new Gate();
+  public final Gate backupGate = new Gate();
+
+  /** Файл единственной БД приложения; тест задаёт его явно. */
+  public volatile Path databaseFile;
+
+  /** Если задано, копирование бросает это исключение или ошибку среды выполнения. */
+  public volatile @Nullable Throwable backupFailure;
 
   /** Открытые через это хранилище БД. */
   public final List<Database> opened = new CopyOnWriteArrayList<>();
@@ -68,8 +75,16 @@ public final class GatedStorage implements DatabaseService.Storage {
   /** Если задано, открытие бросает это исключение или ошибку среды выполнения. */
   public volatile @Nullable Throwable openFailure;
 
-  /** Если задано, закрытие бросает это исключение или ошибку после настоящего закрытия БД. */
+  /**
+   * Если задано, закрытие бросает это исключение или ошибку среды выполнения после настоящего
+   * закрытия БД.
+   */
   public volatile @Nullable Throwable closeFailure;
+
+  @Override
+  public Path databaseFile() {
+    return databaseFile;
+  }
 
   @Override
   public Database.State inspect(Path file) {
@@ -107,6 +122,13 @@ public final class GatedStorage implements DatabaseService.Storage {
   public void migrateWithBackup(Path file) {
     enter(migrateGate);
     Database.migrateWithBackup(file);
+  }
+
+  @Override
+  public void backup(Database database, Path target) {
+    enter(backupGate);
+    throwIfSet(backupFailure);
+    database.backupTo(target);
   }
 
   /** Запоминает поток операции и проходит через ворота. */

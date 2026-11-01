@@ -292,7 +292,8 @@ class DatabaseSchemaTest {
   }
 
   @Test
-  void inspectRejectsChangedMigrationChecksum() throws Exception {
+  void inspectIgnoresChangedMigrationChecksum() throws Exception {
+    // Контрольные суммы применённых миграций не проверяются: решающими являются версии
     Path file = createDatabase(dir.resolve("app.db"), OLD);
     try (var db = Database.open(file, TIMEOUT, OLD)) {
       db.inTransaction(
@@ -302,9 +303,49 @@ class DatabaseSchemaTest {
           });
     }
 
+    assertThat(Database.inspect(file, OLD)).isEqualTo(Database.State.UP_TO_DATE);
+  }
+
+  @Test
+  void inspectRejectsFailedMigrationInHistory() throws Exception {
+    // Неудачная строка истории — несоответствие: такая БД требует внимания, а не миграции
+    Path file = createDatabase(dir.resolve("app.db"), OLD);
+    try (var db = Database.open(file, TIMEOUT, OLD)) {
+      db.inTransaction(
+          c -> {
+            exec(
+                c,
+                "INSERT INTO flyway_schema_history (installed_rank, version, description, type,"
+                    + " script, checksum, installed_by, execution_time, success)"
+                    + " VALUES (9, '0', 'x', 'SQL', 'x', 0, 'test', 0, 0)");
+            return null;
+          });
+    }
+
     assertThatThrownBy(() -> Database.inspect(file, OLD))
         .isInstanceOf(PersistenceException.class)
-        .hasMessageContaining("не соответствует");
+        .hasMessageContaining("неудачную миграцию");
+  }
+
+  @Test
+  void inspectRejectsUnknownAppliedVersionBelowLatestKnown() throws Exception {
+    // Применённая версия вне набора и меньше последней известной: порядок истории нарушен
+    Path file = createDatabase(dir.resolve("app.db"), OLD);
+    try (var db = Database.open(file, TIMEOUT, OLD)) {
+      db.inTransaction(
+          c -> {
+            exec(
+                c,
+                "INSERT INTO flyway_schema_history (installed_rank, version, description, type,"
+                    + " script, checksum, installed_by, execution_time, success)"
+                    + " VALUES (9, '0', 'x', 'SQL', 'x', 0, 'test', 0, 1)");
+            return null;
+          });
+    }
+
+    assertThatThrownBy(() -> Database.inspect(file, OLD))
+        .isInstanceOf(PersistenceException.class)
+        .hasMessageContaining("не соответствует миграциям приложения");
   }
 
   @Test
@@ -463,7 +504,7 @@ class DatabaseSchemaTest {
     }
   }
 
-  /** Число успешно применённых миграций по истории Flyway. */
+  /** Число успешно применённых миграций по таблице истории. */
   private static long appliedMigrations(Database db) {
     return queryLong(db, "SELECT count(*) FROM flyway_schema_history WHERE success = 1");
   }

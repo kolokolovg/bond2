@@ -3,7 +3,7 @@
 package ru.onlychill.bonds2.ui;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
+import static ru.onlychill.bonds2.dbservice.TestDatabases.preMigrationCopiesIn;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -26,9 +26,6 @@ import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
-import ru.onlychill.bonds2.settings.MemorySettingsBackend;
-import ru.onlychill.bonds2.settings.Settings;
-import ru.onlychill.bonds2.settings.SettingsStore;
 
 /**
  * Тесты сценария диалога миграции: контроллер собирается с минимальным окружением, сценарий идёт
@@ -36,8 +33,6 @@ import ru.onlychill.bonds2.settings.SettingsStore;
  * проверяются в {@code DatabaseControllerTest}.
  */
 class MigrationFlowTest {
-
-  private static final String CLOSED_STATUS = "БД не открыта";
 
   @TempDir Path dir;
 
@@ -94,6 +89,7 @@ class MigrationFlowTest {
   void stopService() {
     storage.openGate.release();
     storage.migrateGate.release();
+    storage.backupGate.release();
     service.shutdown(Duration.ofSeconds(30));
   }
 
@@ -105,28 +101,16 @@ class MigrationFlowTest {
     return dataDir().resolve("bonds.db");
   }
 
-  private Path defaultFile() {
-    return dir.resolve("default/bonds2.db");
-  }
-
-  /** Backend настроек теста: общий для {@link #saveSettings} и создаваемых контроллеров. */
-  private final MemorySettingsBackend backend = new MemorySettingsBackend();
-
   private DatabaseController controller() {
-    var store = new SettingsStore(backend);
-    return new DatabaseController(
-        store, store.load(), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
-  }
-
-  private void saveSettings(Path databasePath, boolean autoOpen) {
-    new SettingsStore(backend).save(new Settings(databasePath, autoOpen));
+    storage.databaseFile = userFile();
+    return new DatabaseController(service, dialogs, exits::incrementAndGet, ui);
   }
 
   private static boolean isOpen(DatabaseController db) {
     return db.stateProperty().get() instanceof DbState.Open;
   }
 
-  /** Ждёт, пока открытие или создание придёт к итогу, и доставляет все диалоги. */
+  /** Ждёт, пока открытие придёт к итогу, и доставляет все диалоги. */
   private void settleAfterOperation(DatabaseController db) {
     ui.pumpUntil(
         () ->
@@ -139,16 +123,17 @@ class MigrationFlowTest {
   @Test
   void outdatedSchemaIsMigratedAfterConfirmationWithBackup() throws SQLException, IOException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
 
     db.openOnStartup();
     settleAfterOperation(db);
 
     assertThat(dialogs.questions).hasSize(1);
-    assertThat(dialogs.questions.get(0)).contains("резервная копия");
+    assertThat(dialogs.questions.get(0))
+        .contains("bonds2.pre-migration.db")
+        .contains("одной транзакцией");
     assertThat(isOpen(db)).isTrue();
-    assertThat(backupsIn(dataDir())).hasSize(1);
+    assertThat(preMigrationCopiesIn(dataDir())).hasSize(1);
     assertThat(dialogs.errors).isEmpty();
   }
 
@@ -156,7 +141,6 @@ class MigrationFlowTest {
   void refusedMigrationLeavesFileUntouchedAndDatabaseClosed() throws SQLException, IOException {
     TestDatabases.outdatedAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     dialogs.migrationAnswer = false;
     var db = controller();
 
@@ -166,14 +150,15 @@ class MigrationFlowTest {
     assertThat(dialogs.questions).hasSize(1);
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: схема устарела");
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
     assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
-  void failedMigrationRestoresFileAndShowsErrorWithRestoreNote() throws SQLException, IOException {
+  void failedMigrationRollsBackAndShowsErrorWithUnchangedFileNote()
+      throws SQLException, IOException {
     TestDatabases.forgottenHistoryAt(userFile());
-    saveSettings(userFile(), true);
+    byte[] before = Files.readAllBytes(userFile());
     var db = controller();
 
     db.openOnStartup();
@@ -181,18 +166,15 @@ class MigrationFlowTest {
 
     assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка миграции");
     assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0)).contains("восстановлена").contains(".bak-");
-    // Файл восстановлен копией: VACUUM INTO пишет компактный файл, поэтому сравниваем с копией
-    List<String> backups = backupsIn(dataDir());
-    assertThat(backups).hasSize(1);
-    assertThat(Files.readAllBytes(userFile()))
-        .isEqualTo(Files.readAllBytes(Path.of(backups.get(0))));
+    assertThat(dialogs.errors.get(0)).contains("Файл БД не изменён");
+    // Транзакция миграции откатилась: файл остался до-миграционным, служебная копия создана
+    assertThat(preMigrationCopiesIn(dataDir())).hasSize(1);
+    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
   }
 
   @Test
   void migrationDialogCancelledByAnotherWayIsNotReportedAsError() throws SQLException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
     dialogs.pending = new CompletableFuture<>();
 
@@ -209,7 +191,6 @@ class MigrationFlowTest {
   void declinedMigrationClosesDatabaseWithoutChangingFile() throws SQLException, IOException {
     TestDatabases.outdatedAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
     dialogs.migrationAnswer = false;
 
@@ -235,6 +216,7 @@ class MigrationFlowTest {
 
     final List<String> questions = new ArrayList<>();
     final List<String> warnings = new ArrayList<>();
+    final List<String> infos = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
     final List<String> exitWarnings = new ArrayList<>();
     boolean migrationAnswer = true;
@@ -262,6 +244,11 @@ class MigrationFlowTest {
     @Override
     public void warn(String message) {
       warnings.add(message);
+    }
+
+    @Override
+    public void info(String message) {
+      infos.add(message);
     }
 
     @Override

@@ -140,20 +140,28 @@ class OpenFailuresTest {
   }
 
   @Test
-  void placeReasonsAreUnchanged() {
-    var missing = OpenFailures.missing(Path.of("data", "bonds.db"));
-    assertThat(missing.reason()).isEqualTo("файл не найден");
+  void backupFailedWithFullCodeIsClassifiedAsNoDiskSpace() {
+    // Сбой копирования с кодом SQLITE_FULL классифицирован по коду: текст «нет места»
+    var failure =
+        OpenFailures.backupFailed(
+            Path.of("back", "копия.db"), dbFailure(13, "database or disk is full"));
+
+    assertThat(failure.message())
+        .contains("Не удалось создать резервную копию")
+        .contains("места")
+        .doesNotContain("занята")
+        .doesNotContain("повреждён");
   }
 
   @Test
-  void fileExistsCarriesTypedCauseAndUnchangedMessage() {
-    // Причина «файл существует» различима по типу; пользовательский текст остаётся прежним
-    var rejected = OpenFailures.fileExists(Path.of("data", "bonds.db"));
+  void backupFailedWithoutKnownCodeKeepsExceptionMessage() {
+    // Без известного кода в сообщении остаётся текст исключения
+    var failure =
+        OpenFailures.backupFailed(
+            Path.of("back", "копия.db"), dbFailure(19, "UNIQUE constraint failed"));
 
-    assertThat(rejected.cause()).isEqualTo(RejectionCause.FILE_EXISTS);
-    assertThat(rejected.message())
-        .contains("уже существует")
-        .contains("Выберите другое имя файла")
-        .contains("не изменён");
+    assertThat(failure.message())
+        .contains("Не удалось создать резервную копию")
+        .contains("UNIQUE constraint failed");
   }
 }

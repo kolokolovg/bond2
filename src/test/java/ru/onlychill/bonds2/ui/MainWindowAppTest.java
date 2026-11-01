@@ -31,18 +31,13 @@ import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.OpenResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.InstanceLock;
-import ru.onlychill.bonds2.settings.MemorySettingsBackend;
-import ru.onlychill.bonds2.settings.Settings;
-import ru.onlychill.bonds2.settings.SettingsStore;
 
 class MainWindowAppTest {
 
-  // Индексы пунктов меню «Файл»: разделитель стоит между «Закрыть базу» и «Выход»
-  private static final int SETTINGS = 0;
-  private static final int OPEN = 1;
-  private static final int CREATE = 2;
-  private static final int CLOSE = 3;
-  private static final int EXIT = 5;
+  // Индексы пунктов меню «Файл»: разделитель стоит между «Повторить открытие» и «Выход»
+  private static final int BACKUP = 0;
+  private static final int RETRY_OPEN = 1;
+  private static final int EXIT = 3;
 
   private static final java.nio.file.Path FILE = java.nio.file.Path.of("bonds.db");
   private static final DbState OPEN_STATE = new DbState.Open(FILE);
@@ -56,7 +51,7 @@ class MainWindowAppTest {
   }
 
   @Test
-  void fileMenuContainsDatabaseItemsAndExit() {
+  void fileMenuContainsBackupRetryAndExit() {
     var calls = new ArrayList<String>();
     MenuBar bar =
         MainWindowApp.createMenuBar(
@@ -66,14 +61,12 @@ class MainWindowAppTest {
     var items = bar.getMenus().get(0).getItems();
     assertThat(items)
         .extracting(MenuItem::getText)
-        .containsExactly(
-            "Настройки…", "Открыть базу", "Создать базу…", "Закрыть базу", null, "Выход");
+        .containsExactly("Сделать резервную копию…", "Повторить открытие", null, "Выход");
 
-    items.get(SETTINGS).fire();
-    items.get(OPEN).fire();
-    items.get(CREATE).fire();
+    items.get(BACKUP).fire();
+    items.get(RETRY_OPEN).fire();
     items.get(EXIT).fire();
-    assertThat(calls).containsExactly("settings", "open", "create", "exit");
+    assertThat(calls).containsExactly("backup", "retryOpen", "exit");
   }
 
   @Test
@@ -102,31 +95,25 @@ class MainWindowAppTest {
   }
 
   @Test
-  void exitChainStopsDatabaseThenReleasesLock() throws Exception {
+  void exitChainStopsDatabaseThenReleasesLock() {
     var file = dir.resolve("data/bonds.db");
     var lockFile = dir.resolve("bonds2.lock");
     TestDatabases.newDatabaseAt(file);
     var storage = new GatedStorage();
+    storage.databaseFile = file;
     var service = new DatabaseService(storage);
     var exits = new AtomicInteger();
-    var store = new SettingsStore(new MemorySettingsBackend());
     var db =
         new DatabaseController(
-            store,
-            store.load(),
-            dir.resolve("default/bonds2.db"),
             service,
             new DatabaseControllerTest.RecordingDialogs(),
             exits::incrementAndGet,
             Platform::runLater);
     Optional<InstanceLock> lock = Optional.empty();
     try {
-      service.open(file, false).join();
+      service.open().join();
       lock = InstanceLock.tryAcquire(lockFile);
       assertThat(lock).isPresent();
-
-      // Настройки сохранены синхронно до цепочки: они переживут завершение
-      db.saveSettings(new Settings(file, false));
 
       var done = CompletableFuture.runAsync(MainWindowApp.exitChain(db, lock.orElse(null)));
       assertThat(done).succeedsWithin(Duration.ofSeconds(10));
@@ -136,31 +123,17 @@ class MainWindowAppTest {
       assertThat(reacquired).isPresent();
       reacquired.ifPresent(InstanceLock::close);
 
-      assertThat(service.open(file, false).join())
+      assertThat(service.open().join())
           .isInstanceOfSatisfying(
               OpenResult.Rejected.class,
               rejected -> assertThat(rejected.message()).contains("остановлен"));
-      assertThat(store.load()).isEqualTo(new Settings(file, false));
     } finally {
       storage.openGate.release();
       storage.migrateGate.release();
+      storage.backupGate.release();
       lock.ifPresent(InstanceLock::close);
       service.shutdown(Duration.ofSeconds(30));
     }
-  }
-
-  @Test
-  void closeItemRunsCloseActionWhenDatabaseIsOpen() {
-    var calls = new ArrayList<String>();
-    var items =
-        MainWindowApp.createMenuBar(recording(calls), new SimpleObjectProperty<DbState>(OPEN_STATE))
-            .getMenus()
-            .get(0)
-            .getItems();
-
-    items.get(CLOSE).fire();
-
-    assertThat(calls).containsExactly("close");
   }
 
   @Test
@@ -172,19 +145,24 @@ class MainWindowAppTest {
             .get(0)
             .getItems();
 
-    assertThat(disabledFlags(items)).containsExactly(false, false, false, true, false, false);
+    // Закрыта: копирование недоступно, повторное открытие доступно
+    assertThat(disabledFlags(items)).containsExactly(true, false, false, false);
 
     state.set(OPEN_STATE);
-    assertThat(disabledFlags(items)).containsExactly(false, true, true, false, false, false);
+    // Открыта: копирование доступно, повторное открытие недоступно
+    assertThat(disabledFlags(items)).containsExactly(false, true, false, false);
 
-    state.set(new DbState.Opening(DbState.Kind.OPEN, FILE));
-    assertThat(disabledFlags(items)).containsExactly(true, true, true, true, false, false);
+    state.set(new DbState.Opening(FILE));
+    assertThat(disabledFlags(items)).containsExactly(true, true, false, false);
 
     state.set(new DbState.AwaitingMigration(FILE));
-    assertThat(disabledFlags(items)).containsExactly(true, true, true, true, false, false);
+    assertThat(disabledFlags(items)).containsExactly(true, true, false, false);
 
     state.set(new DbState.Migrating(FILE));
-    assertThat(disabledFlags(items)).containsExactly(true, true, true, true, false, false);
+    assertThat(disabledFlags(items)).containsExactly(true, true, false, false);
+
+    state.set(new DbState.BackingUp(dir.resolve("bonds2-copy.db")));
+    assertThat(disabledFlags(items)).containsExactly(true, true, false, false);
   }
 
   private static List<Boolean> disabledFlags(List<MenuItem> items) {
@@ -193,11 +171,7 @@ class MainWindowAppTest {
 
   private static MainWindowApp.MenuActions recording(List<String> calls) {
     return new MainWindowApp.MenuActions(
-        () -> calls.add("settings"),
-        () -> calls.add("open"),
-        () -> calls.add("create"),
-        () -> calls.add("close"),
-        () -> calls.add("exit"));
+        () -> calls.add("backup"), () -> calls.add("retryOpen"), () -> calls.add("exit"));
   }
 
   @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir;
@@ -259,21 +233,15 @@ class MainWindowAppTest {
     var file = dir.resolve("data/bonds.db");
     TestDatabases.newDatabaseAt(file);
     var storage = new GatedStorage();
+    storage.databaseFile = file;
     var service = new DatabaseService(storage);
     var exits = new AtomicInteger();
-    var store = new SettingsStore(new MemorySettingsBackend());
     var failure = new AssertionError("сбой остановки");
     var db =
         new DatabaseController(
-            store,
-            store.load(),
-            dir.resolve("default/bonds2.db"),
-            service,
-            new FxDialogs(stageBox[0]),
-            exits::incrementAndGet,
-            Platform::runLater);
+            service, new FxDialogs(stageBox[0]), exits::incrementAndGet, Platform::runLater);
     try {
-      service.open(file, false).join();
+      service.open().join();
       // Сбой остановки до известного итога: подписчик бросает Error при доставке «закрыта»,
       // publish(CLOSED) в runShutdown даёт exceptional future — ошибка, окно живо.
       // После exceptional-остановки сервис одноразов: повторный «Выход» сообщит ту же ошибку.
@@ -302,8 +270,7 @@ class MainWindowAppTest {
 
       var exitItem =
           MainWindowApp.createMenuBar(
-                  new MainWindowApp.MenuActions(
-                      () -> {}, () -> {}, () -> {}, () -> {}, db::requestExit),
+                  new MainWindowApp.MenuActions(() -> {}, () -> {}, db::requestExit),
                   db.stateProperty())
               .getMenus()
               .get(0)
@@ -336,6 +303,7 @@ class MainWindowAppTest {
     } finally {
       storage.openGate.release();
       storage.migrateGate.release();
+      storage.backupGate.release();
       // Сервис одноразов после сбоя остановки: повторная остановка возвращает ту же ошибку
       assertThatThrownBy(() -> service.shutdown(Duration.ofSeconds(30))).isSameAs(failure);
     }

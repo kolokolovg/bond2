@@ -8,18 +8,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.time.Clock;
 import java.time.Duration;
-import java.time.ZoneId;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.sqlite.SQLiteConfig;
 
 /**
- * Локальная БД SQLite: создание, проверка схемы и миграции с резервной копией, атомарные
- * транзакции, безопасные при параллельном использовании из нескольких потоков (WAL, {@code
- * busy_timeout}, {@code BEGIN IMMEDIATE} для записи).
+ * Локальная БД SQLite: создание, проверка схемы, миграции со служебной копией, резервные копии по
+ * указанию пользователя и атомарные транзакции, безопасные при параллельном использовании из
+ * нескольких потоков (WAL, {@code busy_timeout}, {@code BEGIN IMMEDIATE} для записи).
  *
  * <p>Открытый экземпляр владеет файлом БД: служебные операции {@link #create(Path, Duration)},
  * {@link #initialize(Path)} и {@link #migrateWithBackup(Path)} отказывают, не касаясь файла и его
@@ -30,8 +28,8 @@ import org.sqlite.SQLiteConfig;
  *
  * <p>Жизненный цикл: {@link #create(Path)}, {@link #initialize(Path)} для пустого файла или {@link
  * #open(Path)}, затем транзакции, затем {@link #close()}. Проверку схемы выполняет {@code
- * SchemaInspector}, резервные копии и откат файла — {@code BackupManager}, низкоуровневые операции
- * с SQLite — {@code SqliteSupport}.
+ * SchemaInspector}, прогон миграций одной транзакцией — {@code Migrations}, резервные копии —
+ * {@code BackupManager}, низкоуровневые операции с SQLite — {@code SqliteSupport}.
  */
 public final class Database implements AutoCloseable {
 
@@ -137,9 +135,8 @@ public final class Database implements AutoCloseable {
     ensureNotOpened(file);
     Path absolute = file.toAbsolutePath();
     createEmptyFile(absolute);
-    String url = SqliteSupport.url(absolute);
     try {
-      SchemaInspector.flywayCreating(url, locations).migrate();
+      Migrations.applyPending(absolute, locations);
     } catch (RuntimeException e) {
       // Файл создан этим вызовом, поэтому удаляем его: повторная попытка должна быть возможна
       SqliteSupport.deleteWithSidecarsQuietly(absolute, e);
@@ -201,8 +198,8 @@ public final class Database implements AutoCloseable {
 
   /**
    * Инициализирует существующий пустой файл актуальной схемой: 0 байт либо SQLite без объектов
-   * схемы. Файл не создаётся и не удаляется. Если миграции завершились ошибкой, файл возвращается к
-   * пустому состоянию, поэтому повторная попытка возможна.
+   * схемы. Файл не создаётся и не удаляется. Если миграции завершились ошибкой, транзакция
+   * откатывается и файл остаётся пустым, поэтому повторная попытка возможна.
    *
    * @throws PersistenceException если файла нет, файл уже открыт этим экземпляром приложения, он не
    *     пуст (в том числе БД приложения или чужая база) либо миграции не применились
@@ -220,40 +217,58 @@ public final class Database implements AutoCloseable {
           "Инициализация возможна только для пустого файла БД: " + absolute);
     }
     try {
-      SchemaInspector.flywayExisting(absolute, locations).migrate();
+      Migrations.applyPending(absolute, locations);
     } catch (RuntimeException e) {
-      // Файл существовал до вызова, поэтому его не удаляем, а возвращаем к пустому состоянию
-      BackupManager.resetToEmpty(absolute, e);
+      // Откат транзакции вернул файл к пустому состоянию; его не удаляем: он существовал до вызова
       throw new PersistenceException("Не удалось инициализировать БД: " + absolute, e);
     }
     return new Database(absolute, busyTimeout);
   }
 
   /**
-   * Миграция существующей БД с резервной копией. Копия {@code <имя>.bak-<yyyyMMdd-HHmmss>}
-   * создаётся рядом командой {@code VACUUM INTO}, которая включает данные из журнала WAL, и
-   * проверяется {@code PRAGMA integrity_check}. После любой попытки миграции, успешной или
-   * неудачной, хранятся три копии файла: новая и две самые новые из остальных; новая не удаляется
-   * никогда. При совпадении имени добавляется числовой суффикс. Если миграция завершилась ошибкой,
-   * файл атомарно заменяется копией.
+   * Миграция существующей БД со служебной копией фиксированного имени {@code
+   * bonds2.pre-migration.db} в каталоге данных: копия создаётся командой {@code VACUUM INTO},
+   * которая включает данные из журнала WAL, проверяется и атомарно перезаписывается. Набор миграций
+   * применяется одной транзакцией: сбой откатывает её, файл остаётся до-миграционным,
+   * восстановление из копии не выполняется — она страховка от успешной, но ошибочной миграции.
    *
-   * @return путь к резервной копии
    * @throws PersistenceException если файл уже открыт этим экземпляром приложения, миграция не
    *     нужна, схема новее приложения, файл пуст или не является БД приложения; файл не изменён
-   * @throws MigrationException если копию создать или проверить не удалось (миграция не выполнена,
-   *     копия удаляется), миграция завершилась ошибкой (файл восстановлен из копии) либо основной
-   *     файл удалён до применения миграций (откат не запускается, копия сохраняется для ручного
-   *     восстановления)
+   * @throws MigrationException если служебную копию создать или проверить не удалось (миграция не
+   *     выполнена, файл БД не изменён) либо миграция завершилась ошибкой (транзакция откачена, файл
+   *     до-миграционный)
    */
-  public static Path migrateWithBackup(Path file) {
-    // Имя копии использует локальное время пользователя: часовой пояс указан явно
-    return migrateWithBackup(file, Clock.system(ZoneId.systemDefault()), MIGRATIONS);
+  public static void migrateWithBackup(Path file) {
+    migrateWithBackup(file, MIGRATIONS);
   }
 
-  /** Миграция по набору {@code locations}; время в имени копии берётся из {@code clock}. */
-  static Path migrateWithBackup(Path file, Clock clock, String... locations) {
+  /** Миграция по набору миграций {@code locations}. */
+  static void migrateWithBackup(Path file, String... locations) {
     ensureNotOpened(file);
-    return BackupManager.migrateWithBackup(file.toAbsolutePath(), clock, locations);
+    BackupManager.migrateWithBackup(file.toAbsolutePath(), locations);
+  }
+
+  /**
+   * Создаёт резервную копию открытой БД по выбранному пользователем пути: {@code VACUUM INTO} во
+   * временный файл рядом с целью (он включает данные из журнала WAL), проверка целостности, сброс
+   * на диск и замена цели — атомарная, а при невозможности обычным перемещением с заменой. При
+   * любом сбое цель не тронута, временный файл удалён. Активные транзакции не блокируются: {@code
+   * VACUUM INTO} читает согласованный снимок; закрытие БД ({@link #close()}) ждёт окончания
+   * копирования.
+   *
+   * @throws PersistenceException если БД закрыта или копию создать, проверить или поставить на
+   *     место не удалось
+   */
+  public void backupTo(Path target) {
+    lock.readLock().lock();
+    try {
+      if (closed) {
+        throw new PersistenceException("БД закрыта");
+      }
+      BackupManager.userCopy(registryKey, target);
+    } finally {
+      lock.readLock().unlock();
+    }
   }
 
   /**

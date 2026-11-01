@@ -4,10 +4,9 @@ package ru.onlychill.bonds2.ui;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static ru.onlychill.bonds2.dbservice.TestDatabases.backupsIn;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.isClosed;
 import static ru.onlychill.bonds2.dbservice.TestDatabases.newDatabaseAt;
-import static ru.onlychill.bonds2.testutil.TestSql.executeSql;
+import static ru.onlychill.bonds2.dbservice.TestDatabases.preMigrationCopiesIn;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -32,6 +31,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import ru.onlychill.bonds2.app.ExitCoordinator;
+import ru.onlychill.bonds2.dbservice.BackupResult;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
@@ -41,13 +41,11 @@ import ru.onlychill.bonds2.dbservice.ShutdownRefusal;
 import ru.onlychill.bonds2.dbservice.ShutdownResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.Database;
-import ru.onlychill.bonds2.settings.MemorySettingsBackend;
-import ru.onlychill.bonds2.settings.Settings;
-import ru.onlychill.bonds2.settings.SettingsStore;
 
 class DatabaseControllerTest {
 
   private static final String CLOSED_STATUS = "БД не открыта";
+  private static final String OPEN_STATUS = "БД открыта";
 
   @TempDir Path dir;
 
@@ -104,6 +102,7 @@ class DatabaseControllerTest {
   void stopService() {
     storage.openGate.release();
     storage.migrateGate.release();
+    storage.backupGate.release();
     service.shutdown(Duration.ofSeconds(30));
   }
 
@@ -115,25 +114,13 @@ class DatabaseControllerTest {
     return dataDir().resolve("bonds.db");
   }
 
-  private Path defaultFile() {
-    return dir.resolve("default/bonds2.db");
+  private Path backupTarget() {
+    return dir.resolve("bonds2-copy.db");
   }
-
-  /** Backend настроек теста: общий для {@link #saveSettings} и создаваемых контроллеров. */
-  private final MemorySettingsBackend backend = new MemorySettingsBackend();
 
   private DatabaseController controller() {
-    return controllerWith(backend);
-  }
-
-  private DatabaseController controllerWith(MemorySettingsBackend settings) {
-    var store = new SettingsStore(settings);
-    return new DatabaseController(
-        store, store.load(), defaultFile(), service, dialogs, exits::incrementAndGet, ui);
-  }
-
-  private void saveSettings(Path databasePath, boolean autoOpen) {
-    new SettingsStore(backend).save(new Settings(databasePath, autoOpen));
+    storage.databaseFile = userFile();
+    return new DatabaseController(service, dialogs, exits::incrementAndGet, ui);
   }
 
   private static boolean isOpen(DatabaseController db) {
@@ -144,7 +131,7 @@ class DatabaseControllerTest {
     return db.stateProperty().get() instanceof DbState.Migrating;
   }
 
-  /** Ждёт, пока открытие или создание придёт к итогу, и доставляет все диалоги. */
+  /** Ждёт, пока открытие придёт к итогу, и доставляет все диалоги. */
   private void settleAfterOperation(DatabaseController db) {
     ui.pumpUntil(
         () ->
@@ -156,10 +143,11 @@ class DatabaseControllerTest {
 
   private DatabaseController opened() {
     newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
+    // Дожидается сброса признака идущей операции после доставки результата открытия
+    ui.settle();
     return db;
   }
 
@@ -172,69 +160,40 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void disabledAutoOpenLeavesDatabaseClosedAndFileUntouched() {
-    saveSettings(userFile(), false);
-    var db = controller();
-
-    db.openOnStartup();
-    ui.settle();
-
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(db.statusProperty().get()).isEqualTo(CLOSED_STATUS);
-    assertThat(userFile()).doesNotExist();
-  }
-
-  @Test
-  void autoOpenOpensExistingDatabaseAndShowsItsPath() {
+  void openOnStartupOpensExistingDatabase() {
     var db = opened();
 
-    assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
+    assertThat(db.statusProperty().get()).isEqualTo(OPEN_STATUS);
     assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
-  void missingDefaultPathDatabaseIsCreatedAutomatically() {
-    saveSettings(null, true);
+  void openOnStartupIsUnconditionalWhenDatabaseWasNeverConfigured() {
+    // Настроек больше нет: открытие при запуске выполняется всегда, даже для нового контроллера
     var db = controller();
 
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
 
-    assertThat(defaultFile()).isRegularFile();
-    assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + defaultFile());
+    assertThat(userFile()).isRegularFile();
+    assertThat(db.statusProperty().get()).isEqualTo(OPEN_STATUS);
   }
 
   @Test
-  void firstRunWithoutSettingsFileCreatesDefaultDatabaseWithoutWarning() {
+  void missingDatabaseFileIsCreatedAutomatically() {
     var db = controller();
 
     db.openOnStartup();
-    settleAfterOperation(db);
+    ui.pumpUntil(() -> isOpen(db));
 
-    assertThat(dialogs.warnings).isEmpty();
-    assertThat(defaultFile()).isRegularFile();
-    assertThat(isOpen(db)).isTrue();
-  }
-
-  @Test
-  void missingUserFileIsNotCreatedAndHintsAtCreation() {
-    saveSettings(userFile(), true);
-    var db = controller();
-
-    db.openOnStartup();
-    settleAfterOperation(db);
-
-    assertThat(userFile()).doesNotExist();
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: файл не найден");
-    assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0)).contains("Создать базу");
+    assertThat(userFile()).isRegularFile();
+    assertThat(db.statusProperty().get()).isEqualTo(OPEN_STATUS);
   }
 
   @Test
   void emptyFileIsInitializedWithoutMigrationQuestion() throws IOException {
     Files.createDirectories(dataDir());
     Files.createFile(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
 
     db.openOnStartup();
@@ -242,7 +201,7 @@ class DatabaseControllerTest {
 
     assertThat(isOpen(db)).isTrue();
     assertThat(dialogs.questions).isEmpty();
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
     assertThat(dialogs.errors).isEmpty();
   }
 
@@ -251,7 +210,6 @@ class DatabaseControllerTest {
       throws SQLException, IOException {
     TestDatabases.foreignAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
 
     db.openOnStartup();
@@ -270,7 +228,6 @@ class DatabaseControllerTest {
   void newerSchemaIsRejectedWithoutTouchingFile() throws SQLException, IOException {
     TestDatabases.tooNewAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
 
     db.openOnStartup();
@@ -284,7 +241,6 @@ class DatabaseControllerTest {
   @Test
   void unexpectedFailureIsReportedAndDatabaseStaysClosed() {
     newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openFailure = new IllegalStateException("сбой");
     var db = controller();
 
@@ -296,26 +252,21 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void openAndCreateAreIgnoredWhileOpeningAndWhileOpen() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
+  void openIsIgnoredWhileOpeningAndWhileOpen() throws InterruptedException {
     storage.openGate.hold();
     var db = controller();
 
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
-    db.openDatabase();
-    db.createDatabase(dataDir().resolve("other.db"));
+    db.retryOpen();
 
     storage.openGate.release();
     ui.pumpUntil(() -> isOpen(db));
-    db.openDatabase();
-    db.createDatabase(dataDir().resolve("other.db"));
+    db.retryOpen();
     ui.settle();
 
-    assertThat(storage.opened).hasSize(1);
-    assertThat(dataDir().resolve("other.db")).doesNotExist();
+    assertThat(storage.threads).hasSize(1);
     assertThat(dialogs.errors).isEmpty();
   }
 
@@ -323,14 +274,13 @@ class DatabaseControllerTest {
   void repeatedOpenBeforeResultIsDeliveredSendsOnlyOneCommand()
       throws SQLException, IOException, InterruptedException {
     TestDatabases.foreignAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
 
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     // Результат первого открытия ещё не доставлен: состояние в интерфейсе всё ещё «закрыта»
-    db.openDatabase();
+    db.retryOpen();
 
     storage.openGate.release();
     ui.pumpUntil(() -> !dialogs.errors.isEmpty());
@@ -343,34 +293,211 @@ class DatabaseControllerTest {
         .isEqualTo(new DbState.Closed("не база bonds2", dialogs.errors.get(0)));
 
     // Признак сброшен в обработчике результата: новое открытие доходит до сервиса
-    db.openDatabase();
+    db.retryOpen();
     ui.pumpUntil(() -> dialogs.errors.size() == 2);
     assertThat(storage.threads).hasSize(2);
   }
 
   @Test
-  void statusFollowsOpeningCreatingAndMigrating() throws SQLException, InterruptedException {
-    saveSettings(null, false);
-    storage.openGate.hold();
+  void statusFollowsOpeningAndMigrating() throws SQLException, InterruptedException {
+    TestDatabases.outdatedAt(userFile());
+    storage.migrateGate.hold();
     var db = controller();
 
-    db.createDatabase(userFile());
-    ui.pumpUntil(() -> db.statusProperty().get().equals("Создание базы…"));
-    storage.openGate.release();
-    ui.pumpUntil(() -> isOpen(db));
-    // Путь записан в настройки: без него открытие пошло бы по пути по умолчанию
-    ui.pumpUntil(() -> new SettingsStore(backend).load().equals(new Settings(userFile(), false)));
-    db.closeDatabase();
-    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
-
-    executeSql(userFile(), "DELETE FROM flyway_schema_history", "DROP TABLE app_info");
-    storage.migrateGate.hold();
-    db.openDatabase();
+    db.openOnStartup();
+    ui.pumpUntil(() -> db.statusProperty().get().equals("Открытие базы…"));
     ui.pumpUntil(() -> isMigrating(db));
 
-    assertThat(db.statusProperty().get()).isEqualTo("Миграция базы…");
+    assertThat(db.statusProperty().get()).isEqualTo("Открытие базы…");
     storage.migrateGate.release();
     ui.pumpUntil(() -> isOpen(db));
+    assertThat(db.statusProperty().get()).isEqualTo(OPEN_STATUS);
+  }
+
+  @Test
+  void retryOpenWhenClosedOpensDatabase() {
+    var db = controller();
+
+    db.retryOpen();
+    ui.pumpUntil(() -> isOpen(db));
+
+    assertThat(db.statusProperty().get()).isEqualTo(OPEN_STATUS);
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void retryOpenAfterFailureOpensDatabaseAgain() throws SQLException, IOException {
+    TestDatabases.foreignAt(userFile());
+    var db = controller();
+    db.openOnStartup();
+    settleAfterOperation(db);
+    assertThat(dialogs.errors).hasSize(1);
+
+    // Файл исправлен: повторное открытие после сбоя доходит до сервиса
+    Files.delete(userFile());
+    newDatabaseAt(userFile());
+    db.retryOpen();
+    ui.pumpUntil(() -> isOpen(db));
+    ui.settle();
+
+    assertThat(storage.threads).hasSize(3);
+  }
+
+  @Test
+  void backupSuccessShowsInfoDialogWithTargetPath() throws IOException {
+    var db = opened();
+    Path target = backupTarget();
+
+    db.backupTo(target);
+    ui.pumpUntil(() -> !dialogs.infos.isEmpty());
+
+    assertThat(target).isRegularFile();
+    assertThat(dialogs.infos).containsExactly("Резервная копия создана: " + target);
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(isOpen(db)).isTrue();
+  }
+
+  @Test
+  void backupFailureShowsErrorAndKeepsDatabaseOpen() {
+    var db = opened();
+    Path target = backupTarget();
+    storage.backupFailure = new IllegalStateException("сбой копирования");
+
+    db.backupTo(target);
+    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
+
+    assertThat(dialogs.errors).singleElement().asString().contains("сбой копирования");
+    assertThat(dialogs.infos).isEmpty();
+    // БД остаётся открытой при любом исходе копирования
+    assertThat(isOpen(db)).isTrue();
+    assertThat(db.stateProperty().get()).isEqualTo(new DbState.Open(userFile()));
+  }
+
+  @Test
+  void backupToIsIgnoredWhenClosedOrBusy() throws InterruptedException {
+    var db = controller();
+    db.backupTo(backupTarget());
+    ui.settle();
+    assertThat(storage.threads).isEmpty();
+
+    // Открытие с БД, идущей через ворота: повторное копирование до доставки результата игнорируется
+    storage.openGate.hold();
+    db.openOnStartup();
+    assertThat(storage.openGate.awaitEntered()).isTrue();
+    db.backupTo(backupTarget());
+    storage.openGate.release();
+    ui.pumpUntil(() -> isOpen(db));
+    ui.settle();
+
+    assertThat(storage.threads).hasSize(1);
+    assertThat(dialogs.infos).isEmpty();
+    assertThat(dialogs.errors).isEmpty();
+  }
+
+  @Test
+  void repeatedBackupBeforeResultIsDeliveredSendsOnlyOneCommand() throws InterruptedException {
+    var db = opened();
+    Path target = backupTarget();
+    storage.backupGate.hold();
+
+    db.backupTo(target);
+    assertThat(storage.backupGate.awaitEntered()).isTrue();
+    db.backupTo(target);
+
+    storage.backupGate.release();
+    ui.pumpUntil(() -> !dialogs.infos.isEmpty());
+
+    assertThat(storage.threads).hasSize(3);
+    assertThat(dialogs.infos).hasSize(1);
+  }
+
+  // Сильная ссылка на logger контроллера: изменения уровня и хендлеров не теряются при сборке
+  // мусора
+  private static final Logger CONTROLLER_LOG = Logger.getLogger(DatabaseController.class.getName());
+
+  // Логи машины выхода пишет координатор
+  private static final Logger COORDINATOR_LOG =
+      Logger.getLogger(ru.onlychill.bonds2.app.ExitCoordinator.class.getName());
+
+  @Test
+  void backupRejectedByStateRaceIsQuietAndLogged() {
+    var db = controller();
+
+    var capture = new LogCapture();
+    CONTROLLER_LOG.addHandler(capture);
+    CONTROLLER_LOG.setLevel(Level.FINE);
+    try {
+      deliverBackup(db, new BackupResult.Rejected(RejectionCause.STATE, "неизвестный текст"));
+      ui.settle();
+    } finally {
+      CONTROLLER_LOG.removeHandler(capture);
+      CONTROLLER_LOG.setLevel(null);
+    }
+
+    // Гонка состояния — не ошибка файла: диалога нет, отклонение зафиксировано в журнале
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.infos).isEmpty();
+    assertThat(capture.messages).anySatisfy(m -> assertThat(m).contains("Копирование отклонено"));
+  }
+
+  /** Доставляет собранный результат копирования контроллеру через очередь потока интерфейса. */
+  private void deliverBackup(DatabaseController db, BackupResult result) {
+    ui.execute(() -> db.onBackupResult(result));
+    ui.settle();
+  }
+
+  @Test
+  void backupRejectedByStoppedCauseIsQuietRegardlessOfMessageText() {
+    var db = controller();
+
+    // Начатая остановка остаётся тихой, каким бы ни был текст отклонения
+    deliverBackup(db, new BackupResult.Rejected(RejectionCause.STOPPED, "не текст остановки"));
+
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.infos).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void openRejectedByStateCauseIsQuietRegardlessOfMessageText() {
+    var db = controller();
+
+    // Текст не совпадает с производственными формулировками: классификация идёт по причине
+    ui.execute(() -> db.onOpenResult(new OpenResult.Rejected(RejectionCause.STATE, "иной текст")));
+    ui.settle();
+
+    // Гонка состояния — не ошибка файла: диалога нет при любом тексте
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void openRejectedByStoppedCauseIsQuietRegardlessOfMessageText() {
+    var db = controller();
+
+    // Начатая остановка остаётся тихой, каким бы ни был текст отклонения
+    ui.execute(
+        () -> db.onOpenResult(new OpenResult.Rejected(RejectionCause.STOPPED, "совсем не текст")));
+    ui.settle();
+
+    assertThat(dialogs.errors).isEmpty();
+    assertThat(dialogs.warnings).isEmpty();
+  }
+
+  @Test
+  void lateBackupResultAfterExitIsIgnoredWithoutDialogs() {
+    var db = opened();
+    db.requestExit();
+    ui.pumpUntil(() -> exits.get() == 1);
+    ui.settle();
+
+    // Приложение уже завершилось: запоздавший итог копирования не показывает диалогов
+    ui.execute(() -> db.onBackupResult(new BackupResult.Copied(backupTarget())));
+    ui.execute(() -> db.onBackupResult(new BackupResult.Failed("поздний сбой")));
+    ui.settle();
+
+    assertThat(dialogs.infos).isEmpty();
+    assertThat(dialogs.errors).isEmpty();
   }
 
   @Test
@@ -385,11 +512,9 @@ class DatabaseControllerTest {
 
   @Test
   void repeatedExitRequestIsIgnoredWhileStopping() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     db.requestExit();
@@ -408,11 +533,9 @@ class DatabaseControllerTest {
 
   @Test
   void exitTimeoutShowsWarningAndExitsAfterConfirmation() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     // Выход начат как обычно: флаг exiting выставлен, остановка ждёт открытия
     db.requestExit();
@@ -436,11 +559,9 @@ class DatabaseControllerTest {
 
   @Test
   void exitTimeoutOutsideMenuIsLoggedWithoutDialog() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
 
@@ -463,11 +584,9 @@ class DatabaseControllerTest {
 
   @Test
   void menuExitDuringOngoingStopRunsSingleShutdownAndExitsOnce() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     // Меню-путь начал асинхронную остановку: она ждёт открытия
@@ -496,13 +615,11 @@ class DatabaseControllerTest {
     // publish(CLOSED) в runShutdown даёт exceptional future — ошибка, приложение живо.
     // После exceptional-остановки сервис одноразов (инвариант shutdownAsync):
     // повторный «Выход» снова запускает цепочку, но сообщает ту же ошибку.
-    var failing = new DatabaseService(new GatedStorage());
+    var failingStorage = new GatedStorage();
+    failingStorage.databaseFile = userFile();
+    var failing = new DatabaseService(failingStorage);
     newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
-    var store = new SettingsStore(backend);
-    var db =
-        new DatabaseController(
-            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
+    var db = new DatabaseController(failing, dialogs, exits::incrementAndGet, ui);
 
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
@@ -528,13 +645,11 @@ class DatabaseControllerTest {
   @Test
   void repeatedExitChainFailureResetsExitingAgain() {
     // Сбой остановки до известного итога: подписчик падает всегда, каждая попытка — та же ошибка
-    var failing = new DatabaseService(new GatedStorage());
+    var failingStorage = new GatedStorage();
+    failingStorage.databaseFile = userFile();
+    var failing = new DatabaseService(failingStorage);
     newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
-    var store = new SettingsStore(backend);
-    var db =
-        new DatabaseController(
-            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
+    var db = new DatabaseController(failing, dialogs, exits::incrementAndGet, ui);
 
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
@@ -555,11 +670,9 @@ class DatabaseControllerTest {
   @Test
   void exitDuringOpeningWaitsForOperationWithoutQuestionAndClosesDatabase()
       throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
 
     db.requestExit();
@@ -578,10 +691,9 @@ class DatabaseControllerTest {
   void exitIsDelayedWithMessageWhileMigratingAndAllowedAfterwards()
       throws SQLException, InterruptedException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     storage.migrateGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     ui.pumpUntil(() -> isMigrating(db));
     assertThat(storage.migrateGate.awaitEntered()).isTrue();
 
@@ -601,11 +713,10 @@ class DatabaseControllerTest {
   void exitRefusedByMigrationStartedBeforeUiUpdateKeepsWarningAndExitsAfterwards()
       throws SQLException, InterruptedException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     storage.migrateGate.hold();
     var db = controller();
     // Интерфейс ничего не применяет до pumpUntil: он отстаёт от сервиса
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(Eventually(() -> service.state() instanceof DbState.AwaitingMigration)).isTrue();
     var migration = service.migrate();
     assertThat(storage.migrateGate.awaitEntered()).isTrue();
@@ -632,7 +743,6 @@ class DatabaseControllerTest {
       throws SQLException, IOException {
     TestDatabases.outdatedAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     var db = controller();
     dialogs.pending = new CompletableFuture<>();
 
@@ -647,7 +757,7 @@ class DatabaseControllerTest {
     assertThat(dialogs.warnings).isEmpty();
     assertThat(dialogs.errors).isEmpty();
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
   }
 
   @Test
@@ -655,7 +765,7 @@ class DatabaseControllerTest {
     TestDatabases.outdatedAt(userFile());
     var db = controller();
     // Диалога нет, решение не отправлено: сервис ждёт команду
-    service.open(userFile(), false).join();
+    service.open().join();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
 
     db.requestExit();
@@ -670,10 +780,9 @@ class DatabaseControllerTest {
       throws SQLException, IOException, InterruptedException {
     TestDatabases.outdatedAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
 
@@ -689,7 +798,7 @@ class DatabaseControllerTest {
     assertThat(exits.get()).isEqualTo(1);
     assertThat(service.state()).isEqualTo(new DbState.Closed("схема устарела", null));
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
   }
 
   @Test
@@ -697,10 +806,9 @@ class DatabaseControllerTest {
       throws SQLException, IOException, InterruptedException {
     TestDatabases.outdatedAt(userFile());
     byte[] before = Files.readAllBytes(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
 
@@ -716,7 +824,7 @@ class DatabaseControllerTest {
     assertThat(dialogs.errors).isEmpty();
     assertThat(exits.get()).isEqualTo(1);
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
   }
 
   @Test
@@ -724,7 +832,7 @@ class DatabaseControllerTest {
     TestDatabases.outdatedAt(userFile());
     var db = controller();
     // Диалога нет, решение не отправлено: сервис ждёт команду
-    service.open(userFile(), false).join();
+    service.open().join();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
 
     db.requestExit();
@@ -735,258 +843,6 @@ class DatabaseControllerTest {
     assertThat(exits.get()).isEqualTo(1);
     assertThat(dialogs.questions).isEmpty();
     assertThat(dialogs.warnings).isEmpty();
-  }
-
-  @Test
-  void createdDatabaseIsOpenedAndItsPathSavedKeepingAutoOpen() {
-    saveSettings(null, false);
-    var db = controller();
-
-    db.createDatabase(userFile());
-    ui.pumpUntil(() -> isOpen(db));
-    var expected = new Settings(userFile(), false);
-    ui.pumpUntil(() -> new SettingsStore(backend).load().equals(expected));
-
-    assertThat(db.statusProperty().get()).isEqualTo("БД открыта: " + userFile());
-    assertThat(userFile()).isRegularFile();
-    assertThat(db.settings()).isEqualTo(expected);
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  @Test
-  void createOverExistingFileIsRefusedAndFileKept() throws IOException {
-    Files.createDirectories(dataDir());
-    Files.writeString(userFile(), "чужой файл");
-    byte[] before = Files.readAllBytes(userFile());
-    var db = controller();
-
-    db.createDatabase(userFile());
-    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
-
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(dialogs.errors).hasSize(1);
-    assertThat(dialogs.errors.get(0))
-        .contains("уже существует")
-        .contains("Выберите другое имя")
-        .contains("не изменён");
-    assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(db.settings()).isEqualTo(Settings.defaults());
-  }
-
-  @Test
-  void createWithDialogNameWithoutExtensionCreatesFileWithDbExtension() {
-    // Диалог дополняет введённое имя без расширения расширением .db
-    Path chosen = MainWindowApp.withDbExtension(dataDir().resolve("новая база"));
-    assertThat(chosen.getFileName().toString()).isEqualTo("новая база.db");
-    var db = controller();
-
-    db.createDatabase(chosen);
-    ui.pumpUntil(() -> isOpen(db));
-
-    assertThat(chosen).isRegularFile();
-    assertThat(dataDir().resolve("новая база")).doesNotExist();
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  @Test
-  void createFailureIsReported() throws IOException {
-    Files.writeString(dir.resolve("blocker"), "файл на месте каталога");
-    var db = controller();
-
-    db.createDatabase(dir.resolve("blocker/bonds.db"));
-    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
-
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: ошибка создания");
-  }
-
-  // Сильная ссылка на logger контроллера: изменения уровня и хендлеров не теряются при сборке
-  // мусора
-  private static final Logger CONTROLLER_LOG = Logger.getLogger(DatabaseController.class.getName());
-
-  // Логи машины выхода пишет координатор
-  private static final Logger COORDINATOR_LOG =
-      Logger.getLogger(ru.onlychill.bonds2.app.ExitCoordinator.class.getName());
-
-  @Test
-  void createRejectedByStateRaceIsQuietAndLogged() {
-    newDatabaseAt(userFile());
-    var db = controller();
-    // Сервис открывает БД мимо интерфейса: сервис уже открыт, интерфейс ещё не прокачан
-    service.open(userFile(), false).join();
-
-    var capture = new LogCapture();
-    CONTROLLER_LOG.addHandler(capture);
-    CONTROLLER_LOG.setLevel(Level.FINE);
-    try {
-      db.createDatabase(dataDir().resolve("other.db"));
-      ui.settle();
-    } finally {
-      CONTROLLER_LOG.removeHandler(capture);
-      CONTROLLER_LOG.setLevel(null);
-    }
-
-    // Гонка состояния — не ошибка файла: диалога нет, отклонение зафиксировано в журнале
-    assertThat(dialogs.errors).isEmpty();
-    assertThat(capture.messages).anySatisfy(m -> assertThat(m).contains("Создание отклонено"));
-    assertThat(dataDir().resolve("other.db")).doesNotExist();
-  }
-
-  @Test
-  void createRejectedDuringShutdownIsQuietAndStateStaysClosed() throws InterruptedException {
-    newDatabaseAt(userFile());
-    var db = controller();
-    // Открытие идёт мимо контроллера: интерфейс остаётся в состоянии «закрыта»
-    storage.openGate.hold();
-    service.open(userFile(), false);
-    assertThat(storage.openGate.awaitEntered()).isTrue();
-    service.shutdownAsync(ExitCoordinator.SHUTDOWN_TIMEOUT);
-
-    db.createDatabase(dataDir().resolve("other.db"));
-    ui.settle();
-
-    // Начатая остановка отклоняет создание тихо: диалогов нет, файл не создан
-    assertThat(dialogs.errors).isEmpty();
-    assertThat(dialogs.warnings).isEmpty();
-    assertThat(dataDir().resolve("other.db")).doesNotExist();
-
-    // Остановка доходит до конца: состояние «закрыта» — пункты меню снова доступны
-    storage.openGate.release();
-    ui.pumpUntil(
-        () -> db.stateProperty().get() instanceof DbState.Closed closed && closed.reason() == null);
-    ui.settle();
-
-    assertThat(db.statusProperty().get()).isEqualTo(CLOSED_STATUS);
-    assertThat(dialogs.errors).isEmpty();
-  }
-
-  /** Доставляет собранный результат создания контроллеру через очередь потока интерфейса. */
-  private void deliverCreated(DatabaseController db, OpenResult result) {
-    ui.execute(() -> db.onCreateResult(userFile(), result));
-    ui.settle();
-  }
-
-  @Test
-  void createRejectedByStateCauseIsQuietRegardlessOfMessageText() {
-    var db = controller();
-
-    // Текст не совпадает с производственными формулировками: классификация идёт по причине
-    deliverCreated(
-        db, new OpenResult.Rejected(RejectionCause.STATE, "перефразированное сообщение"));
-
-    // Гонка состояния — не ошибка файла: диалога нет при любом тексте
-    assertThat(dialogs.errors).isEmpty();
-    assertThat(dialogs.warnings).isEmpty();
-  }
-
-  @Test
-  void createRejectedByStoppedCauseIsQuietRegardlessOfMessageText() {
-    var db = controller();
-
-    // Начатая остановка остаётся тихой, каким бы ни был текст отклонения
-    deliverCreated(
-        db, new OpenResult.Rejected(RejectionCause.STOPPED, "совсем не текст остановки"));
-
-    assertThat(dialogs.errors).isEmpty();
-    assertThat(dialogs.warnings).isEmpty();
-  }
-
-  @Test
-  void createRejectedByFileExistsCauseShowsErrorRegardlessOfMessageText() {
-    var db = controller();
-
-    // Причина FILE_EXISTS показывает диалог с доставленным текстом, а не по узнаванию слов
-    deliverCreated(db, new OpenResult.Rejected(RejectionCause.FILE_EXISTS, "совсем другой текст"));
-
-    assertThat(dialogs.errors).containsExactly("совсем другой текст");
-  }
-
-  @Test
-  void createKeepsDatabaseOpenWhenSettingsCannotBeSaved() {
-    var failing = new MemorySettingsBackend();
-    failing.failOnPersist = true;
-    var db = controllerWith(failing);
-
-    db.createDatabase(userFile());
-    ui.pumpUntil(() -> !dialogs.warnings.isEmpty());
-
-    assertThat(isOpen(db)).isTrue();
-    assertThat(dialogs.warnings.get(0)).contains("не записан в настройки");
-    assertThat(db.settings()).isEqualTo(Settings.defaults());
-  }
-
-  @Test
-  void closeDatabaseClosesItAndDatabaseCanBeOpenedAgain() {
-    var db = opened();
-
-    db.closeDatabase();
-    ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
-    ui.settle();
-
-    assertThat(db.statusProperty().get()).isEqualTo(CLOSED_STATUS);
-    assertThat(dialogs.warnings).isEmpty();
-    assertThat(isClosed(storage.opened.get(0))).isTrue();
-
-    db.openDatabase();
-    ui.pumpUntil(() -> isOpen(db));
-  }
-
-  @Test
-  void unexpectedCloseFailureIsReportedAsErrorAndDatabaseStaysClosed() {
-    var db = opened();
-    storage.closeFailure = new IllegalStateException("сбой закрытия");
-
-    db.closeDatabase();
-    ui.pumpUntil(() -> !dialogs.errors.isEmpty());
-    ui.settle();
-
-    assertThat(db.stateProperty().get()).isInstanceOf(DbState.Closed.class);
-    assertThat(db.statusProperty().get()).isEqualTo("БД не открыта: внутренняя ошибка");
-    assertThat(dialogs.errors).singleElement().asString().contains("сбой закрытия");
-    assertThat(dialogs.warnings).isEmpty();
-  }
-
-  @Test
-  void closeWhenClosedDoesNothing() {
-    var db = controller();
-
-    db.closeDatabase();
-    ui.settle();
-
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(dialogs.warnings).isEmpty();
-  }
-
-  @Test
-  void closeFailureIsReportedAndDatabaseStaysClosed() throws SQLException {
-    var db = opened();
-
-    TestDatabases.whileReaderLagsBehind(
-        userFile(),
-        () -> {
-          db.closeDatabase();
-          ui.pumpUntil(() -> !dialogs.warnings.isEmpty());
-        });
-
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(dialogs.warnings.get(0)).contains("Не удалось полностью закрыть БД");
-  }
-
-  @Test
-  void closeWarningArrivingAfterShutdownIsNotShown() throws SQLException {
-    var db = opened();
-
-    TestDatabases.whileReaderLagsBehind(
-        userFile(),
-        () -> {
-          // Закрытие с предупреждением (WAL не перенесён) завершается раньше остановки
-          db.closeDatabase();
-          db.shutdown();
-        });
-    ui.settle();
-
-    assertThat(dialogs.warnings).isEmpty();
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
-    assertThat(isClosed(storage.opened.get(0))).isTrue();
   }
 
   @Test
@@ -1005,11 +861,9 @@ class DatabaseControllerTest {
 
   @Test
   void lateResultAfterShutdownIsIgnoredAndItsDatabaseClosed() throws InterruptedException {
-    newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
     storage.openGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     assertThat(storage.openGate.awaitEntered()).isTrue();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
 
@@ -1057,7 +911,7 @@ class DatabaseControllerTest {
       // Сервис остановлен в пределах короткого срока: БД закрыта, новые операции отклоняются
       assertThat(isClosed(storage.opened.get(0))).isTrue();
       ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Closed);
-      assertThat(service.open(userFile(), false).join()).isInstanceOf(OpenResult.Rejected.class);
+      assertThat(service.open().join()).isInstanceOf(OpenResult.Rejected.class);
     } finally {
       MainWindowApp.setExternalStop(null);
     }
@@ -1073,7 +927,7 @@ class DatabaseControllerTest {
     assertThatCode(MainWindowApp::stopDatabaseOnExternalShutdown).doesNotThrowAnyException();
 
     assertThat(isClosed(storage.opened.get(0))).isTrue();
-    assertThat(service.open(userFile(), false).join())
+    assertThat(service.open().join())
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected -> assertThat(rejected.message()).contains("остановлен"));
@@ -1104,11 +958,10 @@ class DatabaseControllerTest {
   @Test
   void shutdownRefusedDuringMigrationDoesNotStopController() throws SQLException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     dialogs.migrationAnswer = true;
-    var db = controller();
     storage.migrateGate.hold();
-    db.openDatabase();
+    var db = controller();
+    db.openOnStartup();
     ui.pumpUntil(() -> isMigrating(db));
 
     assertThat(db.shutdown(Duration.ofMillis(50)))
@@ -1125,7 +978,7 @@ class DatabaseControllerTest {
     byte[] before = Files.readAllBytes(userFile());
     var db = controller();
     // Сервис ждёт решения о миграции; диалога и команды ещё нет
-    service.open(userFile(), false).join();
+    service.open().join();
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.AwaitingMigration);
 
     db.shutdown();
@@ -1136,9 +989,9 @@ class DatabaseControllerTest {
     assertThat(dialogs.questions).isEmpty();
     assertThat(dialogs.errors).isEmpty();
     assertThat(Files.readAllBytes(userFile())).isEqualTo(before);
-    assertThat(backupsIn(dataDir())).isEmpty();
+    assertThat(preMigrationCopiesIn(dataDir())).isEmpty();
     // Сервис остановлен: новые операции отклоняются
-    assertThat(service.open(userFile(), false).join())
+    assertThat(service.open().join())
         .isInstanceOfSatisfying(
             OpenResult.Rejected.class,
             rejected -> assertThat(rejected.message()).contains("остановлен"));
@@ -1148,10 +1001,9 @@ class DatabaseControllerTest {
   void shutdownWhileMigratingWaitsForMigrationAndThenStops()
       throws SQLException, IOException, InterruptedException {
     TestDatabases.outdatedAt(userFile());
-    saveSettings(userFile(), true);
     storage.migrateGate.hold();
     var db = controller();
-    db.openDatabase();
+    db.openOnStartup();
     ui.pumpUntil(() -> isMigrating(db));
     assertThat(storage.migrateGate.awaitEntered()).isTrue();
 
@@ -1165,7 +1017,7 @@ class DatabaseControllerTest {
     ui.settle();
 
     assertThat(Database.inspect(userFile())).isEqualTo(Database.State.UP_TO_DATE);
-    assertThat(backupsIn(dataDir())).hasSize(1);
+    assertThat(preMigrationCopiesIn(dataDir())).hasSize(1);
     assertThat(storage.opened).hasSize(1);
     assertThat(isClosed(storage.opened.get(0))).isTrue();
     assertThat(service.state()).isEqualTo(DbState.CLOSED);
@@ -1178,13 +1030,10 @@ class DatabaseControllerTest {
     // Сценарий «Сбой остановки при внешнем завершении»: подписчик бросает ошибку при финальной
     // публикации «закрыта», поэтому синхронная остановка сервиса пробрасывает её вызывающему
     var failingStorage = new GatedStorage();
+    failingStorage.databaseFile = userFile();
     var failing = new DatabaseService(failingStorage);
     newDatabaseAt(userFile());
-    saveSettings(userFile(), true);
-    var store = new SettingsStore(backend);
-    var db =
-        new DatabaseController(
-            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
+    var db = new DatabaseController(failing, dialogs, exits::incrementAndGet, ui);
 
     db.openOnStartup();
     ui.pumpUntil(() -> isOpen(db));
@@ -1247,7 +1096,7 @@ class DatabaseControllerTest {
   }
 
   /**
-   * Сборщик записей журнала контроллера: проверка тихого отклонения создания БД и журнала сбоя
+   * Сборщик записей журнала контроллера: проверка тихого отклонения копирования и журнала сбоя
    * остановки при внешнем завершении.
    */
   private static final class LogCapture extends Handler {
@@ -1272,6 +1121,7 @@ class DatabaseControllerTest {
 
     final List<String> questions = new ArrayList<>();
     final List<String> warnings = new ArrayList<>();
+    final List<String> infos = new ArrayList<>();
     final List<String> errors = new ArrayList<>();
     final List<String> exitWarnings = new ArrayList<>();
     boolean migrationAnswer = true;
@@ -1299,6 +1149,11 @@ class DatabaseControllerTest {
     @Override
     public void warn(String message) {
       warnings.add(message);
+    }
+
+    @Override
+    public void info(String message) {
+      infos.add(message);
     }
 
     @Override

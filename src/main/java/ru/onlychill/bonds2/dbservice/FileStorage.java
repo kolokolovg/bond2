@@ -3,10 +3,16 @@
 package ru.onlychill.bonds2.dbservice;
 
 import java.nio.file.Path;
+import ru.onlychill.bonds2.persistence.DataDirectory;
 import ru.onlychill.bonds2.persistence.Database;
 
 /** Настоящие операции с файлами БД: делегируют пакету {@code persistence}. */
 final class FileStorage implements DatabaseService.Storage {
+
+  @Override
+  public Path databaseFile() {
+    return DataDirectory.databaseFile();
+  }
 
   @Override
   public Database.State inspect(Path file) {
@@ -31,6 +37,11 @@ final class FileStorage implements DatabaseService.Storage {
   @Override
   public void migrateWithBackup(Path file) {
     Database.migrateWithBackup(file);
+  }
+
+  @Override
+  public void backup(Database database, Path target) {
+    database.backupTo(target);
   }
 
   @Override
