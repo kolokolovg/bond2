@@ -6,7 +6,6 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import javafx.application.Application;
@@ -59,9 +58,6 @@ public final class MainWindowApp extends Application {
 
   private @Nullable DatabaseController controller;
   private @Nullable InstanceLock instanceLock;
-
-  /** Цепочка завершения запускается один раз: повторный {@code stop()} не создаёт вторую. */
-  private final AtomicBoolean exitStarted = new AtomicBoolean();
 
   /** Запускатель цепочки завершения; тесты подменяют его, чтобы цепочку не выполнять. */
   private final AtomicReference<Consumer<Runnable>> exitLauncher =
@@ -130,25 +126,32 @@ public final class MainWindowApp extends Application {
   }
 
   /**
-   * Цепочка завершения: сначала останавливается работа с БД (с ожиданием записи настроек), и только
-   * потом освобождается блокировка экземпляра, чтобы новый экземпляр не открыл файл, пока старый
-   * ещё с ним работает. Блокировка освобождается, даже если остановка завершилась ошибкой.
-   * Последним снимается действие хука: штатный выход завершён, хук больше ничего не останавливает.
+   * Цепочка завершения: сначала останавливается работа с БД, и только потом освобождается
+   * блокировка экземпляра, чтобы новый экземпляр не открыл файл, пока старый ещё с ним работает.
+   * Блокировка освобождается, даже если остановка завершилась ошибкой. Последним снимается действие
+   * хука: штатный выход завершён, хук больше ничего не останавливает. Порядок и однократность
+   * выполнения держит машина выхода; здесь только сборка цепочки из частей приложения.
    */
   static Runnable exitChain(@Nullable DatabaseController db, @Nullable InstanceLock lock) {
+    Runnable releaseLock = lock == null ? () -> {} : lock::close;
+    Runnable disarmHook = () -> setExternalStop(null);
     return () -> {
-      shutDownInOrder(db == null ? () -> {} : db::shutdown, lock == null ? () -> {} : lock::close);
-      // Штатный выход завершён: хук завершения JVM больше ничего не останавливает
-      setExternalStop(null);
+      if (db == null) {
+        try {
+          releaseLock.run();
+        } finally {
+          disarmHook.run();
+        }
+        return;
+      }
+      db.runExitChain(releaseLock, disarmHook);
     };
   }
 
-  /** Запускает цепочку завершения один раз: повторный вызов ничего не делает. */
+  /** Запускает цепочку завершения; однократность выполнения гарантирует машина выхода. */
   private void launchExit(Runnable chain) {
-    if (exitStarted.compareAndSet(false, true)) {
-      // Запускатель не null по построению: поле инициализировано и меняется только целиком
-      Objects.requireNonNull(exitLauncher.get()).accept(chain);
-    }
+    // Запускатель не null по построению: поле инициализировано и меняется только целиком
+    Objects.requireNonNull(exitLauncher.get()).accept(chain);
   }
 
   /** Тестовый крючок: заменяет запускатель цепочки завершения. */
@@ -185,19 +188,6 @@ public final class MainWindowApp extends Application {
   /** Заменяет действие остановки для внешнего завершения; {@code null} снимает его. */
   static void setExternalStop(@Nullable Runnable stop) {
     externalStop = stop;
-  }
-
-  /**
-   * Завершение: сначала останавливается работа с БД, и только потом освобождается блокировка
-   * экземпляра, чтобы новый экземпляр не открыл файл, пока старый ещё с ним работает. Блокировка
-   * освобождается, даже если остановка завершилась ошибкой.
-   */
-  static void shutDownInOrder(Runnable stopDatabase, Runnable releaseLock) {
-    try {
-      stopDatabase.run();
-    } finally {
-      releaseLock.run();
-    }
   }
 
   /**

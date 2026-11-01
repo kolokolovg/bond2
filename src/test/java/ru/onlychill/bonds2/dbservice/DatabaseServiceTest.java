@@ -915,7 +915,8 @@ class DatabaseServiceTest {
     TestDatabases.outdatedAt(file());
     get(service.open(file(), false));
 
-    assertThat(get(service.shutdownAsync(Duration.ofSeconds(1)))).isEqualTo(ShutdownResult.REFUSED);
+    assertThat(get(service.shutdownAsync(Duration.ofSeconds(1))))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
   }
 
   @Test
@@ -1060,7 +1061,8 @@ class DatabaseServiceTest {
     var migrate = service.migrate();
     assertThat(storage.migrateGate.awaitEntered()).isTrue();
 
-    assertThat(service.shutdown(Duration.ofSeconds(1))).isEqualTo(ShutdownResult.REFUSED);
+    assertThat(service.shutdown(Duration.ofSeconds(1)))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.MIGRATING));
     assertThat(migrate).isNotDone();
 
     storage.migrateGate.release();
@@ -1074,7 +1076,8 @@ class DatabaseServiceTest {
     TestDatabases.outdatedAt(file());
     get(service.open(file(), false));
 
-    assertThat(service.shutdown(Duration.ofSeconds(1))).isEqualTo(ShutdownResult.REFUSED);
+    assertThat(service.shutdown(Duration.ofSeconds(1)))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
 
     assertThat(service.state()).isEqualTo(new DbState.AwaitingMigration(file()));
     assertThat(get(service.declineMigration())).isEqualTo(new CloseResult.Closed(null));
@@ -1095,9 +1098,34 @@ class DatabaseServiceTest {
     var result = service.shutdown(Duration.ofSeconds(30));
     releaser.join();
 
-    assertThat(result).isEqualTo(ShutdownResult.REFUSED);
+    assertThat(result).isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
     assertThat(get(open)).isEqualTo(new OpenResult.NeedsMigration(file()));
     assertThat(get(service.migrate())).isEqualTo(new OpenResult.Opened(file()));
+  }
+
+  @Test
+  void serviceIsFullyFunctionalAfterShutdownRefusal() throws Exception {
+    // Сценарий дельты «Возврат к работе после отказа за истечением срока»: отказ остановки
+    // возвращает сервис к работе целиком — «покинутость» попытки не переживает отказ.
+    // Гонку «истечение срока против отказа» прямо воспроизвести нельзя, поэтому проверяется
+    // её следствие по спецификации: после отказа публикуются и результаты, и ошибки,
+    // повторная остановка выполняется штатно
+    TestDatabases.outdatedAt(file());
+    assertThat(get(service.open(file(), false))).isEqualTo(new OpenResult.NeedsMigration(file()));
+    assertThat(get(service.shutdownAsync(Duration.ofSeconds(1))))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.DECISION_PENDING));
+
+    // Отказ от миграции публикует закрытие с причиной — публикация не подавлена
+    assertThat(get(service.declineMigration())).isEqualTo(new CloseResult.Closed(null));
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+
+    // Ошибка последующей операции видима вызывающему, а не молча проглочена
+    assertThat(get(service.open(Path.of("несуществующий-каталог/базы/нет.db"), false)))
+        .isInstanceOf(OpenResult.Failed.class);
+    assertThat(service.state()).isInstanceOf(DbState.Closed.class);
+
+    // Повторная остановка выполняется штатно
+    assertThat(service.shutdown(Duration.ofSeconds(30))).isEqualTo(ShutdownResult.STOPPED);
   }
 
   @Test

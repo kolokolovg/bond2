@@ -193,8 +193,8 @@ public final class DatabaseService {
       if (existing != null) {
         return existing.copy();
       }
-      if (mustNotStop(state)) {
-        return CompletableFuture.completedFuture(ShutdownResult.REFUSED);
+      if (!state.allowsShutdown()) {
+        return CompletableFuture.completedFuture(new ShutdownResult.Refused(refusalOf(state)));
       }
       var done = new CompletableFuture<ShutdownResult>();
       shutdownFuture = done;
@@ -207,7 +207,7 @@ public final class DatabaseService {
       done.completeOnTimeout(ShutdownResult.TIMED_OUT, timeout.toMillis(), TimeUnit.MILLISECONDS);
       done.thenAccept(
           result -> {
-            if (result == ShutdownResult.TIMED_OUT) {
+            if (result instanceof ShutdownResult.TimedOut) {
               abandoned = true;
             }
           });
@@ -215,8 +215,11 @@ public final class DatabaseService {
     }
   }
 
-  private static boolean mustNotStop(DbState current) {
-    return current instanceof DbState.Migrating || current instanceof DbState.AwaitingMigration;
+  /** Причина отказа остановки по текущему состоянию: ожидание решения или идущая миграция. */
+  private static ShutdownRefusal refusalOf(DbState current) {
+    return current.awaitsUserDecision()
+        ? ShutdownRefusal.DECISION_PENDING
+        : ShutdownRefusal.MIGRATING;
   }
 
   /**
@@ -263,12 +266,18 @@ public final class DatabaseService {
 
   private void runShutdown(CompletableFuture<ShutdownResult> done) {
     try {
-      if (!abandoned && mustNotStop(state)) {
+      if (!abandoned && !state.allowsShutdown()) {
+        // Отказ оживляет сервис целиком: «покинутость» — свойство попытки остановки, не сервиса.
+        // Сброс только если отказ стал наблюдаемым итогом: если срок уже истёк и вызывающий
+        // ушёл завершаться, «покинутость» остаётся — запоздавшее публикуется молча.
+        boolean refusalWon = done.complete(new ShutdownResult.Refused(refusalOf(state)));
         synchronized (shutdownLock) {
           stopping = false;
           shutdownFuture = null;
+          if (refusalWon) {
+            abandoned = false;
+          }
         }
-        done.complete(ShutdownResult.REFUSED);
         return;
       }
       Database opened = database;

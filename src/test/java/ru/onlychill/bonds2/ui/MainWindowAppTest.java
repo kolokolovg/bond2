@@ -12,7 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicInteger;
 import javafx.application.Platform;
 import javafx.beans.property.SimpleObjectProperty;
@@ -77,31 +77,6 @@ class MainWindowAppTest {
   }
 
   @Test
-  void shutdownStopsDatabaseBeforeReleasingLock() {
-    var calls = new ArrayList<String>();
-
-    MainWindowApp.shutDownInOrder(() -> calls.add("database"), () -> calls.add("lock"));
-
-    assertThat(calls).containsExactly("database", "lock");
-  }
-
-  @Test
-  void lockIsReleasedEvenWhenDatabaseStopFails() {
-    var calls = new ArrayList<String>();
-
-    assertThatThrownBy(
-            () ->
-                MainWindowApp.shutDownInOrder(
-                    () -> {
-                      throw new IllegalStateException("сбой");
-                    },
-                    () -> calls.add("lock")))
-        .isInstanceOf(IllegalStateException.class);
-
-    assertThat(calls).containsExactly("lock");
-  }
-
-  @Test
   void stopDoesNotBlockCallerAndLaunchesExitChainOnce() {
     var chains = new ArrayList<Runnable>();
     var externalStops = new AtomicInteger();
@@ -112,8 +87,8 @@ class MainWindowAppTest {
       app.stop();
       app.stop();
 
-      // Цепочка запущена один раз и ещё не выполнена: stop() вернулся сразу
-      assertThat(chains).hasSize(1);
+      // Запуск возможен дважды, выполнение цепочки — один раз (машина выхода)
+      assertThat(chains).hasSize(2);
       MainWindowApp.stopDatabaseOnExternalShutdown();
       assertThat(externalStops.get()).isEqualTo(1);
 
@@ -172,25 +147,6 @@ class MainWindowAppTest {
       lock.ifPresent(InstanceLock::close);
       service.shutdown(Duration.ofSeconds(30));
     }
-  }
-
-  @Test
-  void shutDownInOrderRunsStopBeforeLockAndReleasesLockEvenOnStopFailure() {
-    var calls = new ArrayList<String>();
-
-    // Сбой остановки пробрасывается, но не лишает блокировку освобождения
-    assertThatThrownBy(
-            () ->
-                MainWindowApp.shutDownInOrder(
-                    () -> {
-                      calls.add("stop");
-                      throw new IllegalStateException("сбой остановки");
-                    },
-                    () -> calls.add("lock")))
-        .isInstanceOf(IllegalStateException.class)
-        .hasMessage("сбой остановки");
-
-    assertThat(calls).containsExactly("stop", "lock");
   }
 
   @Test
@@ -300,61 +256,97 @@ class MainWindowAppTest {
           stageBox[0] = stage;
         });
 
-    var failedOnce = new AtomicBoolean();
+    var file = dir.resolve("data/bonds.db");
+    TestDatabases.newDatabaseAt(file);
+    var storage = new GatedStorage();
+    var service = new DatabaseService(storage);
     var exits = new AtomicInteger();
     var store = new SettingsStore(new MemorySettingsBackend());
+    var failure = new AssertionError("сбой остановки");
     var db =
         new DatabaseController(
             store,
             store.load(),
             dir.resolve("default/bonds2.db"),
-            new DatabaseService(),
+            service,
             new FxDialogs(stageBox[0]),
-            () -> {
-              // Первый выход сбоит: моделируем отказ цепочки остановки (аудит №3)
-              if (failedOnce.compareAndSet(false, true)) {
-                throw new IllegalStateException("сбой остановки");
-              }
-              exits.incrementAndGet();
-            },
+            exits::incrementAndGet,
             Platform::runLater);
+    try {
+      service.open(file, false).join();
+      // Сбой остановки до известного итога: подписчик бросает Error при доставке «закрыта»,
+      // publish(CLOSED) в runShutdown даёт exceptional future — ошибка, окно живо.
+      // После exceptional-остановки сервис одноразов: повторный «Выход» сообщит ту же ошибку.
+      service
+          .states()
+          .subscribe(
+              new Flow.Subscriber<>() {
+                @Override
+                public void onSubscribe(Flow.Subscription subscription) {
+                  subscription.request(Long.MAX_VALUE);
+                }
 
-    var exitItem =
-        MainWindowApp.createMenuBar(
-                new MainWindowApp.MenuActions(
-                    () -> {}, () -> {}, () -> {}, () -> {}, db::requestExit),
-                db.stateProperty())
-            .getMenus()
-            .get(0)
-            .getItems()
-            .get(EXIT);
+                @Override
+                public void onNext(DbState item) {
+                  if (item instanceof DbState.Closed) {
+                    throw failure;
+                  }
+                }
 
-    // Первый «Выход»: цепочка сбоит, процесс не завершается, окно остаётся, ошибка показана
-    runOnFxThread(exitItem::fire);
-    assertThat(holds(MainWindowAppTest::hasErrorAlert)).isTrue();
-    runOnFxThread(
-        () -> {
-          assertThat(stageBox[0].isShowing()).isTrue();
-          assertThat(exits.get()).isZero();
-        });
+                @Override
+                public void onError(Throwable throwable) {}
 
-    // Повторный «Выход» обрабатывается: цепочка запускается заново и завершает приложение
-    runOnFxThread(exitItem::fire);
-    assertThat(holds(() -> exits.get() == 1)).isTrue();
+                @Override
+                public void onComplete() {}
+              });
 
-    // Закрытие через close(): вызов hide() в headless-режиме подвешивает поток JavaFX
-    runOnFxThread(
-        () -> {
-          for (Window window : List.copyOf(Window.getWindows())) {
-            if (window instanceof Stage stage) {
-              stage.close();
-            }
-          }
-        });
+      var exitItem =
+          MainWindowApp.createMenuBar(
+                  new MainWindowApp.MenuActions(
+                      () -> {}, () -> {}, () -> {}, () -> {}, db::requestExit),
+                  db.stateProperty())
+              .getMenus()
+              .get(0)
+              .getItems()
+              .get(EXIT);
+
+      Thread.setDefaultUncaughtExceptionHandler(
+          (t, e) -> System.err.println("UNCAUGHT on " + t + ": " + e));
+      runOnFxThread(exitItem::fire);
+      assertThat(holds(MainWindowAppTest::hasErrorAlert)).isTrue();
+      runOnFxThread(
+          () -> {
+            assertThat(stageBox[0].isShowing()).isTrue();
+            assertThat(exits.get()).isZero();
+          });
+
+      // Повторный «Выход»: сервис мёртв — снова error-диалог, окно живо, выхода нет
+      runOnFxThread(exitItem::fire);
+      assertThat(
+              holds(
+                  () ->
+                      Window.getWindows().stream().filter(MainWindowAppTest::isErrorAlert).count()
+                          == 2))
+          .isTrue();
+      runOnFxThread(
+          () -> {
+            assertThat(stageBox[0].isShowing()).isTrue();
+            assertThat(exits.get()).isZero();
+          });
+    } finally {
+      storage.openGate.release();
+      storage.migrateGate.release();
+      // Сервис одноразов после сбоя остановки: повторная остановка возвращает ту же ошибку
+      assertThatThrownBy(() -> service.shutdown(Duration.ofSeconds(30))).isSameAs(failure);
+    }
   }
 
   private static boolean hasErrorAlert() {
-    return Window.getWindows().stream()
-        .anyMatch(window -> window instanceof Stage stage && "Ошибка".equals(stage.getTitle()));
+    return Window.getWindows().stream().anyMatch(MainWindowAppTest::isErrorAlert);
+  }
+
+  /** Окно является открытым error-диалогом «Ошибка». */
+  private static boolean isErrorAlert(Window window) {
+    return window instanceof Stage stage && "Ошибка".equals(stage.getTitle());
   }
 }

@@ -67,4 +67,21 @@ public sealed interface DbState {
   default boolean allowsSettings() {
     return this instanceof Closed || this instanceof Open;
   }
+
+  /**
+   * Остановка сервиса возможна: не идёт миграция и не ожидается решение о ней. Единый дом решения
+   * для сервиса и интерфейса: новое состояние, меняющее эту возможность, описывается здесь, а не в
+   * точках вызова.
+   */
+  default boolean allowsShutdown() {
+    return !(this instanceof Migrating) && !(this instanceof AwaitingMigration);
+  }
+
+  /**
+   * Состояние ждёт решения пользователя (о миграции): остановка невозможна, но решение можно
+   * принять за пользователя (отклонить миграцию), после чего остановка станет возможной.
+   */
+  default boolean awaitsUserDecision() {
+    return this instanceof AwaitingMigration;
+  }
 }

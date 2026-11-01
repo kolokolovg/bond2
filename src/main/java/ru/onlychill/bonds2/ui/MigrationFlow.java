@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.BooleanSupplier;
 import org.jspecify.annotations.Nullable;
+import ru.onlychill.bonds2.app.MigrationView;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.OpenResult;
 
@@ -17,7 +18,7 @@ import ru.onlychill.bonds2.dbservice.OpenResult;
  *
  * <p>Методы вызываются из потока JavaFX; результаты сервиса доставляются через {@code uiExecutor}.
  */
-final class MigrationFlow {
+final class MigrationFlow implements MigrationView {
 
   /** Текст вопроса о миграции; резервная копия названа явно. */
   private static final String MIGRATION_QUESTION =
@@ -108,7 +109,8 @@ final class MigrationFlow {
   }
 
   /** Закрывает открытый диалог миграции без решения: отмена не считается ошибкой. */
-  void cancelDialog() {
+  @Override
+  public void cancelDialog() {
     CompletableFuture<Boolean> dialog = migrationDialog;
     migrationDialog = null;
     if (dialog != null) {
@@ -117,7 +119,9 @@ final class MigrationFlow {
   }
 
   /** Запущенная миграция; {@code null}, если её не было. */
-  @Nullable CompletableFuture<OpenResult> currentMigration() {
-    return migration;
+  @Override
+  public @Nullable CompletableFuture<OpenResult> currentMigration() {
+    // Копия: получатель не может завершить или изменить саму миграцию
+    return migration == null ? null : migration.copy();
   }
 }

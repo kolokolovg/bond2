@@ -21,7 +21,6 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.Flow;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.logging.Handler;
@@ -32,11 +31,13 @@ import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import ru.onlychill.bonds2.app.ExitCoordinator;
 import ru.onlychill.bonds2.dbservice.DatabaseService;
 import ru.onlychill.bonds2.dbservice.DbState;
 import ru.onlychill.bonds2.dbservice.GatedStorage;
 import ru.onlychill.bonds2.dbservice.OpenResult;
 import ru.onlychill.bonds2.dbservice.RejectionCause;
+import ru.onlychill.bonds2.dbservice.ShutdownRefusal;
 import ru.onlychill.bonds2.dbservice.ShutdownResult;
 import ru.onlychill.bonds2.dbservice.TestDatabases;
 import ru.onlychill.bonds2.persistence.Database;
@@ -444,12 +445,12 @@ class DatabaseControllerTest {
     ui.pumpUntil(() -> db.stateProperty().get() instanceof DbState.Opening);
 
     var capture = new LogCapture();
-    CONTROLLER_LOG.addHandler(capture);
+    COORDINATOR_LOG.addHandler(capture);
     ShutdownResult result;
     try {
       result = db.shutdown(Duration.ofMillis(50));
     } finally {
-      CONTROLLER_LOG.removeHandler(capture);
+      COORDINATOR_LOG.removeHandler(capture);
     }
 
     assertThat(result).isEqualTo(ShutdownResult.TIMED_OUT);
@@ -490,23 +491,22 @@ class DatabaseControllerTest {
   }
 
   @Test
-  void exitChainFailureShowsErrorKeepsAppAliveAndRepeatedExitStartsAgain() {
-    var failFirst = new AtomicBoolean(true);
+  void exitFailureBeforeOutcomeShowsErrorAndRepeatedExitReportsSameError() {
+    // Сбой остановки до известного итога: подписчик бросает Error при доставке «закрыта»,
+    // publish(CLOSED) в runShutdown даёт exceptional future — ошибка, приложение живо.
+    // После exceptional-остановки сервис одноразов (инвариант shutdownAsync):
+    // повторный «Выход» снова запускает цепочку, но сообщает ту же ошибку.
+    var failing = new DatabaseService(new GatedStorage());
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
     var store = new SettingsStore(backend);
     var db =
         new DatabaseController(
-            store,
-            store.load(),
-            defaultFile(),
-            service,
-            dialogs,
-            () -> {
-              if (failFirst.compareAndSet(true, false)) {
-                throw new IllegalStateException("сбой остановки");
-              }
-              exits.incrementAndGet();
-            },
-            ui);
+            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
+
+    db.openOnStartup();
+    ui.pumpUntil(() -> isOpen(db));
+    failing.states().subscribe(failingOnClosedState(new AssertionError("сбой остановки")));
 
     db.requestExit();
     ui.settle();
@@ -515,39 +515,39 @@ class DatabaseControllerTest {
     assertThat(dialogs.errors).singleElement().asString().contains("сбой остановки");
     assertThat(dialogs.warnings).isEmpty();
     assertThat(exits.get()).isZero();
-    assertThat(db.stateProperty().get()).isEqualTo(DbState.CLOSED);
 
-    // Повторный «Выход» начинает цепочку заново: приложение завершается
+    // Повторный «Выход»: сервис мёртв, цепочка снова завершается той же ошибкой
     db.requestExit();
-    ui.pumpUntil(() -> exits.get() == 1);
-    assertThat(dialogs.errors).hasSize(1);
+    ui.settle();
+    assertThat(dialogs.errors).hasSize(2);
+    assertThat(dialogs.errors)
+        .allSatisfy(message -> assertThat(message).contains("сбой остановки"));
+    assertThat(exits.get()).isZero();
   }
 
   @Test
   void repeatedExitChainFailureResetsExitingAgain() {
+    // Сбой остановки до известного итога: подписчик падает всегда, каждая попытка — та же ошибка
+    var failing = new DatabaseService(new GatedStorage());
+    newDatabaseAt(userFile());
+    saveSettings(userFile(), true);
     var store = new SettingsStore(backend);
     var db =
         new DatabaseController(
-            store,
-            store.load(),
-            defaultFile(),
-            service,
-            dialogs,
-            () -> {
-              throw new IllegalStateException("сбой остановки");
-            },
-            ui);
+            store, store.load(), defaultFile(), failing, dialogs, exits::incrementAndGet, ui);
+
+    db.openOnStartup();
+    ui.pumpUntil(() -> isOpen(db));
+    failing.states().subscribe(failingOnClosedState(new AssertionError("сбой остановки")));
 
     db.requestExit();
     ui.settle();
     db.requestExit();
     ui.settle();
-
-    // Второй сбой тоже восстановил флаг выхода: третий запрос снова запускает цепочку
-    assertThat(dialogs.errors).hasSize(2);
     db.requestExit();
     ui.settle();
 
+    // Фаза выхода сбрасывается при каждом сбое: каждый запрос запускает цепочку заново
     assertThat(dialogs.errors).hasSize(3);
     assertThat(exits.get()).isZero();
   }
@@ -803,6 +803,10 @@ class DatabaseControllerTest {
   // мусора
   private static final Logger CONTROLLER_LOG = Logger.getLogger(DatabaseController.class.getName());
 
+  // Логи машины выхода пишет координатор
+  private static final Logger COORDINATOR_LOG =
+      Logger.getLogger(ru.onlychill.bonds2.app.ExitCoordinator.class.getName());
+
   @Test
   void createRejectedByStateRaceIsQuietAndLogged() {
     newDatabaseAt(userFile());
@@ -835,7 +839,7 @@ class DatabaseControllerTest {
     storage.openGate.hold();
     service.open(userFile(), false);
     assertThat(storage.openGate.awaitEntered()).isTrue();
-    service.shutdownAsync(DatabaseController.SHUTDOWN_TIMEOUT);
+    service.shutdownAsync(ExitCoordinator.SHUTDOWN_TIMEOUT);
 
     db.createDatabase(dataDir().resolve("other.db"));
     ui.settle();
@@ -1028,9 +1032,9 @@ class DatabaseControllerTest {
 
   @Test
   void shutdownTimeoutsMatchSpecification() {
-    assertThat(DatabaseController.STOP_TIMEOUT).isEqualTo(Duration.ofSeconds(5));
-    assertThat(DatabaseController.SHUTDOWN_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
-    assertThat(DatabaseController.MIGRATION_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+    assertThat(ExitCoordinator.STOP_TIMEOUT).isEqualTo(Duration.ofSeconds(5));
+    assertThat(ExitCoordinator.SHUTDOWN_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
+    assertThat(ExitCoordinator.MIGRATION_TIMEOUT).isEqualTo(Duration.ofSeconds(30));
   }
 
   @Test
@@ -1046,7 +1050,7 @@ class DatabaseControllerTest {
   @Test
   void externalShutdownHookStopsRunningService() {
     var db = opened();
-    MainWindowApp.setExternalStop(() -> db.shutdown(DatabaseController.STOP_TIMEOUT));
+    MainWindowApp.setExternalStop(() -> db.shutdown(ExitCoordinator.STOP_TIMEOUT));
     try {
       MainWindowApp.stopDatabaseOnExternalShutdown();
 
@@ -1107,7 +1111,8 @@ class DatabaseControllerTest {
     db.openDatabase();
     ui.pumpUntil(() -> isMigrating(db));
 
-    assertThat(db.shutdown(Duration.ofMillis(50))).isEqualTo(ShutdownResult.REFUSED);
+    assertThat(db.shutdown(Duration.ofMillis(50)))
+        .isEqualTo(new ShutdownResult.Refused(ShutdownRefusal.MIGRATING));
 
     storage.migrateGate.release();
     ui.pumpUntil(() -> isOpen(db));
@@ -1189,13 +1194,13 @@ class DatabaseControllerTest {
     failing.states().subscribe(failingOnClosedState(failure));
 
     var capture = new LogCapture();
-    CONTROLLER_LOG.addHandler(capture);
+    COORDINATOR_LOG.addHandler(capture);
     CONTROLLER_LOG.setLevel(Level.FINE);
     try {
       // Завершение продолжается: сбой остановки не пробрасывается вызывающему
       assertThatCode(db::shutdown).doesNotThrowAnyException();
     } finally {
-      CONTROLLER_LOG.removeHandler(capture);
+      COORDINATOR_LOG.removeHandler(capture);
       CONTROLLER_LOG.setLevel(null);
     }
     ui.settle();
